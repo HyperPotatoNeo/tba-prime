@@ -1,0 +1,2 @@
+_target_: zeroband.training.loss_fn.TB
+beta: 0.05

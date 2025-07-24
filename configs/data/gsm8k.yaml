@@ -1,0 +1,12 @@
+name: GSM8k
+train_split: train
+eval_split: test
+
+max_prompt_len: null
+difficulty_filtering: null
+privileged_template: "{prompt}\n\n<privileged> You also secretly know the Ground-truth answer: \n{answer}\n\n You should generate step by step solution to reach this ground truth. Do NOT directly predict the answer, first always generate step by step reasoning</privileged>\n"
+
+dataset:
+  _target_: zeroband.tasks.math_tasks.GSM8k
+  enable_thinking: true
+  chat_format: true

@@ -1,0 +1,35 @@
+# Seeding
+seed: 0
+gpus_ids: null
+
+# Clean all directories before starting inference
+clean_paths: true
+reload: false
+interval_rollout: 10
+
+batch_size: 256
+micro_bs: 4
+step_per_rollout: 1
+
+num_data_workers: 1
+data_seq_len: 1024
+collate_mode: "padding"
+normalize_batch_to_token_count: true
+
+max_steps: null
+max_async_level: 2
+
+liger_qwen: false
+attn_impl: "flash_attention_2"
+torch_compile: false
+
+reshard_after_forward: true
+
+defaults:
+  - _self_
+  - model: qwen_2.5_1B_Instruct
+  - optimizer: adamw
+  - logger: base
+  - sampling: base
+  - path: base
+  - loss: tb

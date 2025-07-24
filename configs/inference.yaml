@@ -1,0 +1,30 @@
+# Seeding
+seed: 0
+
+use_tqdm: false
+max_steps: null
+
+# Clean all directories before starting inference
+clean_paths: true
+reload: false
+
+defaults:
+  - _self_
+  - model: qwen_2.5_1B_Instruct
+  - logger: base
+  - sampling: base
+  - data: gsm8k
+  - path: base
+
+# Define batch size
+batch_size: 8
+async_level: 2
+
+# Parallelization Arguments
+parallel:
+  dp: 8
+  tp: 1
+
+rewards:
+  advantage_estimation_method: "dr_grpo"
+  compute_reward: true

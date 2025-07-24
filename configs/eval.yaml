@@ -1,0 +1,20 @@
+# Seeding
+seed: 0
+use_tqdm: true
+
+defaults:
+  - _self_
+  - model: qwen_2.5_1B_Instruct
+  - logger: base
+  - sampling: base
+  - data: gsm8k
+  - path: base
+
+# Parallelization Arguments
+parallel:
+  dp: 1
+  tp: 1
+
+rewards:
+  advantage_estimation_method: "dr_grpo"
+  compute_reward: true

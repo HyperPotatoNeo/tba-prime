@@ -1,0 +1,8 @@
+name: "meta-llama/Llama-3.2-1B"
+max_model_len: 512
+dtype: "auto"
+device: "auto"
+kv_cache_dtype: "auto"
+quantization: null
+enforce_eager: false
+enable_thinking: true

@@ -1,0 +1,5 @@
+_target_: zeroband.training.loss_fn.KLCovGRPO
+clip_ratio: 8.0
+kl_coef_cov: 1.0
+k_percent: 0.2
+kl_coeff: 0.

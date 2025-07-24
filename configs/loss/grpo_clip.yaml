@@ -1,0 +1,6 @@
+_target_: zeroband.training.loss_fn.ClipGRPO
+clip_ratio: 4.0
+highest_entropy_ratio_loss: 1.0
+epsilon_low: 0.2
+epsilon_high: 0.2
+kl_coeff: 0.

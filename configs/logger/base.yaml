@@ -1,0 +1,7 @@
+log:
+  level: "info"
+  all_ranks: false
+  utc: false
+
+wandb:
+  project: "Post-Training"
