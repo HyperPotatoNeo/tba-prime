@@ -26,16 +26,15 @@ class ModelOutput(BaseModel):
 
 class RewardRequest(BaseModel):
     model_outputs: list[ModelOutput]
-    verification_infos: list[dict[str, Any]]
-    task_types: list[TaskType]
+    ground_truths: list
     config: RewardsConfig | None = None
 
     def __len__(self) -> int:
         return len(self.model_outputs)
 
     def __iter__(self) -> Iterator[tuple[ModelOutput, dict[str, Any], TaskType]]:
-        for request_output, verification_info, task_type in zip(self.model_outputs, self.verification_infos, self.task_types):
-            yield request_output, verification_info, task_type
+        for request_output, ground_truth in zip(self.model_outputs, self.ground_truths):
+            yield request_output, ground_truth
 
 
 def unwrap_request_output(request_output: RequestOutput) -> ModelOutput:
@@ -45,15 +44,13 @@ def unwrap_request_output(request_output: RequestOutput) -> ModelOutput:
 
 def vllm_output_to_serializable(
     request_outputs: list[RequestOutput],
-    verification_infos: list[dict],
-    task_types: list[TaskType],
+    ground_truths: list,
     config: RewardsConfig | None = None,
 ) -> RewardRequest:
     model_outputs = [unwrap_request_output(request_output) for request_output in request_outputs]
     return RewardRequest(
         model_outputs=model_outputs,
-        verification_infos=verification_infos,
-        task_types=task_types,
+        ground_truths=ground_truths,
         config=config,
     )
 
@@ -62,14 +59,12 @@ class CompletionReward(BaseModel):
     completion_id: int  # type(CompletionOutput.index)
     reward: float
     task_reward: float
-    length_penalty: float
     advantage: float | None = None
 
 
 class RequestRewards(BaseModel):
     request_id: str  # type(RequestOutput.request_id)
     rewards: list[CompletionReward]
-    task_type: str
 
 
 class RewardsResponse(BaseModel):
@@ -78,9 +73,8 @@ class RewardsResponse(BaseModel):
 
 def _compute_completion_reward(
     completion_output: ModelCompletion,
-    verification_info: dict,
-    task_type: TaskType,
-    config: RewardsConfig | None,
+    ground_truth,
+    reward_fn,
 ) -> CompletionReward:
     """
     Computes the reward from a single vLLM completion output given the
@@ -97,47 +91,20 @@ def _compute_completion_reward(
         A dictionary containing the reward, task reward, and length penalty.
     """
     # Compute task reward
-    compute_reward = get_reward_function(task_type)
-    task_reward = compute_reward(completion_output.text, verification_info)
+    task_reward = reward_fn(completion_output.text, ground_truth)
     reward = task_reward
-    length_penalty = 0
-
-    # Compute length penalty
-    length_config = config.len_reward if config is not None else None
-    if length_config is not None:
-        target_length = verification_info["target_length"]
-        if target_length > 0:
-            output_length = len(completion_output.token_ids)
-            # Penalizes absolute deviation from target length
-            if length_config.reward_type == "exact":
-                length_penalty = abs(target_length - output_length) * length_config.reward_coef
-                reward -= length_penalty
-            # Rewards for being close to target length with a maximum reward
-            elif length_config.reward_type == "max":
-                raw_value = length_config.reward_coef * (target_length - output_length) + length_config.max_reward_delta
-                length_penalty = max(0, min(1, raw_value))
-                reward *= length_penalty
-            # Zero reward if output exceeds target length
-            elif length_config.reward_type == "clip":
-                length_penalty = int(output_length > target_length)
-
-                if length_penalty == 1:
-                    reward = 0
-            else:
-                raise ValueError(f"Invalid reward type: {length_config.reward_type}")
 
     return CompletionReward(
         completion_id=completion_output.index,
         reward=reward,
         task_reward=task_reward,
-        length_penalty=length_penalty,
     )
 
 
 def _compute_request_rewards(
     request_output: ModelOutput,
-    verification_info: dict,
-    task_type: TaskType,
+    ground_truth,
+    reward_fn,
     config: RewardsConfig | None,
 ) -> RequestRewards:
     """
@@ -157,7 +124,7 @@ def _compute_request_rewards(
     """
     completion_rewards = []
     for output in request_output.outputs:
-        args = (output, verification_info, task_type, config)
+        args = (output, ground_truth, reward_fn)
         completion_rewards.append(_compute_completion_reward(*args))
 
     # Compute advantage (normalized rewards)
@@ -183,46 +150,27 @@ def _compute_request_rewards(
     for completion_reward, advantage in zip(completion_rewards, advantage_array):
         completion_reward.advantage = float(advantage)
 
-    return RequestRewards(request_id=request_output.request_id, rewards=completion_rewards, task_type=str(task_type))
+    return RequestRewards(request_id=request_output.request_id, rewards=completion_rewards)
 
 
 def compute_rewards(
     reward_request: RewardRequest,
+    reward_fn
 ) -> RewardsResponse:
-    remote_url = os.getenv("REWARD_URL", None)
-    if remote_url is None:
-        max_workers = min(32, len(reward_request))
-        futures = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for request, info, task_type in reward_request:
-                args = (request, info, task_type, reward_request.config)
-                futures.append(executor.submit(_compute_request_rewards, *args))
+    max_workers = min(32, len(reward_request))
+    futures = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for request, info in reward_request:
+            args = (request, info, reward_fn, reward_request.config)
+            futures.append(executor.submit(_compute_request_rewards, *args))
 
-        return RewardsResponse(rewards=list(future.result() for future in futures))
-    else:
-        port = os.getenv("REWARD_PORT", 8000)
-        remote_auth = os.getenv("REWARD_AUTH", None)
-        if remote_auth is None:
-            raise ValueError("Remote URL is set but no authentication token provided. Set the REWARD_AUTH environment variable.")
-
-        # TODO: SSL/HTTPS?
-        response = requests.post(
-            f"http://{remote_url}:{port}/compute_rewards",
-            data=json.dumps(reward_request.model_dump()),
-            headers={"Authorization": f"Bearer {remote_auth}"},
-        )
-
-        if response.status_code != 200:
-            get_logger().error(f"Failed to compute rewards: {response.status_code} - {response.text}")
-            raise RuntimeError(f"Failed to compute rewards: {response.status_code} - {response.text}")
-        response = RewardsResponse.model_validate(json.loads(response.text))
-        return response
+    return RewardsResponse(rewards=list(future.result() for future in futures))
 
 
 def compute_vllm_rewards(
     request_outputs: list[RequestOutput],
-    verification_infos: list[dict],
-    task_types: list[TaskType],
+    ground_truths,
+    reward_fn,
     config: RewardsConfig | None = None,
 ) -> list[RequestRewards]:
     """
@@ -242,8 +190,7 @@ def compute_vllm_rewards(
 
     reward_request = vllm_output_to_serializable(
         request_outputs=request_outputs,
-        verification_infos=verification_infos,
-        task_types=task_types,
+        ground_truths=ground_truths,
         config=config,
     )
-    return compute_rewards(reward_request).rewards
+    return compute_rewards(reward_request, reward_fn).rewards

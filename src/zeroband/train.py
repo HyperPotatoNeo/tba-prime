@@ -297,9 +297,6 @@ def train(config: DictConfig):
                     metric_averager.update("train/lengths/seq_len", seq_lens)
                 
                 # Model Forward
-                print(input_ids)
-                print(batch["position_ids"])
-                print()
                 logits = model(
                     input_ids=input_ids, position_ids=batch["position_ids"]
                 ).logits.contiguous()

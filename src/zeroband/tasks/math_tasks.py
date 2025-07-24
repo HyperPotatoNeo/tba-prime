@@ -1,6 +1,7 @@
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset
 import numpy as np
 import re
+from zeroband.tasks.math_utils import compute_math_reward
 
 class Dataset:
     def __init__(self, tokenizer, enable_thinking, chat_format=False):
@@ -11,8 +12,8 @@ class Dataset:
         for split in self.dataset:
             self.dataset[split] = self.dataset[split].rename_columns({"question": "prompt", "answer": "ground_truth"})
             self.dataset[split] = self.dataset[split].map(self.format_dataset, remove_columns=[col for col in self.dataset[split].column_names if col not in self.columns])
-    
-    def format_prompts_with_answers(self, prompts, answers):
+
+    def format_prompts(self, prompts, answers = None):
         prompts = [prompt + f" Place your answer at end exactly inside latex box for example \\boxed{{12}} or \\boxed{{51}}." for prompt in prompts]
         if self.chat_format:
             messages = [
@@ -21,49 +22,35 @@ class Dataset:
                         "role": "user",
                         "content": prompt,
                     },
-                    {
-                        "role": "assistant",
-                        "content": f"The answer is {answer}"
-                    }
-                ]
-                for prompt, answer in zip(prompts, answers)
-            ]
-
-            # Apply chat template
-            formatted_prompts = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=False, enable_thinking=self.enable_thinking
-            )
-        else:
-            formatted_prompts = [self.tokenizer(f'{prompt} The answer is {answer} {self.tokenizer.eos_token}')["input_ids"] for prompt, answer in zip(prompts, answers)]
-        
-        return formatted_prompts
-
-    def format_prompts(self, prompts):
-        prompts = [prompt + f" Place your answer at end exactly inside latex box for example \\boxed{{12}} or \\boxed{{51}}." for prompt in prompts]
-        if self.chat_format:
-            messages = [
-                [
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
                 ]
                 for prompt in prompts
             ]
+            if answers is not None:
+                for msg, answer in zip(messages, answers):
+                    msg.append(
+                        {
+                            "role": "assistant",
+                            "content": f"The final answer is {answer}"
+                        }
+                    )
+                add_generation_prompt = False
+            else:
+                add_generation_prompt = True
 
             # Apply chat template
             formatted_prompts = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, enable_thinking=self.enable_thinking
+                messages, tokenize=True, add_generation_prompt=add_generation_prompt, enable_thinking=self.enable_thinking
             )
         else:
+            if answers is not None:
+                prompts = [f'{prompt} The answer is {answer} {self.tokenizer.eos_token}' for prompt, answer in zip(prompts, answers)]
+
             formatted_prompts = [self.tokenizer(prompt)["input_ids"] for prompt in prompts]
-        
+
         return formatted_prompts
     
-    def __call__(self, split):
-        if split in self.dataset:
-            return self.dataset[split]
-        return self.dataset
+    def reward_fn(self, completion, ground_truth):
+        return compute_math_reward(completion, ground_truth)
 
 class GSM8k(Dataset):
     def __init__(self, tokenizer, enable_thinking, chat_format=False):

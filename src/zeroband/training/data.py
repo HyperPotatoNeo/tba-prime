@@ -30,9 +30,7 @@ class DatasetOutput(TypedDict):
     seq_lens: Int[torch.Tensor, "1"]
     rewards: Float[torch.Tensor, "1"]
     task_rewards: Float[torch.Tensor, "1"]
-    length_penalties: Float[torch.Tensor, "1"]
     temperature: float
-    task_type: str
 
 def validate_schema_pa_file(file: Path):
     """Check if the schema of the parquet file is the same as the schema of the pa_schema"""
@@ -202,8 +200,6 @@ class ParquetDataset(IterableDataset):
                 "advantages",
                 "rewards",
                 "task_rewards",
-                "length_penalties",
-                "task_type",
                 "input_logprobs",
                 "output_logprobs",
                 "temperature",
@@ -251,8 +247,6 @@ class ParquetDataset(IterableDataset):
                                 "rewards": reward_value,
                                 "loss_mask": loss_mask,
                                 "task_rewards": batch["task_rewards"][i].as_py(),
-                                "length_penalties": batch["length_penalties"][i].as_py(),
-                                "task_type": batch["task_type"][i].as_py(),
                                 "logprobs": logprobs,
                                 "temperature": batch["temperature"][i].as_py(),
                                 "prompt": batch['prompt'][i],
@@ -394,8 +388,6 @@ class ParquetDatasetEM(IterableDataset):
                 "advantages",
                 "rewards",
                 "task_rewards",
-                "length_penalties",
-                "task_type",
                 "input_logprobs",
                 "output_logprobs",
                 "temperature",
@@ -452,8 +444,6 @@ class ParquetDatasetEM(IterableDataset):
                                 "loss_mask": loss_mask,
                                 "priv_loss_mask": priv_loss_mask,
                                 "task_rewards": batch["task_rewards"][i].as_py(),
-                                "length_penalties": batch["length_penalties"][i].as_py(),
-                                "task_type": batch["task_type"][i].as_py(),
                                 "logprobs": logprobs,
                                 "temperature": batch["temperature"][i].as_py(),
                             }
@@ -534,8 +524,6 @@ class BatchOutput(TypedDict):
     seq_lens: Int[torch.Tensor, "sample"]
     rewards: Float[torch.Tensor, "sample"]
     task_rewards: Float[torch.Tensor, "sample"]
-    length_penalties: Float[torch.Tensor, "sample"]
-    task_types: list[str]
 
     # batch level
     temperature: float
@@ -566,8 +554,6 @@ def collate_fn(samples: list[DatasetOutput], max_seq_len: int, pad_token_id: int
     if em:
         priv_loss_masks = [sample["priv_loss_mask"] for sample in samples]
     task_rewards = [sample["task_rewards"] for sample in samples]
-    length_penalties = [sample["length_penalties"] for sample in samples]
-    task_types = [sample["task_type"] for sample in samples]
 
     # Handle logprobs if available
     all_logprobs = [sample["logprobs"] for sample in samples if sample["logprobs"] is not None]
@@ -626,8 +612,6 @@ def collate_fn(samples: list[DatasetOutput], max_seq_len: int, pad_token_id: int
             "seq_lens": torch.tensor(seq_lens, dtype=torch.int32),
             "priv_seq_lens": torch.tensor(priv_seq_lens, dtype=torch.int32),
             "task_rewards": torch.tensor(task_rewards),
-            "length_penalties": torch.tensor(length_penalties),
-            "task_types": task_types,
             "temperature": temperature,
         }
     return {
@@ -641,8 +625,6 @@ def collate_fn(samples: list[DatasetOutput], max_seq_len: int, pad_token_id: int
         "rewards": torch.tensor(rewards),
         "seq_lens": torch.tensor(seq_lens, dtype=torch.int32),
         "task_rewards": torch.tensor(task_rewards),
-        "length_penalties": torch.tensor(length_penalties),
-        "task_types": task_types,
         "temperature": temperature,
     }
 
@@ -754,8 +736,6 @@ def merge_batches_padding(batches: list[BatchOutput], em=False) -> BatchOutput:
             "seq_lens": torch.cat([b["seq_lens"] for b in batches]),
             "priv_seq_lens": torch.cat([b["priv_seq_lens"] for b in batches]),
             "task_rewards": torch.cat([b["task_rewards"] for b in batches]),
-            "length_penalties": torch.cat([b["length_penalties"] for b in batches]),
-            "task_types": [task_type for b in batches for task_type in b["task_types"]],
             # batch level
             "temperature": temperatures[0],
         }
@@ -770,8 +750,6 @@ def merge_batches_padding(batches: list[BatchOutput], em=False) -> BatchOutput:
         # sample level
         "seq_lens": torch.cat([b["seq_lens"] for b in batches]),
         "task_rewards": torch.cat([b["task_rewards"] for b in batches]),
-        "length_penalties": torch.cat([b["length_penalties"] for b in batches]),
-        "task_types": [task_type for b in batches for task_type in b["task_types"]],
         # batch level
         "temperature": temperatures[0],
     }

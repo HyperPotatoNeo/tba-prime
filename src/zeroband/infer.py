@@ -176,9 +176,8 @@ def inference(config: InferenceConfig):
             sampling_params.seed = seed + step * 1_000_000  # 1M is needed to avoid collision from sampling.n
 
         problems = dataset.select(indices)
-        verification_infos = [{"ground_truth": item["ground_truth"]} for item in problems]
-        task_types = ["verifiable_math" for item in problems]
         prompts = [item["prompt"] for item in problems]
+        ground_truths = [item["ground_truth"] for item in problems]
 
         # Get tokenized prompts as BatchEncoding
         tokenized_prompts = dataset_class.format_prompts(
@@ -205,12 +204,12 @@ def inference(config: InferenceConfig):
         # Print first example of prompt and completion
         first_prompt = tokenizer.decode(request_outputs[0].prompt_token_ids)
         first_completion = tokenizer.decode(request_outputs[0].outputs[0].token_ids)
-        logger.info(f'Showing example of prompt and completion\nPrompt: {first_prompt}\nCompletion: {first_completion}\nTrue Answer: {verification_infos[0]["ground_truth"]}')
+        logger.info(f'Showing example of prompt and completion\nPrompt: {first_prompt}\nCompletion: {first_completion}\nTrue Answer: {ground_truths[0]}')
 
         # Compute and log rewards and advantages
         logger.info("Computing rewards and advantages")
         start_time = time.time()
-        request_rewards = compute_vllm_rewards(request_outputs, verification_infos, task_types, config.rewards)
+        request_rewards = compute_vllm_rewards(request_outputs, ground_truths, dataset_class.reward_fn, config.rewards)
         batch_reward = sum(sum(r.reward for r in req.rewards) for req in request_rewards) / (config.batch_size * config.sampling.n)
         logger.info(f"Average reward of the batch: {batch_reward:.2f} | Computed in {time.time() - start_time} time")
 
