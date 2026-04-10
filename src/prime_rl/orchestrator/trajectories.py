@@ -11,7 +11,16 @@ import verifiers as vf
 from PIL import Image
 from transformers.tokenization_utils import PreTrainedTokenizer
 
+# Compatibility shim: newer verifiers exposes `RolloutOutput` as the type of
+# a completed rollout, but older versions (0.1.9.post3, pinned by some
+# downstream integrators including kv-eviction's container setup) only have
+# `State`. `RolloutOutput` is behaviorally identical to `State` for all the
+# dict accesses this file performs, so aliasing is safe.
+if not hasattr(vf, "RolloutOutput"):
+    vf.RolloutOutput = vf.State  # type: ignore[attr-defined]
+
 from prime_rl.transport import TrainingSample
+from prime_rl.transport.types import CompactionEventWire
 from prime_rl.utils.chat_template import (
     common_prefix_len,
     deserialize_tool_calls,
@@ -285,14 +294,57 @@ def interleave_rollout(
         logger.warning(f"Missing rollout tokens for example {output['example_id']} step {step_idx}.")
         return None
 
+    def _compaction_events_from_step(
+        step: vf.TrajectoryStep,
+    ) -> list[CompactionEventWire] | None:
+        """Read compaction events from a step's extras dict, handling both
+        already-typed CompactionEventWire instances and the dict/list forms
+        that can arrive after msgspec roundtrip. None when no events present.
+        """
+        extras = step.get("extras")
+        if not extras:
+            return None
+        raw = extras.get("compaction_events")
+        if not raw:
+            return None
+        out: list[CompactionEventWire] = []
+        for e in raw:
+            if isinstance(e, CompactionEventWire):
+                out.append(e)
+            elif isinstance(e, dict):
+                out.append(
+                    CompactionEventWire(
+                        num_output_tokens_at_compaction=int(
+                            e["num_output_tokens_at_compaction"]
+                        ),
+                        tokens_evicted=int(e["tokens_evicted"]),
+                        position_offset_after=int(e["position_offset_after"]),
+                    )
+                )
+            elif isinstance(e, (list, tuple)) and len(e) >= 3:
+                # msgspec array_like form
+                out.append(
+                    CompactionEventWire(
+                        num_output_tokens_at_compaction=int(e[0]),
+                        tokens_evicted=int(e[1]),
+                        position_offset_after=int(e[2]),
+                    )
+                )
+        return out or None
+
     prepared_steps: list[dict[str, Any]] = []
+    step_compaction_events: list[list[CompactionEventWire] | None] = []
     for step_idx, step in enumerate(trajectory):
         prepared = prepare_step_tokens(step, step_idx)
         if prepared is None:
             return None
         prepared_steps.append(prepared)
+        step_compaction_events.append(_compaction_events_from_step(step))
 
-    def make_sample(tokens: dict[str, Any]) -> TrainingSample:
+    def make_sample(
+        tokens: dict[str, Any],
+        compaction_events: list[CompactionEventWire] | None = None,
+    ) -> TrainingSample:
         """Create a new TrainingSample from a trajectory step."""
         if has_error:
             completion_mask = [False] * len(tokens["completion_mask"])
@@ -315,6 +367,7 @@ def interleave_rollout(
             teacher_logprobs=None,
             advantage=None,
             routed_experts=routed_experts,
+            compaction_events=compaction_events,
         )
 
     def extend_sample(sample: TrainingSample, prefix_len: int, step_idx: int) -> None:
@@ -355,7 +408,9 @@ def interleave_rollout(
 
     first_tokens = prepared_steps[0]
     first_prefix = first_tokens["prompt_ids"] + first_tokens["completion_ids"]
-    active_samples.append([first_prefix, make_sample(first_tokens), 0])
+    active_samples.append(
+        [first_prefix, make_sample(first_tokens, step_compaction_events[0]), 0]
+    )
 
     for step_idx, _step in enumerate(trajectory[1:], start=1):
         tokens = prepared_steps[step_idx]
@@ -371,6 +426,19 @@ def interleave_rollout(
         if matched_idx is not None:
             # Extension holds - merge into matched sample
             prefix_tokens, sample, _ = active_samples[matched_idx]
+            # Compaction + multi-step extension is not yet supported: the
+            # events from this step would need their num_output_tokens_at_compaction
+            # offset by the existing sample length AND merged with the previous
+            # step's events. Single-turn (trajectory length 1) is the only
+            # supported configuration for MKV-RL Phase 3 initial scope. Raise
+            # rather than silently produce wrong boundaries.
+            if step_compaction_events[step_idx] is not None:
+                raise NotImplementedError(
+                    f"Compaction events on extended trajectory step "
+                    f"{step_idx} are not supported yet. Use SingleTurnEnv "
+                    f"with compaction, or extend interleave_rollout to "
+                    f"offset and merge per-step events."
+                )
             extend_sample(sample, len(prefix_tokens), step_idx=step_idx)
             active_samples[matched_idx][0] = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples[matched_idx][2] = step_idx
@@ -381,7 +449,9 @@ def interleave_rollout(
                 f"Starting new sample (active_prefixes={len(active_samples)}, step_prompt_len={len(step_prompt_ids)})."
             )
             new_prefix = tokens["prompt_ids"] + tokens["completion_ids"]
-            active_samples.append([new_prefix, make_sample(tokens), step_idx])
+            active_samples.append(
+                [new_prefix, make_sample(tokens, step_compaction_events[step_idx]), step_idx]
+            )
 
     # Attach images once per sample using only the last merged step
     if vlm_cache is not None:

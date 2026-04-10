@@ -1,6 +1,30 @@
 import copy
 
-from prime_rl.transport.types import MicroBatch, TrainingSample
+from prime_rl.transport.types import CompactionEventWire, MicroBatch, TrainingSample
+
+
+def _clamp_compaction_events(
+    events: list[CompactionEventWire] | None,
+    completion_len_after_trunc: int,
+) -> list[CompactionEventWire] | None:
+    """Drop compaction events that refer to generated tokens lost to truncation.
+
+    Each event's `num_output_tokens_at_compaction` is a position in
+    completion-space (pre-truncation). If truncation cut the completion to
+    `completion_len_after_trunc` tokens, any event with
+    `num_output_tokens_at_compaction > completion_len_after_trunc` refers
+    to a compaction that happened on tokens that no longer exist in the
+    training sample — drop it. Events at or before the cut are kept as-is.
+
+    Returns None when no events remain (either input was None/empty, or all
+    were dropped).
+    """
+    if not events:
+        return None
+    kept = [
+        e for e in events if e.num_output_tokens_at_compaction <= completion_len_after_trunc
+    ]
+    return kept or None
 
 
 def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch:
@@ -23,6 +47,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     # computed via prefill in the orchestrator when a teacher model is configured
     teacher_logprobs = training_example.teacher_logprobs
     routed_experts = training_example.routed_experts
+    # Compaction events (kv-eviction). Passed through to the MicroBatch and
+    # clamped below if the completion was truncated to fit seq_len.
+    compaction_events = training_example.compaction_events
 
     if len(input_ids) > seq_len:
         input_ids = input_ids[:seq_len]
@@ -35,6 +62,15 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             teacher_logprobs = teacher_logprobs[:seq_len]
         if routed_experts is not None:
             routed_experts = routed_experts[:seq_len]
+        # Clamp compaction events to the post-truncation completion length.
+        # completion_len_after_trunc = min(full_completion, seq_len - prompt_len).
+        # If the prompt itself fills/exceeds seq_len, no completion tokens
+        # remain and all events are dropped.
+        prompt_len = len(training_example.prompt_ids)
+        completion_len_after_trunc = max(0, seq_len - prompt_len)
+        compaction_events = _clamp_compaction_events(
+            compaction_events, completion_len_after_trunc
+        )
 
     assert (
         len(input_ids)
@@ -67,12 +103,29 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,
         image_grid_thw=training_example.image_grid_thw,
+        # kv-eviction compaction events
+        compaction_events=compaction_events,
     )
 
 
 def _is_multimodal_sample(sample: MicroBatch) -> bool:
     """Check if a sample contains multimodal data (images)."""
     return sample.pixel_values is not None
+
+
+def _is_compaction_sample(sample: MicroBatch) -> bool:
+    """Check if a sample carries KV cache compaction events.
+
+    Compaction samples CANNOT be bin-packed with any other sample because:
+    1. The trainer dispatches to segmented_forward per-sample, and
+       segmented_forward expects batch_size=1 with a single contiguous
+       prompt + completion layout.
+    2. The compaction event list is per-sample; there's no slot in MicroBatch
+       for a list-of-lists (one per packed sample).
+    Each compaction sample therefore becomes its own micro batch, same
+    pattern as multimodal samples.
+    """
+    return sample.compaction_events is not None and len(sample.compaction_events) > 0
 
 
 def packed_samples_into_micro_bs(
@@ -85,6 +138,9 @@ def packed_samples_into_micro_bs(
 
     NOTE: Multimodal samples (with pixel_values) are NOT packed together as they have variable-sized
     vision data that doesn't pack well. Each multimodal sample becomes its own micro batch.
+
+    NOTE: Compaction samples (with compaction_events) are also NOT packed
+    together. See _is_compaction_sample docstring for rationale.
     """
     # Sort by (lora_idx, -length) for packing efficiency
     samples.sort(key=lambda x: (x[0], -len(x[1].input_ids)))
@@ -93,8 +149,9 @@ def packed_samples_into_micro_bs(
     micro_batches: list[MicroBatch] = []
 
     for idx, sample in samples:
-        # Multimodal samples cannot be packed - each becomes its own micro batch
-        if _is_multimodal_sample(sample):
+        # Multimodal and compaction samples cannot be packed - each becomes
+        # its own micro batch.
+        if _is_multimodal_sample(sample) or _is_compaction_sample(sample):
             sample.lora_num_tokens = [0] * num_loras
             sample.lora_num_tokens[idx] = len(sample.input_ids)
             micro_batches.append(sample)
@@ -102,8 +159,8 @@ def packed_samples_into_micro_bs(
 
         # Try to find a bin that can fit this sequence (only pack text-only samples)
         for bin_content in micro_batches:
-            # Don't pack into multimodal micro batches
-            if _is_multimodal_sample(bin_content):
+            # Don't pack into multimodal or compaction micro batches
+            if _is_multimodal_sample(bin_content) or _is_compaction_sample(bin_content):
                 continue
             # Check if sequence fits in this bin
             if len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len:
