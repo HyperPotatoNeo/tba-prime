@@ -90,6 +90,17 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             f"routed_experts: {len(routed_experts)}, input_ids: {len(input_ids)}"
         )
 
+    # Set prompt_len on the MicroBatch ONLY for compaction samples (the
+    # trainer needs it to compute prompt_aligned_len for segmented_forward).
+    # Non-compaction samples leave it None so the msgspec wire format stays
+    # backwards-compatible with existing pipelines.
+    prompt_len: int | None = None
+    if compaction_events:
+        # Post-truncation prompt length. If truncation cut INTO the prompt
+        # itself (extreme case), use the new length; otherwise it's the
+        # original prompt length.
+        prompt_len = min(len(training_example.prompt_ids), len(input_ids))
+
     return MicroBatch(
         input_ids=input_ids,
         advantages=advantages,
@@ -103,8 +114,9 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         pixel_values=training_example.pixel_values,
         pixel_values_shape=training_example.pixel_values_shape,
         image_grid_thw=training_example.image_grid_thw,
-        # kv-eviction compaction events
+        # kv-eviction compaction events + prompt_len
         compaction_events=compaction_events,
+        prompt_len=prompt_len,
     )
 
 
@@ -207,7 +219,17 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     micro_batch.input_ids.extend([1] * padding_size)
     micro_batch.advantages.extend([0.0] * padding_size)
     micro_batch.loss_mask.extend([False] * padding_size)
-    micro_batch.position_ids.extend(list(range(padding_size)))
+    # Compaction samples require continuous position_ids (segmented_forward
+    # uses them as absolute RoPE positions over the whole concatenated
+    # sequence). For packed text/multimodal samples, padding position_ids
+    # restart at 0 to mark a new cu_seqlens boundary.
+    if _is_compaction_sample(micro_batch):
+        last_pos = micro_batch.position_ids[-1] if micro_batch.position_ids else -1
+        micro_batch.position_ids.extend(
+            list(range(last_pos + 1, last_pos + 1 + padding_size))
+        )
+    else:
+        micro_batch.position_ids.extend(list(range(padding_size)))
     micro_batch.inference_logprobs.extend([0.0] * padding_size)
     # Use temperature 1.0 for padding tokens (doesn't matter since loss_mask is False)
     micro_batch.temperatures.extend([1.0] * padding_size)
@@ -253,23 +275,44 @@ def prepare_batch(
     processes a multimodal batch (triggering the vision encoder) while another processes
     a text-only batch, the all-gather will hang. We separate micro batches by modality
     and distribute them so that at each step index, all ranks see the same modality.
+
+    Three modality buckets:
+    1. Multimodal (pixel_values set) — triggers vision encoder.
+    2. Compaction (compaction_events set) — triggers segmented_forward with
+       multiple forward passes per micro-batch instead of the standard single
+       pass. If one rank takes the segmented branch and another the standard
+       branch at the same step index, they diverge in FSDP all-gather counts
+       and NCCL deadlocks.
+    3. Text (neither) — the default single-pass path.
     """
     all_samples = [(idx, prepare_sample(rollout, seq_len)) for idx, rollout in zip(idxs, rollouts)]
 
     micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
     micro_batches = [pad_micro_batch(micro_batch, pad_to_multiple_of) for micro_batch in micro_batches]
 
-    # Separate by modality so each step index has uniform modality across all ranks
+    # Separate by modality so each step index has uniform modality across all ranks.
+    # Order of checks matters: compaction samples may technically also be
+    # multimodal in the future, but today they're mutually exclusive.
     mm_batches = [b for b in micro_batches if _is_multimodal_sample(b)]
-    text_batches = [b for b in micro_batches if not _is_multimodal_sample(b)]
+    compaction_batches = [
+        b for b in micro_batches
+        if not _is_multimodal_sample(b) and _is_compaction_sample(b)
+    ]
+    text_batches = [
+        b for b in micro_batches
+        if not _is_multimodal_sample(b) and not _is_compaction_sample(b)
+    ]
 
     # Pad each group independently so its count is divisible by num_train_workers
     mm_batches = _pad_group_for_distribution(mm_batches, num_train_workers)
+    compaction_batches = _pad_group_for_distribution(compaction_batches, num_train_workers)
     text_batches = _pad_group_for_distribution(text_batches, num_train_workers)
 
-    # Combine: all multimodal first, then all text-only. Since each group's length is
-    # divisible by num_train_workers, the modality boundary aligns with distribution rows.
-    ordered = mm_batches + text_batches
+    # Combine: all multimodal first, then all compaction, then all text-only.
+    # Each group's length is divisible by num_train_workers, so modality
+    # boundaries align with distribution rows — every column (rank) sees
+    # exactly the same modality at step index i.
+    ordered = mm_batches + compaction_batches + text_batches
 
     assert len(ordered) % num_train_workers == 0, "Number of micro batches is not divisible by number of data ranks"
 

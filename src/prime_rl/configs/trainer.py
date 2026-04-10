@@ -27,6 +27,56 @@ EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 _ATTN_ALIASES = {"flash_attention_4": "fa4"}
 
 
+class CompactionConfig(BaseConfig):
+    """Configures KV cache compaction for the trainer's segmented forward.
+
+    Must exactly match the corresponding vLLM inference config
+    (--compaction-window-size, --compaction-stride, --block-size) or the
+    trainer's replay of KV eviction will not match inference and train-vs-
+    inference KL will explode. Cross-config consistency against the
+    orchestrator's inference engine config is NOT checked automatically
+    (the trainer and orchestrator configs are loaded separately); users
+    must keep them in sync manually. TODO: add a top-level RLConfig
+    validator to assert cross-config equality when orchestrator.inference
+    is also configured in the same TOML.
+
+    Only consulted when a TrainingSample carries compaction_events. When
+    compaction is disabled at inference (window_size == 0), TrainingSamples
+    have compaction_events=None and the trainer takes the standard forward
+    path; this config is ignored.
+
+    When `window_size > 0`, the TrainerConfig-level validator
+    `compaction_requires_hf_flash_attn` enforces that the model is using
+    `attn="flash_attention_2"` and `impl="hf"` (the numerical match with
+    vLLM's inference kernel and the past_key_values support that
+    segmented_forward requires, respectively).
+    """
+
+    window_size: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Must match vLLM's --compaction-window-size. 0 disables compaction.",
+        ),
+    ] = 0
+
+    stride: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Must match vLLM's --compaction-stride. Tokens evicted per compaction event; multiple of block_size.",
+        ),
+    ] = 0
+
+    block_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="vLLM KV cache block size. Must match the inference engine's block_size. Used to compute prompt_aligned_len = ceil(prompt_len / block_size) * block_size for the drop boundary.",
+        ),
+    ] = 16
+
+
 class GCConfig(BaseConfig):
     """Configures deterministic garbage collection to avoid stragglers in distributed training.
 
@@ -798,6 +848,13 @@ class TrainerConfig(BaseConfig):
         ),
     ] = GCConfig()
 
+    compaction: Annotated[
+        CompactionConfig,
+        Field(
+            description="KV cache compaction config. Must mirror the vLLM inference engine's compaction settings (window_size, stride, block_size). Only consulted when a TrainingSample carries compaction_events; otherwise ignored.",
+        ),
+    ] = CompactionConfig()
+
     trace_path: Annotated[Path | None, Field(description="Path to write pytorch profiler trace to.")] = None
 
     dist_timeout_seconds: Annotated[
@@ -823,6 +880,63 @@ class TrainerConfig(BaseConfig):
             description="The maximum number of concurrent runs to allow. If 1, then only one run will be allowed at a time.",
         ),
     ] = 1
+
+    @model_validator(mode="after")
+    def compaction_requires_hf_flash_attn(self):
+        """When KV cache compaction is enabled, the trainer must use the HF
+        model path with flash_attention_2. Fails early at config load so the
+        user doesn't burn hours of training only to hit a runtime assertion
+        on the first compaction sample.
+
+        - impl="hf" is required because segmented_forward uses
+          past_key_values to feed retained KV into the next segment. The
+          custom llama path (impl="custom") asserts past_key_values is None.
+          impl="auto" resolves to "custom" for supported architectures (e.g.
+          Qwen3-4B), so it is also rejected.
+        - attn="flash_attention_2" is required so the trainer's per-segment
+          attention kernel matches vLLM's decode kernel numerically. SDPA
+          and other backends produce ~0.002/layer divergence that compounds
+          to large train-inference KL across Qwen3-4B's 36 layers.
+        - compaction.stride must be positive and a multiple of
+          compaction.block_size (matches the vLLM-side constraint).
+        """
+        if self.compaction.window_size > 0:
+            if self.model.attn != "flash_attention_2":
+                raise ValueError(
+                    f"trainer.compaction.window_size > 0 requires "
+                    f"trainer.model.attn='flash_attention_2' to match vLLM's "
+                    f"inference kernel numerics. Got attn={self.model.attn!r}."
+                )
+            if self.model.impl != "hf":
+                raise ValueError(
+                    f"trainer.compaction.window_size > 0 requires "
+                    f"trainer.model.impl='hf' because segmented_forward uses "
+                    f"past_key_values between segments. The custom llama "
+                    f"implementation rejects past_key_values. Got "
+                    f"impl={self.model.impl!r} (note: 'auto' resolves to "
+                    f"'custom' for most supported models and is also rejected)."
+                )
+            if self.model.cp > 1:
+                raise ValueError(
+                    f"trainer.compaction.window_size > 0 is incompatible "
+                    f"with context parallelism (trainer.model.cp > 1). CP "
+                    f"shards input_ids along the sequence dimension, but "
+                    f"segmented_forward needs the full unsharded sequence "
+                    f"to compute segment ranges and re-feed the boundary "
+                    f"token. Got cp={self.model.cp}. Set trainer.model.cp=1."
+                )
+            if self.compaction.stride <= 0:
+                raise ValueError(
+                    "trainer.compaction.stride must be > 0 when "
+                    "compaction.window_size > 0."
+                )
+            if self.compaction.stride % self.compaction.block_size != 0:
+                raise ValueError(
+                    f"trainer.compaction.stride ({self.compaction.stride}) "
+                    f"must be a multiple of compaction.block_size "
+                    f"({self.compaction.block_size})."
+                )
+        return self
 
     @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):

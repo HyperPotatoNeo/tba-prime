@@ -11,6 +11,7 @@ from prime_rl.trainer.rl.packer import BasePacker, setup_packer
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.world import get_world
 from prime_rl.transport import MicroBatch, MicroBatchReceiver, TransportConfig, setup_micro_batch_receiver
+from prime_rl.transport.types import CompactionEventWire
 
 
 class TensorMicroBatch(TypedDict):
@@ -36,6 +37,13 @@ class TensorMicroBatch(TypedDict):
     pixel_values: Float[Tensor, "num_patches patch_dim"] | None
     # image_grid_thw: grid dimensions [num_images, 3] where each entry is [temporal, height, width]
     image_grid_thw: Int[Tensor, "num_images 3"] | None
+
+    # KV cache compaction (kv-eviction). Only set when this micro batch
+    # carries a single un-packed compaction sample. None for non-compaction
+    # micro batches.
+    compaction_events: list[CompactionEventWire] | None
+    # Prompt length for the single sample in a compaction micro batch.
+    prompt_len: int | None
 
 
 class FakeDataLoader:
@@ -108,6 +116,8 @@ class FakeDataLoader:
             "routed_experts": None,
             "pixel_values": None,
             "image_grid_thw": None,
+            "compaction_events": None,
+            "prompt_len": None,
         }
 
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
@@ -133,6 +143,8 @@ class FakeDataLoader:
             "routed_experts": None,
             "pixel_values": None,
             "image_grid_thw": None,
+            "compaction_events": None,
+            "prompt_len": None,
         }
 
 
@@ -211,4 +223,8 @@ class DataLoader:
             )  # [1, seq_len, layers, topk]
             if micro_batch.routed_experts is not None
             else None,
+            # kv-eviction: compaction_events and prompt_len are passed through
+            # unchanged (list of msgspec structs + scalar int; no tensor form).
+            compaction_events=micro_batch.compaction_events,
+            prompt_len=micro_batch.prompt_len,
         )

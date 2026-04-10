@@ -94,3 +94,9 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # is exactly one sample per micro-batch and one list of events for it.
     # None for non-compaction samples (can be packed freely).
     compaction_events: list[CompactionEventWire] | None = None
+
+    # Prompt length (= len(TrainingSample.prompt_ids), after any truncation).
+    # Only set for compaction samples; the trainer needs this to compute
+    # prompt_aligned_len = ceil(prompt_len / block_size) * block_size for
+    # segmented_forward's drop boundary. None for non-compaction samples.
+    prompt_len: int | None = None

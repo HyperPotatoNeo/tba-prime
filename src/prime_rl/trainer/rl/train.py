@@ -41,6 +41,19 @@ from prime_rl.trainer.model import (
     is_tt_moe_model,
     get_load_balance_stats,
 )
+
+try:
+    from kv_eviction.segmented_forward import (
+        compute_num_segments,
+        segmented_forward,
+    )
+except ImportError:
+    # kv_eviction is optional; only required when TrainerConfig.compaction
+    # is enabled and TrainingSamples carry compaction_events. Import failure
+    # is tolerated at module load; the assertion at the dispatch site will
+    # raise with a clearer error if compaction is actually used.
+    segmented_forward = None  # type: ignore[assignment]
+    compute_num_segments = None  # type: ignore[assignment]
 from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.utils import (
@@ -387,25 +400,144 @@ def train(config: TrainerConfig):
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
 
-            # Forward pass with per-token temperatures
-            with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
-                out = forward(
-                    model,
-                    input_ids,
-                    forward_position_ids,
-                    labels=labels,
-                    temperature=temperatures,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                    routed_experts=routed_experts,
+            # kv-eviction: dispatch to segmented_forward when this micro
+            # batch carries compaction events. Compaction samples are NOT
+            # bin-packed (enforced by the packer) so there is exactly one
+            # un-packed sample in the micro batch.
+            compaction_events = micro_batch.get("compaction_events")
+            use_segmented = compaction_events is not None and len(compaction_events) > 0
+
+            # Defense-in-depth: verify every DP rank made the SAME branch
+            # decision at this step index. prepare_batch partitions by
+            # modality so this should already hold, but if a packer
+            # regression, data corruption, or serialization drift caused
+            # rank-level divergence, we'd otherwise silently deadlock at
+            # the first intra-branch collective. A tiny all_reduce MAX/MIN
+            # on the local bool catches it cheaply and turns a NCCL hang
+            # into an informative assertion.
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                bool_tensor = torch.tensor(
+                    [int(use_segmented)], device="cuda", dtype=torch.int32
+                )
+                max_b = bool_tensor.clone()
+                min_b = bool_tensor.clone()
+                dist.all_reduce(max_b, op=dist.ReduceOp.MAX)
+                dist.all_reduce(min_b, op=dist.ReduceOp.MIN)
+                assert int(max_b.item()) == int(min_b.item()), (
+                    "Rank-level divergence in the compaction/standard "
+                    "dispatch branch. prepare_batch is supposed to enforce "
+                    "modality uniformity across DP ranks at each step index "
+                    "via per-group padding, so this should be unreachable. "
+                    "A divergence here would otherwise deadlock at the next "
+                    "FSDP all-gather or the segmented all_reduce."
                 )
 
+            if use_segmented:
+                assert segmented_forward is not None, (
+                    "Micro batch carries compaction_events but the "
+                    "kv_eviction package is not importable. Install kv_eviction "
+                    "or disable compaction on the inference engine."
+                )
+                assert config.compaction.window_size > 0, (
+                    "Micro batch has compaction_events but trainer config "
+                    "compaction.window_size is 0. The trainer's compaction "
+                    "config must mirror the inference engine's config."
+                )
+                assert config.model.attn == "flash_attention_2", (
+                    f"Compaction requires attn='flash_attention_2' to match "
+                    f"vLLM's inference kernel numerics and avoid spurious "
+                    f"train-vs-inference KL. Got attn={config.model.attn!r}. "
+                    f"Set trainer.model.attn='flash_attention_2' in the config."
+                )
+                assert config.model.impl == "hf", (
+                    f"Compaction requires impl='hf' (the custom llama path "
+                    f"asserts past_key_values is None and cannot run "
+                    f"segmented_forward). Got impl={config.model.impl!r}. "
+                    f"Set trainer.model.impl='hf' in the config."
+                )
+                assert not cp_enabled, (
+                    "Compaction is incompatible with context parallelism: "
+                    "CP shards input_ids along the sequence dimension, but "
+                    "segmented_forward needs the full unsharded sequence to "
+                    "compute segment ranges and re-feed the boundary token. "
+                    "The TrainerConfig validator rejects this combination at "
+                    "config load; this runtime assert is defense-in-depth."
+                )
+                mb_prompt_len = micro_batch.get("prompt_len")
+                assert mb_prompt_len is not None, (
+                    "compaction_events set but prompt_len missing on micro_batch"
+                )
+                bs = config.compaction.block_size
+                prompt_aligned_len = ((mb_prompt_len + bs - 1) // bs) * bs
+                segment_boundaries = [
+                    int(e.num_output_tokens_at_compaction) for e in compaction_events
+                ]
+                # Per-rank segment count may diverge across DP ranks if some
+                # samples have more compaction events than others. All-reduce
+                # MAX so every rank runs the same number of forward passes,
+                # preventing NCCL all-gather deadlock. segmented_forward pads
+                # with dummy passes on ranks whose actual count is below max.
+                #
+                # INVARIANT: all DP ranks must simultaneously take either the
+                # segmented or the standard branch within a single training
+                # step. Mixing (some ranks segmented, others standard) causes
+                # a mismatch in total forward-pass count per step and will
+                # deadlock at the next FSDP all-gather. The usual way this
+                # breaks is a very short rollout that never triggered any
+                # compaction event landing on one rank while other ranks see
+                # long rollouts with events. For Phase 3 initial testing,
+                # configure experiments so all rollouts exceed the compaction
+                # window (avoid mixing long and short rollouts in the same
+                # batch).
+                seq_len_local = input_ids.shape[1]
+                n_forwards_local = compute_num_segments(
+                    seq_len_local, mb_prompt_len, segment_boundaries
+                )
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    n_forwards_t = torch.tensor(
+                        [n_forwards_local], device="cuda", dtype=torch.int32
+                    )
+                    dist.all_reduce(n_forwards_t, op=dist.ReduceOp.MAX)
+                    max_forwards = int(n_forwards_t.item())
+                else:
+                    max_forwards = n_forwards_local
+                out = segmented_forward(
+                    model=model,
+                    input_ids=input_ids,
+                    position_ids=forward_position_ids,
+                    segment_boundaries=segment_boundaries,
+                    prompt_len=mb_prompt_len,
+                    prompt_aligned_len=prompt_aligned_len,
+                    stride=config.compaction.stride,
+                    temperature=temperatures,
+                    max_forward_passes=max_forwards,
+                )
+            else:
+                # Forward pass with per-token temperatures (standard path)
+                with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
+                    out = forward(
+                        model,
+                        input_ids,
+                        forward_position_ids,
+                        labels=labels,
+                        temperature=temperatures,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        routed_experts=routed_experts,
+                    )
+
             if out.get("logprobs") is None:
-                # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
+                # VanillaOutputLinear or segmented_forward path - compute
+                # logprobs externally. segmented_forward returns PRE-SCALED
+                # logits (temperature already applied inside), so we must
+                # NOT divide again. Standard forward returns unscaled logits.
                 assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
                 logits = out["logits"]
-                # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
-                scaled_logits = logits / temperatures.unsqueeze(-1)
+                if use_segmented:
+                    scaled_logits = logits
+                else:
+                    # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
+                    scaled_logits = logits / temperatures.unsqueeze(-1)
                 out["logprobs"] = selective_log_softmax(scaled_logits, labels)
                 out["entropy"] = compute_entropy(scaled_logits)
             # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
