@@ -424,6 +424,76 @@ class RLConfig(BaseConfig):
 
         return self
 
+    @model_validator(mode="after")
+    def validate_compaction_mirrors_inference(self):
+        """Cross-check that trainer.compaction matches inference engine args.
+
+        When KV cache compaction is in use, the trainer-side segmented
+        forward and the vLLM-side scheduler-integrated eviction must agree
+        exactly on (window_size, stride, block_size). A mismatch on any of
+        these produces silently-wrong logprobs during training:
+
+        - window_size mismatch: trainer segments differently from inference
+          events -> boundary positions drift from the actual eviction points.
+        - stride mismatch: trainer drops a different number of tokens per
+          segment boundary -> retained KV shape diverges from the inference
+          engine's post-eviction state.
+        - block_size mismatch: prompt_aligned_len used by the trainer drops
+          tokens the inference engine still holds (or vice versa), breaking
+          the retained KV identity assumption segmented_forward relies on.
+
+        Validation is bidirectional: if either side enables compaction, the
+        other side must match. Silent disagreement is the worst failure
+        mode because training appears to work but produces a wrong policy
+        gradient.
+        """
+        if self.inference is None:
+            # No local inference server configured (elastic / external
+            # pool). Can't cross-check engine args here; the trainer-side
+            # config validator still enforces internal consistency.
+            return self
+
+        vllm_extra = self.inference.vllm_extra or {}
+        inf_window = int(vllm_extra.get("compaction_window_size", 0) or 0)
+        inf_stride = int(vllm_extra.get("compaction_stride", 0) or 0)
+        inf_block_size = int(vllm_extra.get("block_size", 16) or 16)
+
+        tr_window = self.trainer.compaction.window_size
+        tr_stride = self.trainer.compaction.stride
+        tr_block_size = self.trainer.compaction.block_size
+
+        compaction_in_use = tr_window > 0 or inf_window > 0
+        if not compaction_in_use:
+            return self
+
+        mismatches: list[str] = []
+        if tr_window != inf_window:
+            mismatches.append(
+                f"window_size: trainer={tr_window}, inference.vllm_extra.compaction_window_size={inf_window}"
+            )
+        if tr_stride != inf_stride:
+            mismatches.append(
+                f"stride: trainer={tr_stride}, inference.vllm_extra.compaction_stride={inf_stride}"
+            )
+        if tr_block_size != inf_block_size:
+            mismatches.append(
+                f"block_size: trainer={tr_block_size}, inference.vllm_extra.block_size={inf_block_size} "
+                "(vLLM default is 16)"
+            )
+
+        if mismatches:
+            joined = "\n  - ".join(mismatches)
+            raise ValueError(
+                "trainer.compaction must mirror inference.vllm_extra exactly "
+                "when KV cache compaction is enabled. Mismatches:\n  - "
+                + joined
+                + "\n\nSet the missing fields in either inference.vllm_extra "
+                "(compaction_window_size, compaction_stride, block_size) or "
+                "trainer.compaction so all three values agree."
+            )
+
+        return self
+
     ### Auto-setup and validate shared configs
 
     @model_validator(mode="after")
