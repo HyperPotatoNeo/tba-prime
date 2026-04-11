@@ -132,6 +132,34 @@ def train(config: TrainerConfig):
     # Initialize parallel dimensions
     parallel_dims = get_parallel_dims(config.model)
 
+    # Early check: reject bptt_segments != 1 under multi-rank FSDP2.
+    # Compaction's per-segment backward mode issues one backward per
+    # BPTT window, and the number of real backwards per rank is
+    # ceil(per_rank_segments / K). Under DP > 1 this count varies
+    # across ranks and the dummy-pass padding inside segmented_forward
+    # can't compensate, which would deadlock on reduce-scatter at the
+    # first compaction micro-batch. Fail at training init (before any
+    # model load or data fetch) so a misconfigured run crashes
+    # immediately instead of after a few mixed-sample steps.
+    # TODO: implement max_backwards all-reduce + mixed dummy padding
+    # in segmented_forward so bptt_segments > 1 works under FSDP2.
+    if (
+        config.compaction.window_size > 0
+        and config.compaction.bptt_segments != 1
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    ):
+        raise ValueError(
+            "Compaction with trainer.compaction.bptt_segments != 1 is not "
+            "yet supported under multi-rank FSDP2 data parallelism due to "
+            "a reduce-scatter count mismatch in the dummy-pass padding "
+            "inside segmented_forward. Got world_size="
+            f"{dist.get_world_size()}, bptt_segments="
+            f"{config.compaction.bptt_segments}. Set "
+            "trainer.compaction.bptt_segments=1 (the default) for "
+            "multi-rank compaction runs, or run on a single GPU."
+        )
+
     # For single-run, check for checkpoint to resume from
     checkpoint_step = None
     if config.max_concurrent_runs == 1:
@@ -463,9 +491,28 @@ def train(config: TrainerConfig):
                     "The TrainerConfig validator rejects this combination at "
                     "config load; this runtime assert is defense-in-depth."
                 )
+                # FSDP2 + multi-rank bptt_segments != 1 constraint is
+                # already rejected at training init (see the early
+                # check after get_parallel_dims); no per-micro-batch
+                # re-check needed here.
                 mb_prompt_len = micro_batch.get("prompt_len")
                 assert mb_prompt_len is not None, (
                     "compaction_events set but prompt_len missing on micro_batch"
+                )
+                # Compaction samples MUST be batch-1. The packer
+                # (prepare_batch in trainer/batch.py) isolates each
+                # compaction sample into its own micro-batch precisely
+                # so segment-range bookkeeping and per-sample KV
+                # eviction don't have to handle bin-packing. The
+                # _segment_loss_fn closure below uses .squeeze(0) on
+                # [1, seq] slices which would silently misinterpret a
+                # batch-2+ tensor as a single sequence; this assert
+                # catches any packer regression before it corrupts
+                # training.
+                assert input_ids.shape[0] == 1, (
+                    f"Compaction samples must be batch_size=1 (packer "
+                    f"invariant), got input_ids.shape={tuple(input_ids.shape)}. "
+                    f"Check prepare_batch / _is_compaction_sample partitioning."
                 )
                 bs = config.compaction.block_size
                 prompt_aligned_len = ((mb_prompt_len + bs - 1) // bs) * bs
@@ -501,17 +548,198 @@ def train(config: TrainerConfig):
                     max_forwards = int(n_forwards_t.item())
                 else:
                     max_forwards = n_forwards_local
-                out = segmented_forward(
-                    model=model,
-                    input_ids=input_ids,
-                    position_ids=forward_position_ids,
-                    segment_boundaries=segment_boundaries,
-                    prompt_len=mb_prompt_len,
-                    prompt_aligned_len=prompt_aligned_len,
-                    stride=config.compaction.stride,
-                    temperature=temperatures,
-                    max_forward_passes=max_forwards,
-                )
+
+                # Per-segment loss closure. segmented_forward will call
+                # this after every segment's forward with the segment's
+                # pre-scaled logits and the range of full-sequence
+                # positions the segment owns. We slice the
+                # full-sequence quantities (labels, advantages, mask,
+                # inference/teacher logprobs) to match and delegate to
+                # prime-rl's standard compute_loss — no duplication of
+                # the loss formula, just range bookkeeping.
+                #
+                # Alignment detail: segment owns logit positions
+                # [full_logit_start, full_logit_end), which predict
+                # target tokens at positions [full_logit_start + 1,
+                # full_logit_end + 1). selective_log_softmax on the
+                # segment's logits against labels[:, start:end] yields
+                # per-token logprobs aligned with those target
+                # positions directly (no shift_tensor_right needed,
+                # because unlike the standard path we never look at
+                # position 0, which is a prompt token that belongs to
+                # no segment's loss range).
+                #
+                # Scaling decomposition: compute_loss sums result.loss
+                # over sequences and divides by loss_scale once at the
+                # end. The per-token loss functions (default_loss_fn,
+                # sft_loss_fn) return result.loss as a pure .sum() over
+                # token contributions, with no internal averaging.
+                # Therefore sum_over_segments(compute_loss(seg).item())
+                # == compute_loss(full_seq).item() exactly, as long as
+                # every segment call uses the SAME global loss_scale.
+                # window_loss inside segmented_forward accumulates the
+                # per-segment scaled losses (each already divided by
+                # loss_scale) before backward, so the final
+                # accumulated_loss equals the full-sample scaled loss.
+                accumulated_loss_tensors: dict[str, list[torch.Tensor]] = {}
+
+                full_seq_len = input_ids.shape[1]
+
+                def _segment_loss_fn(
+                    seg_logits: torch.Tensor,  # [1, seg_owned_logits, vocab]
+                    full_logit_start: int,
+                    full_logit_end: int,
+                ) -> torch.Tensor:
+                    # Logit at position P predicts token at P+1, so a
+                    # segment's owned logit range [full_logit_start,
+                    # full_logit_end) predicts target tokens at
+                    # [full_logit_start+1, full_logit_end+1). For the
+                    # last segment, full_logit_end == full_seq_len, and
+                    # the final logit (position full_seq_len-1) would
+                    # predict a nonexistent token at full_seq_len. The
+                    # standard path discards that logit implicitly via
+                    # shift_tensor_right; we do it explicitly here by
+                    # dropping the final logit and capping tgt_end at
+                    # full_seq_len. Matches the loss contribution of
+                    # the standard path exactly.
+                    if full_logit_end >= full_seq_len:
+                        effective_logit_end = full_seq_len - 1
+                        seg_logits_effective = seg_logits[
+                            :, : effective_logit_end - full_logit_start, :
+                        ]
+                    else:
+                        effective_logit_end = full_logit_end
+                        seg_logits_effective = seg_logits
+                    if effective_logit_end <= full_logit_start:
+                        # Degenerate: the segment owns only the final
+                        # (meaningless) logit that gets dropped by the
+                        # end-of-sequence trim. This can happen when a
+                        # compaction event fires at the very last
+                        # completion token, producing a 1-token tail
+                        # segment whose single logit is trimmed.
+                        #
+                        # Return a zero loss that's still tied to the
+                        # autograd graph so window_loss.backward()
+                        # inside segmented_forward has at least one
+                        # reachable path. seg_logits is non-empty
+                        # here (segmented_forward only creates segments
+                        # with seg_start < seg_end), so `seg_logits.sum()
+                        # * 0.0` is a scalar with a grad_fn chaining
+                        # back through the forward pass. Backward
+                        # contributes zero gradient, which is exactly
+                        # what we want for a segment with no trainable
+                        # tokens.
+                        return seg_logits.sum() * 0.0
+
+                    seg_labels = labels[:, full_logit_start:effective_logit_end]
+                    seg_raw_logprobs = selective_log_softmax(
+                        seg_logits_effective, seg_labels
+                    )
+                    # Target token positions for these logits:
+                    #   [full_logit_start + 1, effective_logit_end + 1)
+                    # which is always within [1, full_seq_len].
+                    tgt_start = full_logit_start + 1
+                    tgt_end = effective_logit_end + 1
+                    seg_adv = advantages[:, tgt_start:tgt_end]
+                    seg_mask = loss_mask[:, tgt_start:tgt_end]
+                    seg_inf = inference_logprobs[:, tgt_start:tgt_end]
+                    seg_teach = (
+                        teacher_logprobs[:, tgt_start:tgt_end]
+                        if teacher_logprobs is not None
+                        else None
+                    )
+                    seg_loss_val, seg_metrics = compute_loss(
+                        trainer_logprobs=(seg_raw_logprobs.squeeze(0),),
+                        inference_logprobs=(seg_inf.squeeze(0),),
+                        teacher_logprobs=(
+                            (seg_teach.squeeze(0),) if seg_teach is not None else None
+                        ),
+                        advantages=(seg_adv.squeeze(0),),
+                        loss_mask=(seg_mask.squeeze(0),),
+                        loss_fn=loss_fn,
+                        loss_scale=loss_scale,
+                    )
+                    # Accumulate metric tensors across segments for
+                    # later logging. compute_loss returns each metric
+                    # already stacked/concat'd for its single-sequence
+                    # input, so we just stash each segment's tensors
+                    # into lists and stack at the end.
+                    for mk, mv in seg_metrics.items():
+                        accumulated_loss_tensors.setdefault(mk, []).append(
+                            mv.detach()
+                        )
+                    return seg_loss_val
+
+                with (
+                    maybe_record_function("forward"),
+                    maybe_activation_offloading(config.model.ac_offloading),
+                ):
+                    out = segmented_forward(
+                        model=model,
+                        input_ids=input_ids,
+                        position_ids=forward_position_ids,
+                        segment_boundaries=segment_boundaries,
+                        prompt_len=mb_prompt_len,
+                        prompt_aligned_len=prompt_aligned_len,
+                        stride=config.compaction.stride,
+                        temperature=temperatures,
+                        max_forward_passes=max_forwards,
+                        loss_fn=_segment_loss_fn,
+                        bptt_segments=config.compaction.bptt_segments,
+                    )
+
+                # segmented_forward already ran backward per BPTT
+                # window; accumulated_loss is a detached scalar for
+                # logging. Aggregate per-segment metrics with
+                # torch.cat to match the shape convention the
+                # standard path produces.
+                #
+                # Shape derivation: compute_loss is called once per
+                # segment with a SINGLE-sequence one-element tuple
+                # input. Inside compute_loss (loss.py:250-255) the
+                # per-sequence scalar metrics (_safe_mean output, 0-dim)
+                # are wrapped via `torch.stack([scalar_0d])` → 1-D
+                # tensor of length 1. So `accumulated_loss_tensors[k]`
+                # is a list of shape-[1] 1-D tensors, one per segment.
+                # `torch.cat(v)` along dim 0 gives a 1-D tensor of
+                # length n_segments — same shape the standard path
+                # produces for n_sequences of packed compute_loss
+                # input, which is what downstream `compute_stats`
+                # (utils.py) expects (it asserts ndim==1 and cats
+                # across micro-steps).
+                #
+                # Known limitation: the built-in loss functions
+                # (default_loss_fn, sft_loss_fn) only emit metrics
+                # via _safe_mean, which is a per-segment average.
+                # Downstream mean-of-stacks gives a mean-of-means,
+                # not a token-weighted mean. For a sample whose
+                # segments are token-count-skewed the logged metric
+                # value diverges from what the standard path would
+                # report. The logged LOSS is still correct (sum of
+                # per-segment scaled losses == full-sample scaled
+                # loss); only the derived metrics like mismatch_kl
+                # drift. TODO: switch to weighted (sum, denom)
+                # accumulation if this metric skew matters for
+                # analysis.
+                loss = out["loss"]
+                loss_tensors: dict[str, torch.Tensor] = {}
+                for k, v in accumulated_loss_tensors.items():
+                    # Defensive: prime-rl's compute_loss produces 1-D
+                    # metric tensors for its single-sequence input.
+                    # A custom loss_fn returning a non-1-D metric
+                    # would need a different aggregation path; fail
+                    # loudly here instead of silently producing a
+                    # shape downstream compute_stats rejects.
+                    assert v[0].dim() == 1, (
+                        f"Segmented per-segment metrics must be 1-D "
+                        f"tensors (got shape {tuple(v[0].shape)} for "
+                        f"metric {k!r}); compute_loss wraps scalar "
+                        "per-sequence metrics via torch.stack so the "
+                        "1-dim is the per-sequence axis. Custom "
+                        "loss_fns that break this convention need a "
+                        "different segmented aggregation path."
+                    )
+                    loss_tensors[k] = torch.cat(v)
             else:
                 # Forward pass with per-token temperatures (standard path)
                 with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
@@ -526,55 +754,56 @@ def train(config: TrainerConfig):
                         routed_experts=routed_experts,
                     )
 
-            if out.get("logprobs") is None:
-                # VanillaOutputLinear or segmented_forward path - compute
-                # logprobs externally. segmented_forward returns PRE-SCALED
-                # logits (temperature already applied inside), so we must
-                # NOT divide again. Standard forward returns unscaled logits.
-                assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
-                logits = out["logits"]
-                if use_segmented:
-                    scaled_logits = logits
-                else:
+                if out.get("logprobs") is None:
+                    # VanillaOutputLinear path - compute logprobs externally.
+                    assert out.get("logits") is not None, "Logits must be provided to compute logprobs"
+                    logits = out["logits"]
                     # Per-token temperature scaling: temperatures is [batch, seq], logits is [batch, seq, vocab]
                     scaled_logits = logits / temperatures.unsqueeze(-1)
-                out["logprobs"] = selective_log_softmax(scaled_logits, labels)
-                out["entropy"] = compute_entropy(scaled_logits)
-            # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
+                    out["logprobs"] = selective_log_softmax(scaled_logits, labels)
+                    out["entropy"] = compute_entropy(scaled_logits)
+                # else: FusedOutputLinear was used - logprobs already computed with per-token temperatures
 
-            if cp_enabled:
-                out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
-                out["entropy"] = gather_for_cp_wo_grad(out["entropy"], cp_size, cp_group)
+                if cp_enabled:
+                    out["logprobs"] = gather_for_cp(out["logprobs"], cp_group)
+                    out["entropy"] = gather_for_cp_wo_grad(out["entropy"], cp_size, cp_group)
 
-            vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
-            # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
-            out["logprobs"] = shift_tensor_right(
-                out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
-            )
-            out["entropy"] = shift_tensor_right(
-                out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
-            )
+                vocab_size = getattr(model.config, "vocab_size", None) or model.config.text_config.vocab_size
+                # This is not really necessary as the first token should be masked out, but we do it anyway to be sure
+                out["logprobs"] = shift_tensor_right(
+                    out["logprobs"], pad_value=torch.log(torch.tensor(1.0 / vocab_size)).item()
+                )
+                out["entropy"] = shift_tensor_right(
+                    out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
+                )
 
-            # Compute loss
-            response_lengths = get_response_lengths(position_ids)
-            loss, loss_tensors = compute_loss(
-                trainer_logprobs=out["logprobs"].squeeze().split(response_lengths),
-                inference_logprobs=inference_logprobs.squeeze().split(response_lengths),
-                teacher_logprobs=teacher_logprobs.squeeze().split(response_lengths)
-                if teacher_logprobs is not None
-                else None,
-                advantages=advantages.squeeze().split(response_lengths),
-                loss_mask=loss_mask.squeeze().split(response_lengths),
-                loss_fn=loss_fn,
-                loss_scale=loss_scale,
-            )
+                # Compute loss
+                response_lengths = get_response_lengths(position_ids)
+                loss, loss_tensors = compute_loss(
+                    trainer_logprobs=out["logprobs"].squeeze().split(response_lengths),
+                    inference_logprobs=inference_logprobs.squeeze().split(response_lengths),
+                    teacher_logprobs=teacher_logprobs.squeeze().split(response_lengths)
+                    if teacher_logprobs is not None
+                    else None,
+                    advantages=advantages.squeeze().split(response_lengths),
+                    loss_mask=loss_mask.squeeze().split(response_lengths),
+                    loss_fn=loss_fn,
+                    loss_scale=loss_scale,
+                )
 
-            # Backward pass
-            with maybe_record_function("backward"):
-                loss.backward()
+                # Backward pass
+                with maybe_record_function("backward"):
+                    loss.backward()
 
-            # Add relevant tensors to tensor dict for logging purposes
-            tensors["entropy"].append(out["entropy"][loss_mask].detach().to("cpu"))
+            # Add relevant tensors to tensor dict for logging purposes.
+            # Entropy logging is skipped for segmented compaction samples:
+            # segmented_forward doesn't compute or return entropy, and
+            # doing so would require per-segment entropy aggregation that
+            # we haven't implemented yet. A zero-length tensor would
+            # confuse downstream reductions, so we only append entropy
+            # for non-segmented steps.
+            if not use_segmented:
+                tensors["entropy"].append(out["entropy"][loss_mask].detach().to("cpu"))
             tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
 
             if is_tt_moe_model(model):
@@ -588,11 +817,24 @@ def train(config: TrainerConfig):
                 loss_tensor = loss_tensor.detach().to("cpu")
                 tensors[key].append(loss_tensor)
 
-            # Debug log with *local, micro step* stats
-            micro_step_message = f"Micro Step {micro_step}/{len(micro_batches)} | Loss: {tensors['loss'][-1].mean().item():.4f} | Entropy: {tensors['entropy'][-1].mean().item():.4f}"
-            if "mismatch_kl" in tensors:
+            # Debug log with *local, micro step* stats. Entropy is not
+            # computed for compaction samples (segmented_forward returns
+            # a scalar loss, not per-token logits), so if the most recent
+            # micro-batch was segmented, `tensors['entropy']` may be empty
+            # or stale — guard the f-string access on a per-micro-step
+            # basis so the debug log never crashes with IndexError and
+            # never reports a stale entropy value from a prior micro-step.
+            micro_step_message = (
+                f"Micro Step {micro_step}/{len(micro_batches)} | "
+                f"Loss: {tensors['loss'][-1].mean().item():.4f}"
+            )
+            if not use_segmented and len(tensors["entropy"]) > 0:
+                micro_step_message += (
+                    f" | Entropy: {tensors['entropy'][-1].mean().item():.4f}"
+                )
+            if "mismatch_kl" in tensors and len(tensors["mismatch_kl"]) > 0:
                 micro_step_message += f" | Mismatch KL: {tensors['mismatch_kl'][-1].mean().item():.4f}"
-            if "max_vio" in tensors:
+            if "max_vio" in tensors and len(tensors["max_vio"]) > 0:
                 micro_step_message += f" | Max Vio: {tensors['max_vio'][-1].mean().item():.4f}"
             logger.debug(micro_step_message)
 

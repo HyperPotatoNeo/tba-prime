@@ -76,6 +76,27 @@ class CompactionConfig(BaseConfig):
         ),
     ] = 16
 
+    bptt_segments: Annotated[
+        int | None,
+        Field(
+            description=(
+                "Truncated BPTT window size in segments for the trainer's "
+                "per-segment backward mode. 1 (default) = M3 semantics, one "
+                "backward per segment, O(1 segment) memory. K > 1 = TBPTT(K), "
+                "gradients flow through retained KV within K consecutive "
+                "segments before detach, O(K segments) memory. None = full "
+                "trajectory in one BPTT window (M4 semantics, G_distal term "
+                "preserved) — requires enough memory to hold every segment's "
+                "activations simultaneously. Only consulted when window_size "
+                "> 0. NOTE: values other than 1 are currently restricted to "
+                "single-GPU runs; under multi-rank FSDP2 the reduce-scatter "
+                "count mismatch between ranks with differing per-sample "
+                "segment counts would deadlock (see the runtime check in "
+                "train.py). Multi-rank K > 1 is a TODO for a future round."
+            ),
+        ),
+    ] = 1
+
 
 class GCConfig(BaseConfig):
     """Configures deterministic garbage collection to avoid stragglers in distributed training.
@@ -935,6 +956,14 @@ class TrainerConfig(BaseConfig):
                     f"trainer.compaction.stride ({self.compaction.stride}) "
                     f"must be a multiple of compaction.block_size "
                     f"({self.compaction.block_size})."
+                )
+            if (
+                self.compaction.bptt_segments is not None
+                and self.compaction.bptt_segments < 1
+            ):
+                raise ValueError(
+                    f"trainer.compaction.bptt_segments must be None or >= 1, "
+                    f"got {self.compaction.bptt_segments}."
                 )
         return self
 
