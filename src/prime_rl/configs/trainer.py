@@ -965,6 +965,54 @@ class TrainerConfig(BaseConfig):
                     f"trainer.compaction.bptt_segments must be None or >= 1, "
                     f"got {self.compaction.bptt_segments}."
                 )
+            if self.model.ac is not None:
+                # Per-block activation checkpointing + use_cache=True +
+                # DynamicCache is a known broken combination: prime-rl's
+                # apply_ac wraps every decoder layer with torch.utils.
+                # checkpoint (non-reentrant). Under non-reentrant mode,
+                # each layer's forward is re-run during backward to
+                # recompute activations. If that forward calls
+                # DynamicCache.update() (which segmented_forward requires
+                # to thread past_key_values between segments), the
+                # re-run appends K/V to the SAME cache object a SECOND
+                # time, doubling the stored length. torch.utils.checkpoint
+                # then raises CheckpointError: "Recomputed values ...
+                # have different metadata than during the forward pass:
+                # saved [1, N, ...] vs recomputed [1, 2N, ...]".
+                #
+                # Per-segment backward mode does NOT sidestep this
+                # because the double-update happens inside
+                # window_loss.backward() within a single segment, before
+                # any subsequent segment starts. Confirmed by
+                # smoke4_rl_stability_run v3 which hit this exact error
+                # at step 0 of the first compaction-events-flowing run.
+                # probe_ac_cache_mutation.py reproduces it on a 1024-token
+                # single-segment case.
+                #
+                # Fix: remove [trainer.model.ac] from the RL config when
+                # compaction is enabled. Memory budget is still fine
+                # because segmented_forward's per-segment backward bounds
+                # activation memory to O(1 segment), which is tighter than
+                # per-block AC on the full sequence. (Smoke #4 post-fix
+                # peak memory was 43.7 GiB on 80 GB A100s — lower than
+                # the AC-enabled baseline's 59 GiB.)
+                raise ValueError(
+                    "trainer.compaction.window_size > 0 is incompatible "
+                    "with per-block activation checkpointing "
+                    "(trainer.model.ac != None). Prime-rl's per-block "
+                    "checkpoint_wrapper re-runs each decoder layer's "
+                    "forward during backward under non-reentrant mode, "
+                    "and each re-run calls DynamicCache.update() again, "
+                    "producing CheckpointError: 'Recomputed values have "
+                    "different metadata than during the forward pass' "
+                    "(saved cache length N vs recomputed 2N). Per-segment "
+                    "backward does NOT sidestep this — the double-update "
+                    "happens inside backward of a single segment. Set "
+                    "`trainer.model.ac = None` or remove the "
+                    "[trainer.model.ac] section entirely. Peak activation "
+                    "memory is still O(1 segment) because segmented_forward "
+                    "frees activations between per-segment backwards."
+                )
         return self
 
     @model_validator(mode="after")
