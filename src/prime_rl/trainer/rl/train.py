@@ -582,6 +582,15 @@ def train(config: TrainerConfig):
                 # loss_scale) before backward, so the final
                 # accumulated_loss equals the full-sample scaled loss.
                 accumulated_loss_tensors: dict[str, list[torch.Tensor]] = {}
+                # Per-segment masked entropy values, to be concat'd into
+                # a single 1-D tensor and appended to tensors["entropy"]
+                # once segmented_forward returns. Each segment pushes
+                # only its OWNED target tokens (disjoint across segments
+                # by construction — see the owned_range logic in
+                # segmented_forward) so the concatenation counts every
+                # completion token exactly once, matching the standard
+                # path's out["entropy"][loss_mask] semantics.
+                accumulated_entropy_masked: list[torch.Tensor] = []
 
                 full_seq_len = input_ids.shape[1]
 
@@ -668,6 +677,25 @@ def train(config: TrainerConfig):
                         accumulated_loss_tensors.setdefault(mk, []).append(
                             mv.detach()
                         )
+
+                    # Per-segment entropy over OWNED target tokens
+                    # masked by loss_mask. seg_logits_effective is
+                    # already temperature-scaled (segmented_forward
+                    # scales by 1/temperature before handing logits
+                    # to the loss_fn) and already boundary-trimmed,
+                    # so it matches exactly the set of logits whose
+                    # target tokens this segment owns. Indexing the
+                    # resulting [1, N] entropy tensor with seg_mask
+                    # (also shape [1, N], bool) yields the 1-D
+                    # subset of entropy values this segment should
+                    # contribute. compute_entropy runs under
+                    # torch.no_grad, so no autograd overhead.
+                    seg_entropy = compute_entropy(seg_logits_effective)
+                    accumulated_entropy_masked.append(
+                        seg_entropy.squeeze(0)[seg_mask.squeeze(0).bool()]
+                        .detach()
+                        .to("cpu")
+                    )
                     return seg_loss_val
 
                 with (
@@ -796,13 +824,34 @@ def train(config: TrainerConfig):
                     loss.backward()
 
             # Add relevant tensors to tensor dict for logging purposes.
-            # Entropy logging is skipped for segmented compaction samples:
-            # segmented_forward doesn't compute or return entropy, and
-            # doing so would require per-segment entropy aggregation that
-            # we haven't implemented yet. A zero-length tensor would
-            # confuse downstream reductions, so we only append entropy
-            # for non-segmented steps.
-            if not use_segmented:
+            # For the standard path, out["entropy"][loss_mask] is a
+            # 1-D tensor of masked per-token entropies. For the
+            # segmented path, _segment_loss_fn has already computed
+            # per-segment masked entropies and concat'ing them yields
+            # the same shape and semantics: each completion token
+            # counted exactly once (disjoint owned ranges across
+            # segments guarantee this; see the accumulated_entropy_masked
+            # init comment above).
+            if use_segmented:
+                if accumulated_entropy_masked:
+                    tensors["entropy"].append(
+                        torch.cat(accumulated_entropy_masked)
+                    )
+                else:
+                    # Degenerate sample: every segment short-circuited
+                    # to the zero-loss tail branch (all final logits
+                    # trimmed, no owned tokens). Append an empty 1-D
+                    # tensor with the same dtype the standard path
+                    # produces (bfloat16, since compute_entropy
+                    # preserves the model's output dtype and compaction
+                    # requires flash_attention_2 → half precision).
+                    # Dtype consistency matters because
+                    # Tensors.compute_stats torch.cat's the entire list
+                    # across micro-batches and will fail on a mismatch.
+                    tensors["entropy"].append(
+                        torch.zeros(0, dtype=torch.bfloat16)
+                    )
+            else:
                 tensors["entropy"].append(out["entropy"][loss_mask].detach().to("cpu"))
             tensors["loss"].append(loss.detach().to("cpu").unsqueeze(0))
 
@@ -817,18 +866,20 @@ def train(config: TrainerConfig):
                 loss_tensor = loss_tensor.detach().to("cpu")
                 tensors[key].append(loss_tensor)
 
-            # Debug log with *local, micro step* stats. Entropy is not
-            # computed for compaction samples (segmented_forward returns
-            # a scalar loss, not per-token logits), so if the most recent
-            # micro-batch was segmented, `tensors['entropy']` may be empty
-            # or stale — guard the f-string access on a per-micro-step
-            # basis so the debug log never crashes with IndexError and
-            # never reports a stale entropy value from a prior micro-step.
+            # Debug log with *local, micro step* stats. Entropy is now
+            # computed for both the standard path (out["entropy"][loss_mask])
+            # and the segmented path (per-segment compute_entropy over
+            # owned target tokens, concatenated). Both paths append a
+            # 1-D tensor per micro-batch, so indexing [-1] is always
+            # safe as long as the list is non-empty. On the rare
+            # degenerate segmented case (all segments had zero owned
+            # tokens), the appended tensor is zero-length and .mean()
+            # returns NaN — acceptable for a debug log.
             micro_step_message = (
                 f"Micro Step {micro_step}/{len(micro_batches)} | "
                 f"Loss: {tensors['loss'][-1].mean().item():.4f}"
             )
-            if not use_segmented and len(tensors["entropy"]) > 0:
+            if len(tensors["entropy"]) > 0 and tensors["entropy"][-1].numel() > 0:
                 micro_step_message += (
                     f" | Entropy: {tensors['entropy'][-1].mean().item():.4f}"
                 )
