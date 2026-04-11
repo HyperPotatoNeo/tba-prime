@@ -14,12 +14,39 @@ import verifiers as vf
 from verifiers.serve import ZMQEnvClient, ZMQEnvServer
 from verifiers.utils.serve_utils import get_free_port
 
+# Importing kv_eviction triggers its module-level monkey-patches on
+# verifiers (see kv_eviction/env.py:_install_compaction_event_hooks).
+# Those patches plumb compaction_events from vLLM ChatCompletion
+# responses through verifiers' client adapter and MultiTurnEnv's
+# add_model_response into the trajectory step's extras dict. Without
+# this import firing in the orchestrator process AND in the env-server
+# subprocess (see _spawn_env_server_target below), verifiers silently
+# drops compaction_events during response conversion and the trainer
+# never sees any events. This import is for its side effect only; the
+# name `kv_eviction` is unused at module scope.
+import kv_eviction  # noqa: F401
+
 from prime_rl.configs.orchestrator import EnvConfig, EvalEnvConfig, TrainEnvConfig
 from prime_rl.orchestrator.eval_utils import compute_pass_at_k
 from prime_rl.orchestrator.vf_utils import get_completion_len
 from prime_rl.utils.logger import ProgressTracker, get_logger
 from prime_rl.utils.monitor import get_monitor
 from prime_rl.utils.utils import capitalize
+
+
+def _env_server_subprocess_entrypoint(*args, **kwargs):
+    """Subprocess target that ensures kv_eviction's verifiers monkey-
+    patches are installed BEFORE ZMQEnvServer.run_server runs.
+
+    The env server spawns via `mp.get_context("spawn").Process`, which
+    starts a fresh Python interpreter. Without this wrapper the
+    subprocess never imports kv_eviction — it only imports
+    ZMQEnvServer.run_server directly — and the compaction-event
+    plumbing patches never apply in the process that actually runs
+    rollouts and calls add_model_response.
+    """
+    import kv_eviction  # noqa: F401 — triggers monkey-patches at import
+    ZMQEnvServer.run_server(*args, **kwargs)
 
 REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
 
@@ -84,7 +111,7 @@ class Env:
         address = f"tcp://127.0.0.1:{get_free_port()}"
         get_logger().debug(f"Spawning env server {self.name} ({address=}, {num_workers=})")
         process = mp.get_context("spawn").Process(
-            target=ZMQEnvServer.run_server,
+            target=_env_server_subprocess_entrypoint,
             args=(
                 self.config.stripped_id,
                 self.config.args,
