@@ -678,19 +678,31 @@ def train(config: TrainerConfig):
                             mv.detach()
                         )
 
-                    # Per-segment entropy over OWNED target tokens
-                    # masked by loss_mask. seg_logits_effective is
-                    # already temperature-scaled (segmented_forward
-                    # scales by 1/temperature before handing logits
-                    # to the loss_fn) and already boundary-trimmed,
-                    # so it matches exactly the set of logits whose
-                    # target tokens this segment owns. Indexing the
-                    # resulting [1, N] entropy tensor with seg_mask
-                    # (also shape [1, N], bool) yields the 1-D
-                    # subset of entropy values this segment should
-                    # contribute. compute_entropy runs under
-                    # torch.no_grad, so no autograd overhead.
-                    seg_entropy = compute_entropy(seg_logits_effective)
+                    # Per-segment entropy over OWNED target tokens masked
+                    # by loss_mask. seg_logits_effective is already
+                    # temperature-scaled by segmented_forward and
+                    # boundary-trimmed, so it matches exactly the set
+                    # of logits whose target tokens this segment owns.
+                    #
+                    # We INLINE the entropy math instead of calling
+                    # prime_rl.trainer.rl.loss.compute_entropy, which
+                    # has @torch.compile(dynamic=True). Each segment
+                    # produces a different [1, N, vocab] shape, and
+                    # torch.compile's dynamic-shape handling does not
+                    # generalize across the sizes segmented_forward
+                    # produces — first smoke attempt with the compiled
+                    # variant stalled all 4 DP ranks for 25+ minutes
+                    # on step 0 (Inductor recompile thrash). The
+                    # inlined math runs under torch.no_grad so there
+                    # is no autograd overhead.
+                    with torch.no_grad():
+                        lse = torch.logsumexp(seg_logits_effective, dim=-1)
+                        pd = torch.nn.functional.softmax(
+                            seg_logits_effective, dim=-1
+                        )
+                        seg_entropy = lse - torch.sum(
+                            pd * seg_logits_effective, dim=-1
+                        )
                     accumulated_entropy_masked.append(
                         seg_entropy.squeeze(0)[seg_mask.squeeze(0).bool()]
                         .detach()
