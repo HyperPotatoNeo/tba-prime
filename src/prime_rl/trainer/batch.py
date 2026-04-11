@@ -27,10 +27,22 @@ def _clamp_compaction_events(
     return kept or None
 
 
-def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch:
+def prepare_sample(
+    training_example: TrainingSample,
+    seq_len: int,
+    compaction_enabled: bool = False,
+) -> MicroBatch:
     """
     Prepare a problem for sequence packing training.
     Tokenize and prepare tensors.
+
+    When compaction_enabled=True, EVERY sample gets a prompt_len set on
+    its MicroBatch, even samples whose inference rollout didn't trigger
+    any compaction event. The trainer in a compaction run routes every
+    sample through segmented_forward (samples without events run as a
+    single-segment forward), and segmented_forward needs prompt_len to
+    compute prompt_aligned_len for its owned-range bookkeeping. See D5
+    fix notes in plans/phase3_training_integration.md.
     """
     input_ids = training_example.prompt_ids + training_example.completion_ids
     loss_mask = training_example.prompt_mask + training_example.completion_mask
@@ -90,12 +102,17 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             f"routed_experts: {len(routed_experts)}, input_ids: {len(input_ids)}"
         )
 
-    # Set prompt_len on the MicroBatch ONLY for compaction samples (the
-    # trainer needs it to compute prompt_aligned_len for segmented_forward).
-    # Non-compaction samples leave it None so the msgspec wire format stays
-    # backwards-compatible with existing pipelines.
+    # Set prompt_len on the MicroBatch for samples the trainer will
+    # route through segmented_forward. In compaction runs
+    # (compaction_enabled=True) that's every sample, because the
+    # trainer dispatches ALL non-multimodal micro-batches through
+    # segmented_forward — samples with empty events run as a single-
+    # segment forward, samples with events run as a multi-segment
+    # forward. Outside compaction runs, only samples that actually
+    # carry events need prompt_len set (preserving the msgspec wire
+    # format for existing non-compaction pipelines).
     prompt_len: int | None = None
-    if compaction_events:
+    if compaction_events or compaction_enabled:
         # Post-truncation prompt length. If truncation cut INTO the prompt
         # itself (extreme case), use the new length; otherwise it's the
         # original prompt length.
@@ -128,6 +145,15 @@ def _is_multimodal_sample(sample: MicroBatch) -> bool:
 def _is_compaction_sample(sample: MicroBatch) -> bool:
     """Check if a sample carries KV cache compaction events.
 
+    Note: this only tests whether the INFERENCE rollout triggered
+    compaction. In a compaction training run (compaction_enabled=True
+    at the call sites below), the trainer also routes event-less
+    samples through segmented_forward, so the dispatch-side treatment
+    of "compaction-like" is OR-ed with compaction_enabled at every
+    call site. This function is kept as the narrow test because it's
+    still the right test for "does this sample carry event metadata
+    the segmented path must consume".
+
     Compaction samples CANNOT be bin-packed with any other sample because:
     1. The trainer dispatches to segmented_forward per-sample, and
        segmented_forward expects batch_size=1 with a single contiguous
@@ -141,7 +167,10 @@ def _is_compaction_sample(sample: MicroBatch) -> bool:
 
 
 def packed_samples_into_micro_bs(
-    samples: list[tuple[int, MicroBatch]], max_seq_len: int, num_loras: int
+    samples: list[tuple[int, MicroBatch]],
+    max_seq_len: int,
+    num_loras: int,
+    compaction_enabled: bool = False,
 ) -> list[MicroBatch]:
     """
     Pack samples into micro_batch efficiently.
@@ -153,6 +182,13 @@ def packed_samples_into_micro_bs(
 
     NOTE: Compaction samples (with compaction_events) are also NOT packed
     together. See _is_compaction_sample docstring for rationale.
+
+    When compaction_enabled=True, EVERY non-multimodal sample is treated
+    as compaction-style (each becomes its own un-packed micro-batch) so
+    the trainer can route all samples through segmented_forward. This is
+    the D5 fix: eliminates the packed-text micro-batches whose
+    compaction<->text modality transition caused the smoke-#4 OOM. See
+    plans/phase3_training_integration.md.
     """
     # Sort by (lora_idx, -length) for packing efficiency
     samples.sort(key=lambda x: (x[0], -len(x[1].input_ids)))
@@ -162,8 +198,14 @@ def packed_samples_into_micro_bs(
 
     for idx, sample in samples:
         # Multimodal and compaction samples cannot be packed - each becomes
-        # its own micro batch.
-        if _is_multimodal_sample(sample) or _is_compaction_sample(sample):
+        # its own micro batch. In compaction runs, every non-multimodal
+        # sample is un-packed for the same reason (goes through
+        # segmented_forward which requires batch_size=1).
+        if (
+            _is_multimodal_sample(sample)
+            or _is_compaction_sample(sample)
+            or compaction_enabled
+        ):
             sample.lora_num_tokens = [0] * num_loras
             sample.lora_num_tokens[idx] = len(sample.input_ids)
             micro_batches.append(sample)
@@ -200,13 +242,22 @@ def packed_samples_into_micro_bs(
     return micro_batches
 
 
-def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBatch:
+def pad_micro_batch(
+    micro_batch: MicroBatch,
+    pad_to_multiple_of: int,
+    compaction_enabled: bool = False,
+) -> MicroBatch:
     """
     Pad a micro batch with the given padding size sample
     Return the padded micro batch.
     Args:
         micro_batch: The micro batch to pad.
         padding_size: The number of padding tokens to add.
+        compaction_enabled: When True, treat this micro batch as
+            compaction-style (continuous position_ids) even if it has
+            no compaction events, so it can be routed through
+            segmented_forward in the unified dispatch path. Part of
+            the D5 fix.
     Returns:
         The padded micro batch.
     """
@@ -222,8 +273,10 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
     # Compaction samples require continuous position_ids (segmented_forward
     # uses them as absolute RoPE positions over the whole concatenated
     # sequence). For packed text/multimodal samples, padding position_ids
-    # restart at 0 to mark a new cu_seqlens boundary.
-    if _is_compaction_sample(micro_batch):
+    # restart at 0 to mark a new cu_seqlens boundary. In a compaction run
+    # we use the continuous layout for ALL samples since they'll all go
+    # through segmented_forward.
+    if _is_compaction_sample(micro_batch) or compaction_enabled:
         last_pos = micro_batch.position_ids[-1] if micro_batch.position_ids else -1
         micro_batch.position_ids.extend(
             list(range(last_pos + 1, last_pos + 1 + padding_size))
@@ -266,6 +319,7 @@ def prepare_batch(
     idxs: list[int],
     num_loras: int,
     pad_to_multiple_of: int = 1,
+    compaction_enabled: bool = False,
 ) -> list[list[MicroBatch]]:
     """
     Prepare a batch of problems for each GPU. Each batch is a list of micro batches.
@@ -278,29 +332,49 @@ def prepare_batch(
 
     Three modality buckets:
     1. Multimodal (pixel_values set) — triggers vision encoder.
-    2. Compaction (compaction_events set) — triggers segmented_forward with
-       multiple forward passes per micro-batch instead of the standard single
-       pass. If one rank takes the segmented branch and another the standard
-       branch at the same step index, they diverge in FSDP all-gather counts
+    2. Compaction (compaction_events set, OR compaction_enabled=True) —
+       triggers segmented_forward with multiple forward passes per
+       micro-batch instead of the standard single pass. If one rank
+       takes the segmented branch and another the standard branch at
+       the same step index, they diverge in FSDP all-gather counts
        and NCCL deadlocks.
     3. Text (neither) — the default single-pass path.
-    """
-    all_samples = [(idx, prepare_sample(rollout, seq_len)) for idx, rollout in zip(idxs, rollouts)]
 
-    micro_batches = packed_samples_into_micro_bs(all_samples, seq_len, num_loras)
-    micro_batches = [pad_micro_batch(micro_batch, pad_to_multiple_of) for micro_batch in micro_batches]
+    When compaction_enabled=True every non-multimodal sample is treated
+    as compaction-style, so text_batches is always empty in compaction
+    runs. The trainer then routes every micro-batch through
+    segmented_forward — samples with empty events run as a single
+    segment (equivalent to a standard text forward on that one sample).
+    This is the D5 fix eliminating the compaction <-> text transition
+    that caused the smoke-#4 OOM.
+    """
+    all_samples = [
+        (idx, prepare_sample(rollout, seq_len, compaction_enabled=compaction_enabled))
+        for idx, rollout in zip(idxs, rollouts)
+    ]
+
+    micro_batches = packed_samples_into_micro_bs(
+        all_samples, seq_len, num_loras, compaction_enabled=compaction_enabled
+    )
+    micro_batches = [
+        pad_micro_batch(mb, pad_to_multiple_of, compaction_enabled=compaction_enabled)
+        for mb in micro_batches
+    ]
 
     # Separate by modality so each step index has uniform modality across all ranks.
     # Order of checks matters: compaction samples may technically also be
     # multimodal in the future, but today they're mutually exclusive.
+    def _treat_as_compaction(b: MicroBatch) -> bool:
+        return _is_compaction_sample(b) or compaction_enabled
+
     mm_batches = [b for b in micro_batches if _is_multimodal_sample(b)]
     compaction_batches = [
         b for b in micro_batches
-        if not _is_multimodal_sample(b) and _is_compaction_sample(b)
+        if not _is_multimodal_sample(b) and _treat_as_compaction(b)
     ]
     text_batches = [
         b for b in micro_batches
-        if not _is_multimodal_sample(b) and not _is_compaction_sample(b)
+        if not _is_multimodal_sample(b) and not _treat_as_compaction(b)
     ]
 
     # Pad each group independently so its count is divisible by num_train_workers

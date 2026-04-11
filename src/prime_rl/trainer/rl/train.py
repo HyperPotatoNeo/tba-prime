@@ -1,7 +1,26 @@
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
 
 from contextlib import nullcontext
+import os
 import time
+
+# D5 debug: memory trace at every micro-batch boundary. Guarded by env
+# var so non-debug runs are unaffected. When KVE_MEM_TRACE=1, each
+# micro-batch logs its path, pre/post-forward/backward memory_allocated
+# and max_memory_allocated, so we can see exactly where memory grows
+# across the compaction -> text transition on step 1 (see D5
+# investigation notes in plans/phase3_training_integration.md).
+_KVE_MEM_TRACE = os.environ.get("KVE_MEM_TRACE") == "1"
+
+
+def _mem_snap(tag: str) -> str:
+    if not _KVE_MEM_TRACE:
+        return ""
+    import torch as _t
+    alloc = _t.cuda.memory_allocated() / 1e9
+    peak = _t.cuda.max_memory_allocated() / 1e9
+    reserved = _t.cuda.memory_reserved() / 1e9
+    return f"[MEM] {tag} alloc={alloc:.3f}GB peak={peak:.3f}GB reserved={reserved:.3f}GB"
 from datetime import timedelta
 
 # Import environment before any other imports
@@ -254,6 +273,12 @@ def train(config: TrainerConfig):
             config.model.cp,
             tokenizer,
             config.rollout_transport,
+            # D5 fix: when compaction training is on, tell the packer to
+            # un-pack every sample into its own micro-batch so every
+            # micro-batch routes through segmented_forward. Eliminates
+            # the compaction <-> text transition that caused smoke-#4
+            # OOM. See plans/phase3_training_integration.md.
+            compaction_enabled=config.compaction.window_size > 0,
         )
 
     gc_handler = GarbageCollection(config.gc.interval) if config.gc else None
@@ -367,6 +392,27 @@ def train(config: TrainerConfig):
         cp_size = parallel_dims.cp
 
         for micro_step, micro_batch in enumerate(micro_batches):
+            if _KVE_MEM_TRACE:
+                # "EVT" = sample has real compaction events (multi-
+                # segment segmented_forward); "NOEVT" = sample is
+                # event-less (single-segment in a compaction run, or
+                # packed text in a non-compaction run). In a compaction
+                # run both types take the segmented path; only the
+                # segment count differs.
+                _compaction_flag = (
+                    "EVT" if (
+                        micro_batch.get("compaction_events") is not None
+                        and len(micro_batch.get("compaction_events") or []) > 0
+                    ) else "NOEVT"
+                )
+                _seq = micro_batch["input_ids"].shape[1]
+                torch.cuda.reset_peak_memory_stats()
+                logger.info(
+                    _mem_snap(
+                        f"mb {micro_step}/{len(micro_batches)} "
+                        f"{_compaction_flag} seq={_seq} ENTRY"
+                    )
+                )
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")
@@ -428,12 +474,25 @@ def train(config: TrainerConfig):
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
 
-            # kv-eviction: dispatch to segmented_forward when this micro
-            # batch carries compaction events. Compaction samples are NOT
-            # bin-packed (enforced by the packer) so there is exactly one
-            # un-packed sample in the micro batch.
-            compaction_events = micro_batch.get("compaction_events")
-            use_segmented = compaction_events is not None and len(compaction_events) > 0
+            # kv-eviction: in a compaction training run, route EVERY
+            # micro-batch through segmented_forward, even samples whose
+            # inference rollout didn't trigger a compaction event.
+            # Samples with empty events run as a single-segment forward
+            # (numerically equivalent to a standard text forward on the
+            # same unpacked sample). Samples with events run multi-
+            # segment. Every sample is un-packed by the packer (see the
+            # compaction_enabled thread in trainer/batch.py).
+            #
+            # Pre-D5 behavior was `use_segmented = <sample has events>`,
+            # which left event-less short rollouts on the packed text
+            # path. The resulting compaction <-> text modality
+            # transition inside a single step caused the smoke-#4 OOM
+            # cascade: the allocator held ~11 GB of cached blocks sized
+            # for per-segment tensor patterns that didn't fit the
+            # contiguous shapes the packed text forward needed. See
+            # plans/phase3_training_integration.md D5 section.
+            compaction_events = micro_batch.get("compaction_events") or []
+            use_segmented = config.compaction.window_size > 0
 
             # Defense-in-depth: verify every DP rank made the SAME branch
             # decision at this step index. prepare_batch partitions by
@@ -497,7 +556,11 @@ def train(config: TrainerConfig):
                 # re-check needed here.
                 mb_prompt_len = micro_batch.get("prompt_len")
                 assert mb_prompt_len is not None, (
-                    "compaction_events set but prompt_len missing on micro_batch"
+                    "prompt_len missing on micro_batch in compaction run "
+                    "(compaction.window_size > 0). prepare_sample should "
+                    "set prompt_len on EVERY sample when compaction_enabled "
+                    "is True; a missing value points to a wire-format or "
+                    "packer regression."
                 )
                 # Compaction samples MUST be batch-1. The packer
                 # (prepare_batch in trainer/batch.py) isolates each
@@ -901,6 +964,17 @@ def train(config: TrainerConfig):
                 micro_step_message += f" | Max Vio: {tensors['max_vio'][-1].mean().item():.4f}"
             logger.debug(micro_step_message)
 
+            if _KVE_MEM_TRACE:
+                logger.info(
+                    _mem_snap(
+                        f"mb {micro_step}/{len(micro_batches)} "
+                        f"{_compaction_flag} EXIT"
+                    )
+                )
+
+        if _KVE_MEM_TRACE:
+            logger.info(_mem_snap(f"step {progress.step} PRE-OPTIM"))
+
         # Optionally, clip the gradients
         grad_norm: torch.Tensor | None = None
         if config.optim.max_norm is not None:
@@ -915,6 +989,8 @@ def train(config: TrainerConfig):
         # Update the model parameters
         optimizer.step()
         optimizer.zero_grad()
+        if _KVE_MEM_TRACE:
+            logger.info(_mem_snap(f"step {progress.step} POST-OPTIM"))
 
         # Update learning rate scheduler
         scheduler.step()
