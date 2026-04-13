@@ -63,7 +63,14 @@ def prepare_sample(
     # clamped below if the completion was truncated to fit seq_len.
     compaction_events = training_example.compaction_events
 
-    if len(input_ids) > seq_len:
+    # Truncate to seq_len for non-compaction runs only. In compaction runs,
+    # segmented_forward processes one segment at a time with bptt_segments=1,
+    # so peak memory is bounded by the largest segment (~prompt_len tokens)
+    # regardless of total sequence length. Truncating here would discard
+    # tokens that inference sampled (and compaction events that reference
+    # them), wasting inference compute and breaking the invariant that the
+    # trainer trains on everything the rollout produced.
+    if len(input_ids) > seq_len and not compaction_enabled:
         input_ids = input_ids[:seq_len]
         loss_mask = loss_mask[:seq_len]
         inference_logprobs = inference_logprobs[:seq_len]

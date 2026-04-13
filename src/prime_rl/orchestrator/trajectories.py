@@ -319,6 +319,7 @@ def interleave_rollout(
                         ),
                         tokens_evicted=int(e["tokens_evicted"]),
                         position_offset_after=int(e["position_offset_after"]),
+                        num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
                     )
                 )
             elif isinstance(e, (list, tuple)) and len(e) >= 3:
@@ -328,6 +329,7 @@ def interleave_rollout(
                         num_output_tokens_at_compaction=int(e[0]),
                         tokens_evicted=int(e[1]),
                         position_offset_after=int(e[2]),
+                        num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
                     )
                 )
         return out or None
@@ -340,6 +342,29 @@ def interleave_rollout(
             return None
         prepared_steps.append(prepared)
         step_compaction_events.append(_compaction_events_from_step(step))
+
+    # --- Diagnostic: detect coordinate mismatch between compaction events
+    # and completion_ids BEFORE the merge loop runs (and potentially asserts).
+    for diag_idx, (diag_tokens, diag_events) in enumerate(
+        zip(prepared_steps, step_compaction_events)
+    ):
+        if diag_events:
+            max_raw = max(e.num_output_tokens_at_compaction for e in diag_events)
+            clen = len(diag_tokens["completion_ids"])
+            total_evicted = sum(e.tokens_evicted for e in diag_events)
+            events_summary = [(e.num_output_tokens_at_compaction, e.tokens_evicted)
+                              for e in diag_events]
+            logger.warning(
+                f"[DIAG] step {diag_idx}: max_event_raw={max_raw}  "
+                f"completion_ids_len={clen}  total_evicted={total_evicted}  "
+                f"gap={max_raw - clen}  events={events_summary}"
+            )
+            if max_raw > clen:
+                logger.error(
+                    f"[DIAG] MISMATCH step {diag_idx}: max_event_raw={max_raw} > "
+                    f"completion_ids_len={clen} (gap={max_raw - clen}). This will "
+                    f"cause non-monotonic boundary assertion in merge."
+                )
 
     def make_sample(
         tokens: dict[str, Any],
@@ -426,20 +451,67 @@ def interleave_rollout(
         if matched_idx is not None:
             # Extension holds - merge into matched sample
             prefix_tokens, sample, _ = active_samples[matched_idx]
-            # Compaction + multi-step extension is not yet supported: the
-            # events from this step would need their num_output_tokens_at_compaction
-            # offset by the existing sample length AND merged with the previous
-            # step's events. Single-turn (trajectory length 1) is the only
-            # supported configuration for MKV-RL Phase 3 initial scope. Raise
-            # rather than silently produce wrong boundaries.
-            if step_compaction_events[step_idx] is not None:
-                raise NotImplementedError(
-                    f"Compaction events on extended trajectory step "
-                    f"{step_idx} are not supported yet. Use SingleTurnEnv "
-                    f"with compaction, or extend interleave_rollout to "
-                    f"offset and merge per-step events."
+            prefix_len = len(prefix_tokens)
+
+            # Offset compaction events: num_output_tokens_at_compaction is
+            # per-turn-relative, shift to merged completion_ids coordinates.
+            step_events = step_compaction_events[step_idx]
+            if step_events is not None:
+                current_completion_len = len(sample.completion_ids)
+                new_prompt_ext_len = len(tokens["prompt_ids"]) - prefix_len
+                assert new_prompt_ext_len >= 0, (
+                    f"Step {step_idx} prompt ({len(tokens['prompt_ids'])} tokens) "
+                    f"shorter than matched prefix ({prefix_len} tokens)"
                 )
-            extend_sample(sample, len(prefix_tokens), step_idx=step_idx)
+                generation_offset = current_completion_len + new_prompt_ext_len
+
+                step_completion_len = len(tokens["completion_ids"])
+                prev_last = (sample.compaction_events[-1] if sample.compaction_events else None)
+                logger.warning(
+                    f"[DIAG-MERGE] step {step_idx}: "
+                    f"current_completion_len={current_completion_len}  "
+                    f"new_prompt_ext_len={new_prompt_ext_len}  "
+                    f"generation_offset={generation_offset}  "
+                    f"step_completion_ids_len={step_completion_len}  "
+                    f"prefix_len={prefix_len}  "
+                    f"num_events={len(step_events)}  "
+                    f"prev_last={prev_last}"
+                )
+
+                existing = sample.compaction_events or []
+                for e in step_events:
+                    offsetted = e.num_output_tokens_at_compaction + generation_offset
+                    if existing:
+                        prev = existing[-1].num_output_tokens_at_compaction
+                        assert offsetted >= prev, (
+                            f"Non-monotonic compaction boundary at step {step_idx}: "
+                            f"offsetted={offsetted} < prev={prev} "
+                            f"(raw={e.num_output_tokens_at_compaction}, "
+                            f"generation_offset={generation_offset})"
+                        )
+                        if offsetted == prev:
+                            # Two compaction events at the same merged position
+                            # (e.g. compaction fires at the very start of a new
+                            # turn, landing on the same boundary as the previous
+                            # turn's last event). Merge into the existing event.
+                            existing[-1] = CompactionEventWire(
+                                num_output_tokens_at_compaction=offsetted,
+                                tokens_evicted=existing[-1].tokens_evicted + e.tokens_evicted,
+                                position_offset_after=e.position_offset_after,
+                                num_prompt_tokens=e.num_prompt_tokens,
+                            )
+                            continue
+                    existing.append(
+                        CompactionEventWire(
+                            num_output_tokens_at_compaction=offsetted,
+                            tokens_evicted=e.tokens_evicted,
+                            position_offset_after=e.position_offset_after,
+                            num_prompt_tokens=e.num_prompt_tokens,
+                        )
+                    )
+                sample.compaction_events = existing
+
+            extend_sample(sample, prefix_len, step_idx=step_idx)
             active_samples[matched_idx][0] = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples[matched_idx][2] = step_idx
         else:

@@ -95,7 +95,7 @@ class WandbMonitor(Monitor):
         if config is not None and isinstance(config, WandbWithExtrasConfig) and config.log_extras:
             if config.log_extras.samples:
                 self.last_log_samples_step = -1
-                self.samples_cols = ["step", "env_name", "task", "example_id", "messages", "input_ids", "reward"]
+                self.samples_cols = ["step", "env_name", "task", "example_id", "messages", "input_ids", "reward", "compaction_events"]
                 self.samples_table = wandb.Table(
                     columns=self.samples_cols,
                     log_mode="INCREMENTAL",
@@ -159,6 +159,30 @@ class WandbMonitor(Monitor):
             tokens = last_step["tokens"]
             full_ids = tokens["prompt_ids"] + tokens["completion_ids"]
             messages_text = self.tokenizer.decode(full_ids)
+
+            # Extract per-step compaction events from trajectory extras.
+            per_step_events = []
+            for traj_step in trajectory:
+                extras = traj_step.get("extras") or {}
+                raw = extras.get("compaction_events")
+                if raw:
+                    per_step_events.append([
+                        {
+                            "n": e.get("num_output_tokens_at_compaction", e[0] if isinstance(e, (list, tuple)) else 0),
+                            "evicted": e.get("tokens_evicted", e[1] if isinstance(e, (list, tuple)) else 0),
+                            "offset": e.get("position_offset_after", e[2] if isinstance(e, (list, tuple)) else 0),
+                            "prompt": e.get("num_prompt_tokens", (e[3] if len(e) >= 4 else 0) if isinstance(e, (list, tuple)) else 0),
+                        } if isinstance(e, dict) else {
+                            "n": e[0] if isinstance(e, (list, tuple)) else getattr(e, "num_output_tokens_at_compaction", 0),
+                            "evicted": e[1] if isinstance(e, (list, tuple)) else getattr(e, "tokens_evicted", 0),
+                            "offset": e[2] if isinstance(e, (list, tuple)) else getattr(e, "position_offset_after", 0),
+                            "prompt": (e[3] if len(e) >= 4 else 0) if isinstance(e, (list, tuple)) else getattr(e, "num_prompt_tokens", 0),
+                        }
+                        for e in raw
+                    ])
+                else:
+                    per_step_events.append(None)
+
             sample = {
                 "step": step,
                 "env_name": rollout.get("env_name"),
@@ -167,6 +191,7 @@ class WandbMonitor(Monitor):
                 "messages": messages_text,
                 "input_ids": str(full_ids),
                 "reward": rollout["reward"],
+                "compaction_events": json.dumps(per_step_events),
             }
             assert list(sample.keys()) == self.samples_cols, (
                 "Order of columns in the table must be the same as order of the keys here"
