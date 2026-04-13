@@ -240,6 +240,8 @@ def interleave_rollout(
     output: vf.RolloutOutput,
     vlm_cache: "VLMImageCache | None" = None,
     cache_key: int | None = None,
+    tokenizer: PreTrainedTokenizer | None = None,
+    log_evicted_text: bool = False,
 ) -> list[TrainingSample] | None:
     """
     Convert vf.RolloutOutput to trainable rollouts by interleaving trajectory steps
@@ -282,9 +284,26 @@ def interleave_rollout(
     def prepare_step_tokens(step: vf.TrajectoryStep, step_idx: int) -> dict[str, Any] | None:
         tokens = step["tokens"]
         if tokens is not None:
+            prompt_ids = list(tokens["prompt_ids"])
+            prompt_mask = [bool(i) for i in tokens["prompt_mask"]]
+
+            # Block-aligned padding mode: the kv_eviction interceptor
+            # stashed the EXACT padded token stream vLLM ran on in the
+            # step's extras. Override the verifiers-re-tokenized prompt_ids
+            # (which is unpadded) so the trainer sees what inference saw.
+            # prompt_mask is rebuilt as all-False because (a) every prompt
+            # position is no-gradient by construction and (b) the existing
+            # per-token verifiers mask applies to the unpadded sequence
+            # and can't be re-aligned cheaply.
+            extras = step.get("extras")
+            padded_ids = extras.get("prompt_token_ids") if extras else None
+            if padded_ids:
+                prompt_ids = [int(x) for x in padded_ids]
+                prompt_mask = [False] * len(prompt_ids)
+
             return {
-                "prompt_ids": list(tokens["prompt_ids"]),
-                "prompt_mask": [bool(i) for i in tokens["prompt_mask"]],
+                "prompt_ids": prompt_ids,
+                "prompt_mask": prompt_mask,
                 "completion_ids": list(tokens["completion_ids"]),
                 "completion_mask": [bool(i) for i in tokens["completion_mask"]],
                 "completion_logprobs": list(tokens["completion_logprobs"]),
@@ -345,13 +364,126 @@ def interleave_rollout(
 
     # --- Diagnostic: detect coordinate mismatch between compaction events
     # and completion_ids BEFORE the merge loop runs (and potentially asserts).
+    example_id = output.get("example_id", "?")
     for diag_idx, (diag_tokens, diag_events) in enumerate(
         zip(prepared_steps, step_compaction_events)
     ):
         if diag_events:
             max_raw = max(e.num_output_tokens_at_compaction for e in diag_events)
             clen = len(diag_tokens["completion_ids"])
+            plen = len(diag_tokens["prompt_ids"])
             total_evicted = sum(e.tokens_evicted for e in diag_events)
+            # Notebook-style per-event log (one line per CompactionEvent).
+            # Mirrors experiments/debug_balrog/compaction_test.ipynb output:
+            #   #0 evicted=352 offset_after=352 prompt_tokens=996 ...
+            logger.info(
+                f"[COMPACT] ex={example_id} step={diag_idx} prompt_len={plen} "
+                f"completion_len={clen} events={len(diag_events)}"
+            )
+            for ev_idx, ev in enumerate(diag_events):
+                logger.info(
+                    f"[COMPACT]   #{ev_idx} evicted={ev.tokens_evicted} "
+                    f"offset_after={ev.position_offset_after} "
+                    f"prompt_tokens={ev.num_prompt_tokens} "
+                    f"output_at_compact={ev.num_output_tokens_at_compaction}"
+                )
+            # Debug-only: decode each event's evicted token range from the
+            # orchestrator's local (prompt + completion) buffer and log a
+            # framed `| ... |` block. Mirrors the notebook trace format
+            # (experiments/debug_balrog/compaction_test.ipynb / out_turn.txt).
+            #
+            # Range math (mirrors vLLM scheduler.py:_effective_prompt_tokens
+            # + evict_start computation):
+            #   1. protected_prefix_len = first <|im_end|> position + 1.
+            #      vLLM auto-detects this by scanning for eos_token_id; in
+            #      turn mode the protected region is exactly the system
+            #      message.
+            #   2. evict_base = align_up(protected_prefix_len, block_size).
+            #   3. position_offset_after is the cumulative count of evicted
+            #      tokens after this event. Events on a step are contiguous
+            #      and ordered, so for event N:
+            #         start = evict_base + (offset_after - tokens_evicted)
+            #         end   = evict_base + offset_after
+            #      The system prompt is never evicted, so the indices stay
+            #      valid into the orchestrator's (prompt+completion) buffer.
+            if log_evicted_text and tokenizer is not None:
+                # Use the EXACT padded prompt_token_ids vLLM ran on, taken
+                # from the kv_eviction interceptor's stash on extras. The
+                # `prepare_step_tokens` override should already substitute
+                # this — but reading extras directly avoids any ambiguity
+                # about which buffer (padded vs unpadded) we're slicing.
+                step_extras = trajectory[diag_idx].get("extras") or {}
+                padded_prompt_ids = step_extras.get("prompt_token_ids")
+                if padded_prompt_ids:
+                    prompt_ids_for_decode = [int(x) for x in padded_prompt_ids]
+                else:
+                    prompt_ids_for_decode = list(diag_tokens["prompt_ids"])
+                full_ids = prompt_ids_for_decode + list(
+                    diag_tokens["completion_ids"]
+                )
+                eos_id = tokenizer.eos_token_id
+                protected_prefix_len = len(prompt_ids_for_decode)  # fallback
+                if eos_id is not None:
+                    for i, tok_id in enumerate(prompt_ids_for_decode):
+                        if tok_id == eos_id:
+                            protected_prefix_len = i + 1
+                            break
+                # One-shot diagnostic per step: confirm we're slicing the
+                # padded buffer (filler count > 0 expected on multi-turn
+                # rollouts). Under AFTER-padding, <|im_end|> sits at its
+                # natural position; fillers occupy slots between
+                # <|im_end|> and the next block boundary. The useful
+                # invariant is therefore "first_boundary is block-
+                # aligned", not "first_im_end is aligned".
+                _filler_count = sum(
+                    1 for t in prompt_ids_for_decode if t == 151643
+                )
+                _first_im_end = (
+                    protected_prefix_len - 1
+                    if protected_prefix_len < len(prompt_ids_for_decode)
+                    else -1
+                )
+                _first_boundary = (
+                    ((_first_im_end + 1 + 15) // 16) * 16
+                    if _first_im_end >= 0 else -1
+                )
+                logger.info(
+                    f"[COMPACT-DEBUG] ex={example_id} step={diag_idx} "
+                    f"prompt_len={len(prompt_ids_for_decode)} "
+                    f"src={'extras' if padded_prompt_ids else 'prep'} "
+                    f"fillers={_filler_count} first_im_end={_first_im_end} "
+                    f"first_boundary={_first_boundary} "
+                    f"block_aligned={_first_boundary % 16 == 0 if _first_boundary >= 0 else 'n/a'}"
+                )
+                # block_size is the same as inference.vllm_extra.block_size.
+                # Hardcoded to 16 here to match the only supported value
+                # (PagedAttention block_size is fixed across the run).
+                block_size = 16
+                evict_base = (
+                    (protected_prefix_len + block_size - 1) // block_size
+                ) * block_size
+                for ev_idx, ev in enumerate(diag_events):
+                    start = evict_base + ev.position_offset_after - ev.tokens_evicted
+                    end = evict_base + ev.position_offset_after
+                    if start < 0 or end > len(full_ids) or start >= end:
+                        logger.warning(
+                            f"[COMPACT-TEXT] ex={example_id} step={diag_idx} "
+                            f"#{ev_idx} skipped: range [{start},{end}) outside "
+                            f"buffer (len={len(full_ids)})"
+                        )
+                        continue
+                    text = tokenizer.decode(
+                        full_ids[start:end], skip_special_tokens=False
+                    )
+                    framed = "\n".join(f"  | {line}" for line in text.split("\n"))
+                    logger.info(
+                        f"[COMPACT-TEXT] ex={example_id} step={diag_idx} "
+                        f"#{ev_idx} evict=[{start},{end}) "
+                        f"({ev.tokens_evicted} tokens, {len(text)} chars)\n"
+                        f"  {'-' * 70}\n"
+                        f"{framed}\n"
+                        f"  {'-' * 70}"
+                    )
             events_summary = [(e.num_output_tokens_at_compaction, e.tokens_evicted)
                               for e in diag_events]
             logger.warning(

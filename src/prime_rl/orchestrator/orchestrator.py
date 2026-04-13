@@ -139,6 +139,36 @@ async def orchestrate(config: OrchestratorConfig):
     logger.info(f"Initializing tokenizer for {config.model.name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
 
+    # Install block-aligned message padding interceptor (kv-eviction). No-op
+    # passthrough when compaction_padding.enabled is False.
+    if config.compaction_padding.enabled:
+        from kv_eviction.env import configure_message_padding
+        from kv_eviction.padding import (
+            resolve_filler_token_id,
+            resolve_im_end_token_id,
+        )
+
+        filler_id = resolve_filler_token_id(
+            tokenizer, config.compaction_padding.filler_token_id
+        )
+        im_end_id = (
+            config.compaction_padding.im_end_token_id
+            if config.compaction_padding.im_end_token_id is not None
+            else resolve_im_end_token_id(tokenizer)
+        )
+        configure_message_padding(
+            enabled=True,
+            tokenizer=tokenizer,
+            block_size=config.compaction_padding.block_size,
+            filler_token_id=filler_id,
+            im_end_token_id=im_end_id,
+        )
+        logger.info(
+            f"Block-aligned message padding enabled "
+            f"(block_size={config.compaction_padding.block_size}, "
+            f"filler_token_id={filler_id}, im_end_token_id={im_end_id})"
+        )
+
     processor = None
     if is_vlm:
         logger.info(f"Loading VLM processor for {config.model.name}")
@@ -447,8 +477,19 @@ async def orchestrate(config: OrchestratorConfig):
             vlm_cache = None
 
         # Process rollouts in parallel
+        log_evicted_text = (
+            config.compaction_padding.enabled
+            and config.compaction_padding.log_evicted_text
+        )
+
         def process_rollout(rollout: vf.RolloutOutput, rollout_idx: int) -> list[TrainingSample] | None:
-            return interleave_rollout(rollout, vlm_cache=vlm_cache, cache_key=rollout_idx)
+            return interleave_rollout(
+                rollout,
+                vlm_cache=vlm_cache,
+                cache_key=rollout_idx,
+                tokenizer=tokenizer if log_evicted_text else None,
+                log_evicted_text=log_evicted_text,
+            )
 
         loop = asyncio.get_event_loop()
         futures = [

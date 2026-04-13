@@ -494,6 +494,61 @@ class RLConfig(BaseConfig):
 
         return self
 
+    @model_validator(mode="after")
+    def validate_compaction_padding(self):
+        """Block-aligned message padding consistency.
+
+        When `orchestrator.compaction_padding.enabled` is True, the padding
+        block_size must equal both `inference.vllm_extra.block_size` and
+        `trainer.compaction.block_size` (same PagedAttention block size used
+        by the KV cache). A mismatch would mean the orchestrator pads to a
+        block size different from what the scheduler uses for eviction,
+        defeating the whole point of padding — eviction would inward-snap
+        anyway and the trainer's `prompt_aligned_len` math would still
+        drift.
+
+        Also require compaction to be active (trainer.compaction.window_size
+        > 0): padding without compaction is benign but almost certainly a
+        config mistake, worth catching at load time.
+        """
+        padding = self.orchestrator.compaction_padding
+        if not padding.enabled:
+            return self
+
+        tr_block_size = self.trainer.compaction.block_size
+        tr_window = self.trainer.compaction.window_size
+        inf_block_size = (
+            int((self.inference.vllm_extra or {}).get("block_size", 16) or 16)
+            if self.inference is not None
+            else None
+        )
+
+        mismatches: list[str] = []
+        if tr_block_size != padding.block_size:
+            mismatches.append(
+                f"trainer.compaction.block_size={tr_block_size} vs "
+                f"orchestrator.compaction_padding.block_size={padding.block_size}"
+            )
+        if inf_block_size is not None and inf_block_size != padding.block_size:
+            mismatches.append(
+                f"inference.vllm_extra.block_size={inf_block_size} vs "
+                f"orchestrator.compaction_padding.block_size={padding.block_size}"
+            )
+        if tr_window <= 0:
+            mismatches.append(
+                "trainer.compaction.window_size=0 but compaction_padding is enabled "
+                "(padding only makes sense when compaction is active)"
+            )
+
+        if mismatches:
+            joined = "\n  - ".join(mismatches)
+            raise ValueError(
+                "orchestrator.compaction_padding.block_size must match "
+                "inference and trainer block sizes, and compaction must be "
+                "active. Mismatches:\n  - " + joined
+            )
+        return self
+
     ### Auto-setup and validate shared configs
 
     @model_validator(mode="after")

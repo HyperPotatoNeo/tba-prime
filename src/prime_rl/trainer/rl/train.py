@@ -584,8 +584,15 @@ def train(config: TrainerConfig):
                     # position_offset_after and tokens_evicted. The first
                     # eviction starts at the block-aligned protected prefix,
                     # so offset_after - evicted gives us the eviction start.
-                    first_evt = compaction_events[0]
-                    pp = first_evt.position_offset_after - first_evt.tokens_evicted
+                    # Under D5 unified dispatch, event-less samples also
+                    # pass through this branch; in that case pp is unused
+                    # downstream (no eviction math needed) — fall back to
+                    # mb_prompt_len so the effective-prompt calc is a no-op.
+                    if compaction_events:
+                        first_evt = compaction_events[0]
+                        pp = first_evt.position_offset_after - first_evt.tokens_evicted
+                    else:
+                        pp = mb_prompt_len
                 effective_prompt_len = min(pp, mb_prompt_len) if pp > 0 else mb_prompt_len
                 prompt_aligned_len = ((effective_prompt_len + bs - 1) // bs) * bs
                 segment_boundaries = [

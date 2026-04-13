@@ -782,6 +782,86 @@ class TeacherRolloutModelConfig(BaseConfig):
     ] = ModelConfig()
 
 
+class CompactionPaddingConfig(BaseConfig):
+    """Block-aligned chat-message padding for turn-based KV compaction.
+
+    When enabled, the orchestrator installs an AsyncOpenAI.chat.completions.create
+    interceptor (in kv_eviction.env) that pre-tokenizes each chat request,
+    inserts filler tokens AFTER every `<|im_end|>` so the next turn's first
+    token starts at a PagedAttention block boundary, and passes the padded
+    token stream to vLLM via `extra_body={"prompt_token_ids": ...}`. vLLM's
+    `ChatCompletionRequest` bypass branch (see vLLM fork) skips
+    `apply_chat_template` and feeds the tokens to the engine verbatim.
+
+    The net effect: turn-based eviction becomes exact-edge (evicts whole
+    `[...<|im_end|>]` block sequences with no orphan fragments) instead of
+    inward-snapped, and the trainer's `prompt_aligned_len` math becomes a
+    no-op because `len(prompt_ids) % block_size == 0`.
+
+    Enabling this requires the vLLM fork with the `prompt_token_ids`
+    extension on ChatCompletionRequest. Using stock vLLM will silently
+    fall back to chat-template rendering and ignore the padded ids —
+    training/inference will diverge.
+
+    `block_size` MUST equal `inference.vllm_extra.block_size` (asserted by
+    cross-config validator) and `trainer.compaction.block_size`.
+    """
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description="Master switch for block-aligned message padding.",
+        ),
+    ] = False
+
+    block_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Padding block size. Must match inference.vllm_extra.block_size. "
+                "Filler tokens are inserted AFTER each `<|im_end|>` so the next "
+                "turn's first token starts at position k*block_size."
+            ),
+        ),
+    ] = 16
+
+    filler_token_id: Annotated[
+        int | None,
+        Field(
+            description=(
+                "Token id to insert as filler. None resolves at orchestrator "
+                "startup to tokenizer.pad_token_id (Qwen3: <|endoftext|> = 151643). "
+                "Override with a never-in-data id to avoid mask collisions."
+            ),
+        ),
+    ] = None
+
+    im_end_token_id: Annotated[
+        int | None,
+        Field(
+            description=(
+                "Token id for <|im_end|>. None resolves at startup via "
+                "tokenizer.convert_tokens_to_ids('<|im_end|>'). Override only "
+                "for non-Qwen chat templates with a different turn-end marker."
+            ),
+        ),
+    ] = None
+
+    log_evicted_text: Annotated[
+        bool,
+        Field(
+            description=(
+                "Debug-only: decode each compaction event's evicted token "
+                "range from the orchestrator's local (prompt+completion) "
+                "buffer and log a framed `| ... |` block per event, mirroring "
+                "experiments/debug_balrog/compaction_test.ipynb output. "
+                "Decoding is per-event and verbose — keep off in production."
+            ),
+        ),
+    ] = False
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -845,6 +925,12 @@ class OrchestratorConfig(BaseConfig):
     weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
 
     rollout_transport: TransportConfig = FileSystemTransportConfig()
+
+    # Block-aligned message padding for turn-based KV compaction. Default
+    # disabled — enabling requires the HyperPotatoNeo/vllm fork. See
+    # CompactionPaddingConfig above and
+    # `plans/prime_rl_message_padding_patch.md`.
+    compaction_padding: CompactionPaddingConfig = CompactionPaddingConfig()
 
     output_dir: Annotated[
         Path,
