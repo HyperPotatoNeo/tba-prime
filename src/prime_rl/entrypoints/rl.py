@@ -85,8 +85,11 @@ def check_gpus_available(gpu_ids: list[int]) -> None:
         handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
         processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
         if processes:
-            pids = [p.pid for p in processes]
-            occupied.append((gpu_id, pids))
+            # Filter out zombie CUDA allocations (process exited but nvml
+            # still reports them — /proc/<pid> absent).
+            pids = [p.pid for p in processes if os.path.exists(f"/proc/{p.pid}")]
+            if pids:
+                occupied.append((gpu_id, pids))
 
     if occupied:
         msg = "Existing processes found on GPUs:\n"

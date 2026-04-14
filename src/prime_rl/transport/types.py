@@ -38,6 +38,13 @@ class CompactionEventWire(
     # compatibility (omit_defaults=True on the struct).
     num_prompt_tokens: int = 0
 
+    # Start position of the eviction range in the current (possibly
+    # already-partially-trimmed) token sequence. For admission-time events
+    # (num_output_tokens_at_compaction == 0) the orchestrator replays the
+    # same del prompt_ids[evict_start : evict_start + tokens_evicted] that
+    # the vLLM scheduler applied, so the trainer sees the trimmed prompt.
+    evict_start: int = 0
+
 
 # Orchestrator -> Packer
 class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):

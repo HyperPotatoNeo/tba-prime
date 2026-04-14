@@ -301,6 +301,40 @@ def interleave_rollout(
                 prompt_ids = [int(x) for x in padded_ids]
                 prompt_mask = [False] * len(prompt_ids)
 
+            # Admission-time compaction trim: the vLLM response carries
+            # the ORIGINAL (pre-trim) prompt_token_ids, but inference ran
+            # on the trimmed prompt. Replay the scheduler's token
+            # deletions so the trainer sees identical tokens + positions.
+            step_events = _compaction_events_from_step(step)
+            if step_events and padded_ids:
+                orig_len = len(prompt_ids)
+                prompt_ids, prompt_mask, step_events = _apply_admission_trim(
+                    prompt_ids, prompt_mask, step_events,
+                )
+                if len(prompt_ids) < orig_len:
+                    logger.info(
+                        f"[ADMISSION-TRIM] step {step_idx}: "
+                        f"prompt {orig_len} -> {len(prompt_ids)} tokens, "
+                        f"{len(step_events)} mid-gen events remaining"
+                    )
+                # Write surviving events back to the step's extras so the
+                # downstream step_compaction_events list sees the trimmed
+                # set (admission events consumed, only mid-gen remain).
+                if extras is not None:
+                    if step_events:
+                        extras["compaction_events"] = [
+                            {
+                                "num_output_tokens_at_compaction": e.num_output_tokens_at_compaction,
+                                "tokens_evicted": e.tokens_evicted,
+                                "position_offset_after": e.position_offset_after,
+                                "num_prompt_tokens": e.num_prompt_tokens,
+                                "evict_start": e.evict_start,
+                            }
+                            for e in step_events
+                        ]
+                    else:
+                        extras["compaction_events"] = None
+
             return {
                 "prompt_ids": prompt_ids,
                 "prompt_mask": prompt_mask,
@@ -312,6 +346,39 @@ def interleave_rollout(
 
         logger.warning(f"Missing rollout tokens for example {output['example_id']} step {step_idx}.")
         return None
+
+    def _apply_admission_trim(
+        prompt_ids: list[int],
+        prompt_mask: list[bool],
+        events: list[CompactionEventWire],
+    ) -> tuple[list[int], list[bool], list[CompactionEventWire]]:
+        """Apply admission-time compaction events to the prompt.
+
+        Admission events (num_output_tokens_at_compaction == 0) represent
+        token deletions that the vLLM scheduler applied to the prompt
+        BEFORE prefill. The response carries the original (pre-trim)
+        prompt, so we replay the deletions here so the trainer sees the
+        same tokens inference ran on.
+
+        Events are applied in order (oldest-first), matching the
+        scheduler's _apply_trim sequence. Each event's evict_start is
+        relative to the CURRENT (already-partially-trimmed) prompt.
+
+        Returns (trimmed_prompt, trimmed_mask, remaining_events) where
+        remaining_events contains only mid-generation events (output > 0).
+        """
+        trimmed_ids = list(prompt_ids)
+        trimmed_mask = list(prompt_mask)
+        remaining: list[CompactionEventWire] = []
+        for evt in events:
+            if evt.num_output_tokens_at_compaction == 0:
+                start = evt.evict_start
+                end = start + evt.tokens_evicted
+                del trimmed_ids[start:end]
+                del trimmed_mask[start:end]
+            else:
+                remaining.append(evt)
+        return trimmed_ids, trimmed_mask, remaining
 
     def _compaction_events_from_step(
         step: vf.TrajectoryStep,
@@ -339,6 +406,7 @@ def interleave_rollout(
                         tokens_evicted=int(e["tokens_evicted"]),
                         position_offset_after=int(e["position_offset_after"]),
                         num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
+                        evict_start=int(e.get("evict_start", 0)),
                     )
                 )
             elif isinstance(e, (list, tuple)) and len(e) >= 3:
@@ -349,6 +417,7 @@ def interleave_rollout(
                         tokens_evicted=int(e[1]),
                         position_offset_after=int(e[2]),
                         num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
+                        evict_start=int(e[4]) if len(e) >= 5 else 0,
                     )
                 )
         return out or None
