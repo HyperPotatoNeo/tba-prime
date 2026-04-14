@@ -524,21 +524,21 @@ class RLConfig(BaseConfig):
         )
 
         mismatches: list[str] = []
-        if tr_block_size != padding.block_size:
-            mismatches.append(
-                f"trainer.compaction.block_size={tr_block_size} vs "
-                f"orchestrator.compaction_padding.block_size={padding.block_size}"
-            )
-        if inf_block_size is not None and inf_block_size != padding.block_size:
-            mismatches.append(
-                f"inference.vllm_extra.block_size={inf_block_size} vs "
-                f"orchestrator.compaction_padding.block_size={padding.block_size}"
-            )
-        if tr_window <= 0:
-            mismatches.append(
-                "trainer.compaction.window_size=0 but compaction_padding is enabled "
-                "(padding only makes sense when compaction is active)"
-            )
+        # Only enforce block_size consistency when compaction is active.
+        # compaction_padding.enabled=True with window_size=0 is intentional for
+        # no-eviction baselines: the interceptor still sends prompt_token_ids to
+        # bypass vLLM's tool_choice validation, even without actual eviction.
+        if tr_window > 0:
+            if tr_block_size != padding.block_size:
+                mismatches.append(
+                    f"trainer.compaction.block_size={tr_block_size} vs "
+                    f"orchestrator.compaction_padding.block_size={padding.block_size}"
+                )
+            if inf_block_size is not None and inf_block_size != padding.block_size:
+                mismatches.append(
+                    f"inference.vllm_extra.block_size={inf_block_size} vs "
+                    f"orchestrator.compaction_padding.block_size={padding.block_size}"
+                )
 
         if mismatches:
             joined = "\n  - ".join(mismatches)
