@@ -163,6 +163,15 @@ async def orchestrate(config: OrchestratorConfig):
             filler_token_id=filler_id,
             im_end_token_id=im_end_id,
         )
+        # Propagate to the verifiers env server subprocess spawned below.
+        # That subprocess (mp.spawn) runs a fresh interpreter and would
+        # otherwise see `_padding_config=None`, making the AsyncCompletions
+        # interceptor a no-op. kv_eviction.env autoconfigures from these
+        # vars at import time.
+        os.environ["KV_EVICTION_PADDING_MODEL"] = config.model.name
+        os.environ["KV_EVICTION_PADDING_BLOCK_SIZE"] = str(config.compaction_padding.block_size)
+        os.environ["KV_EVICTION_PADDING_FILLER_ID"] = str(filler_id)
+        os.environ["KV_EVICTION_PADDING_IM_END_ID"] = str(im_end_id)
         logger.info(
             f"Block-aligned message padding enabled "
             f"(block_size={config.compaction_padding.block_size}, "
