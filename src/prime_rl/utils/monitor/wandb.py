@@ -61,17 +61,27 @@ class WandbMonitor(Monitor):
                 "This is an experimental feature. Disable with --wandb.shared False"
             )
         else:
-            run_id = None
             primary = False
             settings = wandb.Settings(
                 mode="offline" if config.offline else "online",
             )
+            # Resume the same wandb run across EAI restarts by persisting the
+            # run ID to output_dir. On a clean launch (output_dir wiped by
+            # clean_output_dir=true) no file exists → fresh run created and ID
+            # saved. On an EAI restart the file survives → same run resumed.
+            run_id_file = Path(output_dir) / "wandb_run_id" if output_dir else None
+            if run_id_file and run_id_file.exists():
+                run_id = run_id_file.read_text().strip()
+                self.logger.info(f"Resuming W&B run {run_id}")
+            else:
+                run_id = None
 
         def init_wandb(max_retries: int):
             for attempt in range(max_retries):
                 try:
                     return wandb.init(
                         id=run_id,
+                        resume="allow" if run_id else None,
                         project=config.project,
                         name=config.name,
                         dir=output_dir,
@@ -88,6 +98,11 @@ class WandbMonitor(Monitor):
 
         max_retries = 1 if not shared_mode or primary else 30
         self.wandb = init_wandb(max_retries)
+
+        # Persist run ID for restarts (no-op in shared mode, handled above).
+        if not shared_mode and run_id_file and self.wandb is not None:
+            run_id_file.parent.mkdir(parents=True, exist_ok=True)
+            run_id_file.write_text(self.wandb.id)
 
         wandb.define_metric("*", step_metric="step")
 
