@@ -594,10 +594,7 @@ def train(config: TrainerConfig):
                     else:
                         pp = mb_prompt_len
                 effective_prompt_len = min(pp, mb_prompt_len) if pp > 0 else mb_prompt_len
-                prompt_aligned_len = min(
-                    ((effective_prompt_len + bs - 1) // bs) * bs,
-                    input_ids.shape[1],
-                )
+                prompt_aligned_len = ((effective_prompt_len + bs - 1) // bs) * bs
                 segment_boundaries = [
                     int(e.num_output_tokens_at_compaction) for e in compaction_events
                 ]
