@@ -68,6 +68,23 @@ class SharedWandbConfig(BaseConfig):
 
     name: Annotated[str | None, Field(description="The W&B run name to use.")] = None
 
+    id: Annotated[
+        str | None,
+        Field(
+            description="Explicit W&B run id, shared by trainer and orchestrator under "
+            "shared-mode. When set, propagates to WANDB_SHARED_RUN_ID and both "
+            "submodules' WandbConfig.id so a re-launch resumes the same run.",
+        ),
+    ] = None
+
+    group: Annotated[
+        str | None,
+        Field(
+            description="W&B run group (shared by trainer and orchestrator). Seeds of "
+            "the same experiment should share a group to aggregate on the wandb UI.",
+        ),
+    ] = None
+
     offline: Annotated[bool | None, Field(description="Whether to run W&B in offline mode.")] = False
 
     shared: Annotated[
@@ -495,6 +512,70 @@ class RLConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_markovian_thinker(self):
+        """Markovian Thinker assumes no KV compaction anywhere in the stack.
+
+        When ``orchestrator.markovian_thinker.enabled=True``, the
+        orchestrator truncates ``messages`` client-side before each chat
+        completion. vLLM then runs a normal full-context request with no
+        compaction events. Enabling any other compaction / padding /
+        TITO feature alongside Markovian silently produces wrong
+        behavior:
+
+        - vLLM-side compaction: would evict an already-shortened prompt,
+          firing unnecessary CompactionEvents the trainer can't replay.
+        - Trainer-side compaction: the trainer would dispatch to
+          segmented_forward with no events, breaking the unified
+          dispatch invariant.
+        - compaction_padding: would stash its own prompt_token_ids after
+          Markovian stashed its own, overwriting the truncated token
+          stream the trainer must use.
+        - use_token_client: TITO assumes the chat template has the
+          extension property across turns; dropping turns breaks it.
+        """
+        mt = self.orchestrator.markovian_thinker
+        if not mt.enabled:
+            return self
+
+        if self.inference is not None:
+            vllm_extra = self.inference.vllm_extra or {}
+            for k in ("compaction_window_size", "compaction_max_turns"):
+                v = int(vllm_extra.get(k, 0) or 0)
+                if v > 0:
+                    raise ValueError(
+                        f"orchestrator.markovian_thinker.enabled=true is "
+                        f"incompatible with inference.vllm_extra.{k}={v}. "
+                        "Markovian Thinker performs client-side truncation; "
+                        "vLLM-side compaction must be disabled."
+                    )
+
+        if self.trainer.compaction.window_size > 0:
+            raise ValueError(
+                "orchestrator.markovian_thinker.enabled=true is incompatible "
+                "with trainer.compaction.window_size > 0. Markovian samples "
+                "have no CompactionEvents; the trainer must use the standard "
+                "full-context forward."
+            )
+
+        if self.orchestrator.compaction_padding.enabled:
+            raise ValueError(
+                "orchestrator.markovian_thinker.enabled=true is incompatible "
+                "with orchestrator.compaction_padding.enabled=true. "
+                "Markovian Thinker stashes its own prompt_token_ids on the "
+                "response; block-aligned padding is only meaningful for "
+                "block-level KV eviction."
+            )
+
+        if self.orchestrator.use_token_client:
+            raise ValueError(
+                "orchestrator.markovian_thinker.enabled=true requires "
+                "use_token_client=false. TITO assumes extension property "
+                "across turns, which client-side truncation breaks."
+            )
+
+        return self
+
+    @model_validator(mode="after")
     def validate_compaction_padding(self):
         """Block-aligned message padding consistency.
 
@@ -631,6 +712,19 @@ class RLConfig(BaseConfig):
                 if self.wandb.name:
                     self.trainer.wandb.name = f"{self.wandb.name}-trainer"
                     self.orchestrator.wandb.name = f"{self.wandb.name}-orchestrator"
+
+            # In shared mode, both subprocesses call wandb.init with the same
+            # id so they attach to a single run. The actual id flows via
+            # WANDB_SHARED_RUN_ID (set from config.wandb.id in entrypoints/rl.py);
+            # we mirror it onto the submodule configs for consistency + for the
+            # non-shared path.
+            if self.wandb.id:
+                self.trainer.wandb.id = self.wandb.id
+                self.orchestrator.wandb.id = self.wandb.id
+
+            if self.wandb.group:
+                self.trainer.wandb.group = self.wandb.group
+                self.orchestrator.wandb.group = self.wandb.group
 
             if self.wandb.offline:
                 self.trainer.wandb.offline = self.wandb.offline

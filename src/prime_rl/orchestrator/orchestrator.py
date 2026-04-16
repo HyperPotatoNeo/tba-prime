@@ -178,6 +178,34 @@ async def orchestrate(config: OrchestratorConfig):
             f"filler_token_id={filler_id}, im_end_token_id={im_end_id})"
         )
 
+    # Install Markovian Thinker client-side message truncation
+    # (kv-eviction). No-op when markovian_thinker.enabled is False.
+    if config.markovian_thinker.enabled:
+        from kv_eviction.env import configure_markovian_thinker
+
+        configure_markovian_thinker(
+            enabled=True,
+            tokenizer=tokenizer,
+            max_turns=config.markovian_thinker.max_turns,
+            log_truncated_messages=config.markovian_thinker.log_truncated_messages,
+        )
+        # Propagate to the verifiers env server subprocess. That
+        # subprocess (mp.spawn) runs a fresh interpreter and would
+        # otherwise see `_markovian_config=None`, making the
+        # AsyncCompletions interceptor a passthrough. kv_eviction.env
+        # autoconfigures from these vars at import time.
+        os.environ["KV_EVICTION_MARKOVIAN_ENABLED"] = "1"
+        os.environ["KV_EVICTION_MARKOVIAN_MAX_TURNS"] = str(
+            config.markovian_thinker.max_turns
+        )
+        os.environ["KV_EVICTION_MARKOVIAN_MODEL"] = config.model.name
+        if config.markovian_thinker.log_truncated_messages:
+            os.environ["KV_EVICTION_MARKOVIAN_LOG"] = "1"
+        logger.info(
+            f"Markovian Thinker enabled "
+            f"(max_turns={config.markovian_thinker.max_turns})"
+        )
+
     processor = None
     if is_vlm:
         logger.info(f"Loading VLM processor for {config.model.name}")
@@ -705,6 +733,19 @@ async def orchestrate(config: OrchestratorConfig):
             env_metrics_df = metrics_df.loc[env_df.index]
             for metric in metrics_df.columns:
                 to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["example_id"])[metric].mean().mean()
+
+        # Drain Markovian Thinker truncation counters into the step
+        # metrics. Keys are absent when the feature is disabled (pop
+        # returns zero counters, but we only emit when enabled to keep
+        # the metric surface clean).
+        if config.markovian_thinker.enabled:
+            from kv_eviction.env import pop_markovian_stats
+
+            mt_stats = pop_markovian_stats()
+            to_log["markovian/n_truncations_per_step"] = mt_stats["n_truncations"]
+            to_log["markovian/n_messages_dropped_per_step"] = mt_stats[
+                "n_messages_dropped"
+            ]
 
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)

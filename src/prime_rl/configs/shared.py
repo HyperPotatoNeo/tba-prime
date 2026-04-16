@@ -354,6 +354,22 @@ class WandbConfig(BaseConfig):
         ),
     ] = None
 
+    id: Annotated[
+        str | None,
+        Field(
+            description="Explicit W&B run id. When set, takes precedence over the id "
+            "persisted to output_dir/wandb_run_id.",
+        ),
+    ] = None
+
+    group: Annotated[
+        str | None,
+        Field(
+            description="W&B run group. Seeds of the same experiment share a group so "
+            "they aggregate on the wandb UI.",
+        ),
+    ] = None
+
     offline: Annotated[bool, Field(description="Whether to run W&B in offline mode.")] = False
 
 

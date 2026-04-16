@@ -69,8 +69,12 @@ class WandbMonitor(Monitor):
             # run ID to output_dir. On a clean launch (output_dir wiped by
             # clean_output_dir=true) no file exists → fresh run created and ID
             # saved. On an EAI restart the file survives → same run resumed.
+            # Precedence: explicit config.id > persisted run_id_file > None.
             run_id_file = Path(output_dir) / "wandb_run_id" if output_dir else None
-            if run_id_file and run_id_file.exists():
+            if getattr(config, "id", None):
+                run_id = config.id
+                self.logger.info(f"Using explicit W&B run id {run_id}")
+            elif run_id_file and run_id_file.exists():
                 run_id = run_id_file.read_text().strip()
                 self.logger.info(f"Resuming W&B run {run_id}")
             else:
@@ -84,6 +88,7 @@ class WandbMonitor(Monitor):
                         resume="allow" if run_id else None,
                         project=config.project,
                         name=config.name,
+                        group=getattr(config, "group", None),
                         dir=output_dir,
                         config=run_config.model_dump() if run_config else None,
                         settings=settings,

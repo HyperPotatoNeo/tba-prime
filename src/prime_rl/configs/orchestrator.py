@@ -862,6 +862,65 @@ class CompactionPaddingConfig(BaseConfig):
     ] = False
 
 
+class MarkovianThinkerConfig(BaseConfig):
+    """Client-side message truncation baseline for multi-turn RL.
+
+    When enabled, the orchestrator truncates the ``messages`` list to the
+    most recent ``max_turns`` complete conversation turn groups BEFORE
+    sending each chat completion request to vLLM. vLLM sees normal
+    full-context completions with no compaction, no eviction, no
+    ``CompactionEvent``s. Training uses the standard full-context forward
+    (no ``segmented_forward``).
+
+    A "turn group" is the atomic unit ending at each assistant message
+    without ``tool_calls``. The system prefix (leading non-user messages)
+    and in-flight tail (messages after the last terminal assistant) are
+    always preserved — see ``plans/markovian_thinker_baseline.md``.
+
+    Incompatible with:
+    - ``inference.vllm_extra.compaction_window_size > 0``
+    - ``trainer.compaction.window_size > 0``
+    - ``orchestrator.compaction_padding.enabled = true``
+      (redundant — Markovian stashes its own ``prompt_token_ids``)
+    - ``orchestrator.use_token_client = true``
+      (TITO assumes extension property across turns, which Markovian breaks)
+
+    Enforced at config load by ``validate_markovian_thinker``.
+    """
+
+    enabled: Annotated[
+        bool,
+        Field(description="Master switch for Markovian Thinker truncation."),
+    ] = False
+
+    max_turns: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Max number of complete turn groups to retain in the "
+                "`messages` list. A turn group ends at each assistant "
+                "message without `tool_calls`. System prefix and in-flight "
+                "tail are always preserved regardless of this cap. "
+                "Default 6: aggressive enough to exercise the truncation "
+                "path on typical BabyAI/TextWorld episodes (~15-30 turns) "
+                "while leaving enough context for coherent action selection."
+            ),
+        ),
+    ] = 6
+
+    log_truncated_messages: Annotated[
+        bool,
+        Field(
+            description=(
+                "Debug-only: log one line per truncation with the number "
+                "of groups dropped and the role of the first/last dropped "
+                "message. Off in production."
+            ),
+        ),
+    ] = False
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -931,6 +990,13 @@ class OrchestratorConfig(BaseConfig):
     # CompactionPaddingConfig above and
     # `plans/prime_rl_message_padding_patch.md`.
     compaction_padding: CompactionPaddingConfig = CompactionPaddingConfig()
+
+    # Client-side message truncation baseline ("Markovian Thinker").
+    # Default disabled — enabling truncates each chat completion
+    # request's `messages` list to the last K turn groups before vLLM
+    # sees it. See MarkovianThinkerConfig above and
+    # `plans/markovian_thinker_baseline.md`.
+    markovian_thinker: MarkovianThinkerConfig = MarkovianThinkerConfig()
 
     output_dir: Annotated[
         Path,

@@ -1,6 +1,7 @@
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
 
 from contextlib import nullcontext
+import gc
 import os
 import time
 
@@ -325,6 +326,9 @@ def train(config: TrainerConfig):
             and progress.step % config.ckpt.interval == 0
         ):
             save_ckpt_time = 0
+
+            gc.collect()
+            torch.cuda.empty_cache()
 
             if not config.ckpt.weights_only:
                 # Single-run: Save full checkpoint
@@ -1171,6 +1175,8 @@ def train(config: TrainerConfig):
 
     # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
     if config.max_concurrent_runs == 1 and ckpt_manager is not None:
+        gc.collect()
+        torch.cuda.empty_cache()
         if not (config.ckpt and config.ckpt.weights_only):
             logger.info("Writing final checkpoint")
             ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)

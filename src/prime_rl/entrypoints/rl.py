@@ -143,11 +143,19 @@ def rl_local(config: RLConfig):
     logger.info("Starting RL run")
     logger.debug(f"RL start command: {' '.join(start_command)}")
 
-    # Build shared W&B env vars for subprocesses
+    # Build shared W&B env vars for subprocesses. Precedence for the shared
+    # run id: explicit config.wandb.id > existing WANDB_SHARED_RUN_ID env >
+    # fresh uuid. Explicit ids let the user deterministically resume/rejoin
+    # a run across re-launches (e.g. same TOML re-used on a different node).
     wandb_shared_env: dict[str, str] = {}
     if config.wandb and config.wandb.shared:
         wandb_shared_env["WANDB_SHARED_MODE"] = "1"
-        wandb_shared_env["WANDB_SHARED_RUN_ID"] = os.environ.get("WANDB_SHARED_RUN_ID", uuid.uuid4().hex)
+        shared_run_id = (
+            config.wandb.id
+            or os.environ.get("WANDB_SHARED_RUN_ID")
+            or uuid.uuid4().hex
+        )
+        wandb_shared_env["WANDB_SHARED_RUN_ID"] = shared_run_id
 
     # Check for existing processes on GPUs
     all_gpu_ids = list(set(infer_gpu_ids + trainer_gpu_ids + teacher_gpu_ids))

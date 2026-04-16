@@ -1,10 +1,20 @@
 import base64
 import hashlib
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+
+# When the orchestrator enables Markovian Thinker, each extension-break
+# starts a fresh TrainingSample from a re-truncated prompt. The system
+# prefix must survive truncation — a silent drop would let the model
+# train without its instructions. We cheaply assert that every new
+# sample's prompt_ids begins with the same first token as the very
+# first sample's prompt_ids (typically `<|im_start|>`). Off by default
+# (gated by the env var the orchestrator sets when markovian is enabled).
+_MARKOVIAN_ASSERT_ENABLED = os.environ.get("KV_EVICTION_MARKOVIAN_ENABLED") == "1"
 
 import torch
 import verifiers as vf
@@ -310,6 +320,8 @@ def interleave_rollout(
                 orig_len = len(prompt_ids)
                 prompt_ids, prompt_mask, step_events = _apply_admission_trim(
                     prompt_ids, prompt_mask, step_events,
+                    step_idx=step_idx,
+                    example_id=output.get("example_id", "?"),
                 )
                 if len(prompt_ids) < orig_len:
                     logger.info(
@@ -351,6 +363,8 @@ def interleave_rollout(
         prompt_ids: list[int],
         prompt_mask: list[bool],
         events: list[CompactionEventWire],
+        step_idx: int = -1,
+        example_id: Any = "?",
     ) -> tuple[list[int], list[bool], list[CompactionEventWire]]:
         """Apply admission-time compaction events to the prompt.
 
@@ -370,12 +384,30 @@ def interleave_rollout(
         trimmed_ids = list(prompt_ids)
         trimmed_mask = list(prompt_mask)
         remaining: list[CompactionEventWire] = []
+        ev_idx = 0
         for evt in events:
             if evt.num_output_tokens_at_compaction == 0:
                 start = evt.evict_start
                 end = start + evt.tokens_evicted
+                if log_evicted_text and tokenizer is not None:
+                    evicted_ids = trimmed_ids[start:end]
+                    text = tokenizer.decode(
+                        evicted_ids, skip_special_tokens=False
+                    )
+                    framed = "\n".join(
+                        f"  | {line}" for line in text.split("\n")
+                    )
+                    logger.info(
+                        f"[COMPACT-TEXT] ex={example_id} step={step_idx} "
+                        f"#{ev_idx} ADMISSION evict=[{start},{end}) "
+                        f"({evt.tokens_evicted} tokens, {len(text)} chars)\n"
+                        f"  {'-' * 70}\n"
+                        f"{framed}\n"
+                        f"  {'-' * 70}"
+                    )
                 del trimmed_ids[start:end]
                 del trimmed_mask[start:end]
+                ev_idx += 1
             else:
                 remaining.append(evt)
         return trimmed_ids, trimmed_mask, remaining
@@ -721,6 +753,25 @@ def interleave_rollout(
                 f"Extension property broke at step {step_idx + 1} for example {output['example_id']}. "
                 f"Starting new sample (active_prefixes={len(active_samples)}, step_prompt_len={len(step_prompt_ids)})."
             )
+
+            # Markovian Thinker sanity check: every post-truncation
+            # sample must begin with the same system-prefix token as the
+            # first sample. Catches silent regressions where truncation
+            # accidentally drops the system message.
+            if (
+                _MARKOVIAN_ASSERT_ENABLED
+                and step_prompt_ids
+                and first_tokens["prompt_ids"]
+            ):
+                expected_first = first_tokens["prompt_ids"][0]
+                assert step_prompt_ids[0] == expected_first, (
+                    f"[MARKOVIAN] system prefix missing at step {step_idx}: "
+                    f"expected first prompt token {expected_first}, "
+                    f"got {step_prompt_ids[0]}. This usually means "
+                    f"truncate_messages_to_last_k_turns dropped the "
+                    f"system message."
+                )
+
             new_prefix = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples.append(
                 [new_prefix, make_sample(tokens, step_compaction_events[step_idx]), step_idx]
