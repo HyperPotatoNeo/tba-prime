@@ -246,6 +246,65 @@ def pretokenize_rollout_trajectory(
     return True
 
 
+def _build_summary_sample(
+    step: vf.TrajectoryStep,
+    *,
+    temperature: float,
+    has_error: bool,
+) -> TrainingSample | None:
+    """Construct a standalone TrainingSample from a summary payload
+    stashed on a trajectory step's extras.
+
+    Returns None when the step has no summary payload, or when the
+    payload is malformed (missing prompt/completion tokens, or logprobs
+    length mismatch with completion tokens). The regular per-step
+    sample emission is unaffected.
+
+    Full-credit: ``completion_mask`` is all-True when the rollout did
+    not error; for errored rollouts we zero the mask (same policy as
+    make_sample above). ``compaction_events`` is always None — summary
+    generation runs as a fresh request with no prior KV cache eviction
+    history.
+    """
+    extras = step.get("extras") if isinstance(step, dict) else None
+    if not extras:
+        return None
+    payload = extras.get("summary_trainsample")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        prompt_ids = [int(x) for x in (payload.get("prompt_token_ids") or [])]
+        completion_ids = [
+            int(x) for x in (payload.get("completion_token_ids") or [])
+        ]
+        completion_logprobs = [
+            float(x) for x in (payload.get("completion_logprobs") or [])
+        ]
+    except (TypeError, ValueError):
+        return None
+    if not prompt_ids or not completion_ids:
+        return None
+    if len(completion_logprobs) != len(completion_ids):
+        return None
+    completion_mask = (
+        [False] * len(completion_ids)
+        if has_error
+        else [True] * len(completion_ids)
+    )
+    return TrainingSample(
+        prompt_ids=prompt_ids,
+        prompt_mask=[False] * len(prompt_ids),
+        completion_ids=completion_ids,
+        completion_mask=completion_mask,
+        completion_logprobs=completion_logprobs,
+        completion_temperatures=[temperature] * len(completion_ids),
+        teacher_logprobs=None,
+        advantage=None,
+        routed_experts=None,
+        compaction_events=None,
+    )
+
+
 def interleave_rollout(
     output: vf.RolloutOutput,
     vlm_cache: "VLMImageCache | None" = None,
@@ -786,7 +845,25 @@ def interleave_rollout(
             sample.pixel_values_shape = shape
             sample.image_grid_thw = grids
 
-    return [sample for _, sample, _ in active_samples]
+    # Markovian Summary extension: for every trajectory step that carries
+    # an `extras["summary_trainsample"]` payload, emit a separate
+    # TrainingSample. These samples are full-credit (completion_mask
+    # all-True) and their logprobs come from the summary call itself.
+    # They inherit the rollout's advantage via the orchestrator's
+    # per-rollout advantage assignment after this function returns.
+    summary_samples: list[TrainingSample] = []
+    for step in trajectory:
+        s = _build_summary_sample(step, temperature=temperature, has_error=has_error)
+        if s is not None:
+            summary_samples.append(s)
+
+    regular_samples = [sample for _, sample, _ in active_samples]
+    # Summary samples appended AFTER the regular samples so they don't
+    # disturb per-rollout prefix-matching / merge invariants. Ordering
+    # within the return list does not affect training semantics (each
+    # sample trains independently); sharing the rollout's advantage
+    # assignment happens downstream.
+    return regular_samples + summary_samples
 
 
 # =============================================================================
