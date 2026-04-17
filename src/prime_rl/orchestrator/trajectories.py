@@ -262,9 +262,11 @@ def _build_summary_sample(
 
     Full-credit: ``completion_mask`` is all-True when the rollout did
     not error; for errored rollouts we zero the mask (same policy as
-    make_sample above). ``compaction_events`` is always None — summary
-    generation runs as a fresh request with no prior KV cache eviction
-    history.
+    make_sample above). ``compaction_events`` is populated from the
+    payload in ``mode="eviction"`` (vLLM-side eviction can fire during
+    the summary call's own prefill/decode); ``None`` in
+    ``mode="markovian"`` where the summary call runs with vLLM
+    compaction off.
     """
     extras = step.get("extras") if isinstance(step, dict) else None
     if not extras:
@@ -286,6 +288,49 @@ def _build_summary_sample(
         return None
     if len(completion_logprobs) != len(completion_ids):
         return None
+
+    # Coerce payload's ``compaction_events`` list to
+    # ``CompactionEventWire`` instances. Mirrors the same
+    # dict / list-tuple / typed handling as the regular per-step path
+    # in ``_compaction_events_from_step`` — summary payloads traverse
+    # the same msgspec boundary and can arrive as any of those shapes.
+    raw_events = payload.get("compaction_events")
+    summary_events: list[CompactionEventWire] | None = None
+    if raw_events:
+        coerced: list[CompactionEventWire] = []
+        for e in raw_events:
+            if isinstance(e, CompactionEventWire):
+                coerced.append(e)
+            elif isinstance(e, dict):
+                try:
+                    coerced.append(
+                        CompactionEventWire(
+                            num_output_tokens_at_compaction=int(
+                                e["num_output_tokens_at_compaction"]
+                            ),
+                            tokens_evicted=int(e["tokens_evicted"]),
+                            position_offset_after=int(e["position_offset_after"]),
+                            num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
+                            evict_start=int(e.get("evict_start", 0)),
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+            elif isinstance(e, (list, tuple)) and len(e) >= 3:
+                try:
+                    coerced.append(
+                        CompactionEventWire(
+                            num_output_tokens_at_compaction=int(e[0]),
+                            tokens_evicted=int(e[1]),
+                            position_offset_after=int(e[2]),
+                            num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
+                            evict_start=int(e[4]) if len(e) >= 5 else 0,
+                        )
+                    )
+                except (TypeError, ValueError):
+                    continue
+        summary_events = coerced or None
+
     completion_mask = (
         [False] * len(completion_ids)
         if has_error
@@ -301,7 +346,7 @@ def _build_summary_sample(
         teacher_logprobs=None,
         advantage=None,
         routed_experts=None,
-        compaction_events=None,
+        compaction_events=summary_events,
     )
 
 

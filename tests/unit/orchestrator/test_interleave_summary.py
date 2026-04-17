@@ -308,3 +308,104 @@ def test_interleave_rollout_errored_output_zeros_summary_mask():
     assert len(samples) == 2
     summary = samples[-1]
     assert summary.completion_mask == [False, False]
+
+
+# ─── compaction_events forwarding (eviction mode) ───
+
+
+def test_build_summary_sample_compaction_events_from_dict():
+    """Eviction-mode summary payloads carry ``compaction_events`` as a
+    list of dicts (how the vLLM fork emits them). The builder must
+    coerce them to ``CompactionEventWire`` so the trainer's dispatcher
+    routes the sample through ``segmented_forward``."""
+    from prime_rl.transport.types import CompactionEventWire
+
+    payload = _summary_payload(
+        prompt_ids=[10, 11, 12], completion_ids=[20, 21]
+    )
+    payload["compaction_events"] = [
+        {
+            "num_output_tokens_at_compaction": 128,
+            "tokens_evicted": 512,
+            "position_offset_after": 4096,
+            "num_prompt_tokens": 2048,
+            "evict_start": 0,
+        },
+    ]
+    step = _step(
+        prompt_ids=[1, 2],
+        completion_ids=[3, 4],
+        extras={"summary_trainsample": payload},
+    )
+    sample = _build_summary_sample(step, temperature=0.7, has_error=False)
+    assert sample is not None
+    assert sample.compaction_events is not None
+    assert len(sample.compaction_events) == 1
+    evt = sample.compaction_events[0]
+    assert isinstance(evt, CompactionEventWire)
+    assert evt.num_output_tokens_at_compaction == 128
+    assert evt.tokens_evicted == 512
+    assert evt.position_offset_after == 4096
+    assert evt.num_prompt_tokens == 2048
+    assert evt.evict_start == 0
+
+
+def test_build_summary_sample_compaction_events_empty_list():
+    """Empty events list (markovian mode, or eviction mode without
+    events during the summary call) → compaction_events is None."""
+    payload = _summary_payload(
+        prompt_ids=[10], completion_ids=[20]
+    )
+    payload["compaction_events"] = []
+    step = _step(
+        prompt_ids=[1, 2],
+        completion_ids=[3, 4],
+        extras={"summary_trainsample": payload},
+    )
+    sample = _build_summary_sample(step, temperature=1.0, has_error=False)
+    assert sample is not None
+    assert sample.compaction_events is None
+
+
+def test_build_summary_sample_compaction_events_absent():
+    """No ``compaction_events`` key (legacy payload) → None."""
+    payload = _summary_payload(
+        prompt_ids=[10], completion_ids=[20]
+    )
+    step = _step(
+        prompt_ids=[1, 2],
+        completion_ids=[3, 4],
+        extras={"summary_trainsample": payload},
+    )
+    sample = _build_summary_sample(step, temperature=1.0, has_error=False)
+    assert sample is not None
+    assert sample.compaction_events is None
+
+
+def test_build_summary_sample_compaction_events_skips_malformed():
+    """Malformed events are dropped, not raised — mirrors the
+    per-step path's defensive coercion."""
+    from prime_rl.transport.types import CompactionEventWire
+
+    payload = _summary_payload(
+        prompt_ids=[10], completion_ids=[20]
+    )
+    payload["compaction_events"] = [
+        {"tokens_evicted": 512},  # missing required keys — dropped
+        {
+            "num_output_tokens_at_compaction": 64,
+            "tokens_evicted": 256,
+            "position_offset_after": 1024,
+        },  # valid
+    ]
+    step = _step(
+        prompt_ids=[1, 2],
+        completion_ids=[3, 4],
+        extras={"summary_trainsample": payload},
+    )
+    sample = _build_summary_sample(step, temperature=1.0, has_error=False)
+    assert sample is not None
+    assert sample.compaction_events is not None
+    assert len(sample.compaction_events) == 1
+    assert isinstance(sample.compaction_events[0], CompactionEventWire)
+    assert sample.compaction_events[0].tokens_evicted == 256
