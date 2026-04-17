@@ -566,7 +566,7 @@ class RLConfig(BaseConfig):
                 "full-context forward."
             )
 
-        if self.orchestrator.compaction_padding.enabled:
+        if self.orchestrator.compaction_padding.enabled and not summary_eviction_mode:
             raise ValueError(
                 "orchestrator.markovian_thinker.enabled=true is incompatible "
                 "with orchestrator.compaction_padding.enabled=true. "
