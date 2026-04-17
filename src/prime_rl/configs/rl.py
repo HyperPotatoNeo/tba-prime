@@ -537,7 +537,16 @@ class RLConfig(BaseConfig):
         if not mt.enabled:
             return self
 
-        if self.inference is not None:
+        # Summary `mode="eviction"` layers on top of vLLM-side KV eviction
+        # instead of replacing it, so the "no vLLM compaction" mutex is
+        # relaxed for that one configuration. `validate_markovian_summary`
+        # below enforces the positive invariants (at least one vLLM-side
+        # compaction knob ON, max_len_summary fits, etc.).
+        summary_eviction_mode = (
+            mt.summary.enabled and mt.summary.mode == "eviction"
+        )
+
+        if self.inference is not None and not summary_eviction_mode:
             vllm_extra = self.inference.vllm_extra or {}
             for k in ("compaction_window_size", "compaction_max_turns"):
                 v = int(vllm_extra.get(k, 0) or 0)
@@ -549,7 +558,7 @@ class RLConfig(BaseConfig):
                         "vLLM-side compaction must be disabled."
                     )
 
-        if self.trainer.compaction.window_size > 0:
+        if self.trainer.compaction.window_size > 0 and not summary_eviction_mode:
             raise ValueError(
                 "orchestrator.markovian_thinker.enabled=true is incompatible "
                 "with trainer.compaction.window_size > 0. Markovian samples "
@@ -572,6 +581,102 @@ class RLConfig(BaseConfig):
                 "use_token_client=false. TITO assumes extension property "
                 "across turns, which client-side truncation breaks."
             )
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_markovian_summary(self):
+        """Summary-based eviction requires Markovian Thinker and enforces
+        mode-specific vLLM-side compaction invariants.
+
+        See ``plans/markovian_summary.md`` for the full design.
+
+        Common constraints:
+        - Summary requires Markovian Thinker enabled (it rides on the
+          Markovian interceptor's Branch-A path).
+        - ``compaction_max_turns`` must be > 0 (else there's no trigger).
+        - A separate rollout model (teacher_rollout_model) breaks the
+          logprob path — summaries would be rolled from a different
+          policy than the trainer.
+        - The summary call's ``max_tokens`` must fit in the model's
+          context window alongside the rollout's regular generation
+          budget (here we require at least 2048 tokens of headroom
+          beyond max_len_summary).
+
+        Mode-specific:
+        - ``markovian``: any vLLM-side compaction (block ``window_size``
+          or ``compaction_max_turns``) would double-evict on top of the
+          client-side reset — must be OFF.
+        - ``eviction``: at least one of (block compaction window, turn
+          compaction max-turns) must be ON — otherwise the client-visible
+          message list would grow unbounded with no KV eviction.
+        """
+        mt = self.orchestrator.markovian_thinker
+        summary = mt.summary
+        if not summary.enabled:
+            return self
+
+        if not mt.enabled:
+            raise ValueError(
+                "orchestrator.markovian_thinker.summary.enabled=true requires "
+                "orchestrator.markovian_thinker.enabled=true. The summary "
+                "layer rides on the Markovian interceptor."
+            )
+
+        if summary.compaction_max_turns <= 0:
+            raise ValueError(
+                "orchestrator.markovian_thinker.summary.compaction_max_turns "
+                "must be > 0 when summary.enabled=true (else there is no "
+                "turn-count trigger)."
+            )
+
+        if self.orchestrator.teacher_rollout_model is not None:
+            raise ValueError(
+                "orchestrator.markovian_thinker.summary.enabled=true is "
+                "incompatible with orchestrator.teacher_rollout_model. "
+                "Summary logprobs come from the rollout model; a separate "
+                "teacher rollout model would produce logprobs that don't "
+                "match the trainer's policy."
+            )
+
+        max_model_len = None
+        if self.inference is not None and self.inference.model is not None:
+            max_model_len = getattr(self.inference.model, "max_model_len", None)
+        if max_model_len is not None and max_model_len > 0:
+            headroom = 2048
+            if max_model_len < summary.max_len_summary + headroom:
+                raise ValueError(
+                    f"orchestrator.markovian_thinker.summary.max_len_summary="
+                    f"{summary.max_len_summary} requires at least "
+                    f"{summary.max_len_summary + headroom} tokens of context "
+                    f"window, but inference.model.max_model_len={max_model_len}."
+                )
+
+        vllm_extra = (
+            (self.inference.vllm_extra or {}) if self.inference is not None else {}
+        )
+        vllm_window = int(vllm_extra.get("compaction_window_size", 0) or 0)
+        vllm_max_turns = int(vllm_extra.get("compaction_max_turns", 0) or 0)
+
+        if summary.mode == "markovian":
+            if vllm_window > 0 or vllm_max_turns > 0:
+                raise ValueError(
+                    "orchestrator.markovian_thinker.summary.mode='markovian' "
+                    "is incompatible with any vLLM-side compaction "
+                    "(inference.vllm_extra.compaction_window_size or "
+                    "compaction_max_turns). Client-side reset handles all "
+                    "truncation in markovian mode."
+                )
+        else:  # "eviction"
+            if vllm_window <= 0 and vllm_max_turns <= 0:
+                raise ValueError(
+                    "orchestrator.markovian_thinker.summary.mode='eviction' "
+                    "requires at least one of "
+                    "inference.vllm_extra.compaction_window_size > 0 or "
+                    "inference.vllm_extra.compaction_max_turns > 0. "
+                    "The client appends but does not truncate; vLLM must "
+                    "handle KV state."
+                )
 
         return self
 

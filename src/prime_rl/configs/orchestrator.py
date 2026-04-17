@@ -862,6 +862,132 @@ class CompactionPaddingConfig(BaseConfig):
     ] = False
 
 
+class MarkovianSummaryConfig(BaseConfig):
+    """Summarization-based eviction layered on top of Markovian Thinker.
+
+    When enabled, the orchestrator intercepts each chat-completion call
+    and, once the number of real turn groups exceeds
+    ``compaction_max_turns``, fires a side-channel summary request to
+    the same model. The returned summary is spliced into the
+    conversation as a normal ``{user: instruction, assistant: summary}``
+    exchange and emitted as a separate trainable
+    :class:`TrainingSample` (loss-active on the completion tokens).
+
+    Two transform modes — both ride on the existing Markovian Thinker
+    interceptor plumbing:
+
+    - ``mode="markovian"`` — client-side full reset:
+      ``sys_prefix + [I, S] + tail``. vLLM-side compaction MUST be
+      disabled (the client handles all truncation).
+
+    - ``mode="eviction"`` — append-only splice:
+      ``sys_prefix + body + [I, S] + tail``. Some form of vLLM-side
+      compaction (block or turn) MUST be enabled so the KV state stays
+      bounded as the client-visible message list grows monotonically.
+
+    See ``plans/markovian_summary.md`` for the full design.
+    """
+
+    enabled: Annotated[
+        bool,
+        Field(description="Master switch for summary-based eviction."),
+    ] = False
+
+    mode: Annotated[
+        Literal["markovian", "eviction"],
+        Field(
+            description=(
+                "Which eviction backend the summary layers on top of. "
+                "'markovian' truncates client-side to `sys + [I, S] + tail`. "
+                "'eviction' appends `[I, S]` before the tail and lets "
+                "vLLM-side compaction handle KV state."
+            ),
+        ),
+    ] = "markovian"
+
+    compaction_max_turns: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Turn-count trigger. Once the number of REAL turn groups "
+                "(i.e., excluding prior summary exchanges) exceeds this "
+                "value, the interceptor fires a summary request. Counts "
+                "only complete groups terminating at a non-tool-call "
+                "assistant. 0 disables summarization."
+            ),
+        ),
+    ] = 0
+
+    max_len_summary: Annotated[
+        int,
+        Field(
+            ge=16,
+            le=8192,
+            description=(
+                "Max tokens for the summary generation. Independent of "
+                "sampling.max_completion_tokens — the summary call has "
+                "different length needs than a regular action turn."
+            ),
+        ),
+    ] = 512
+
+    instruction_text: Annotated[
+        str,
+        Field(
+            description=(
+                "User-role instruction text spliced into the conversation "
+                "before the generated summary. Used both as the prompt "
+                "for the summary call and for counting prior summary "
+                "exchanges (exact-match)."
+            ),
+        ),
+    ] = (
+        "You will lose context of the prior turns. Please summarize "
+        "everything important for the task — the current goal, the "
+        "state you've observed, what you've already tried, and any "
+        "facts you'll need to continue acting effectively."
+    )
+
+    temperature: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=2.0,
+            description="Sampling temperature for the summary call.",
+        ),
+    ] = 0.3
+
+    top_p: Annotated[
+        float,
+        Field(
+            gt=0.0,
+            le=1.0,
+            description="Top-p nucleus sampling for the summary call.",
+        ),
+    ] = 0.95
+
+    on_error: Annotated[
+        Literal["drop", "raise"],
+        Field(
+            description=(
+                "Behavior when the summary call fails or returns empty. "
+                "'drop' falls back to plain Markovian Thinker truncation "
+                "(safe default). 'raise' propagates the exception."
+            ),
+        ),
+    ] = "drop"
+
+    log_summaries: Annotated[
+        bool,
+        Field(
+            description=(
+                "Debug-only: log each summary's first N chars on generation."
+            ),
+        ),
+    ] = False
+
+
 class MarkovianThinkerConfig(BaseConfig):
     """Client-side message truncation baseline for multi-turn RL.
 
@@ -919,6 +1045,17 @@ class MarkovianThinkerConfig(BaseConfig):
             ),
         ),
     ] = False
+
+    summary: Annotated[
+        MarkovianSummaryConfig,
+        Field(
+            description=(
+                "Summarization-based eviction: when enabled, turns being "
+                "dropped by the Markovian Thinker truncation are replaced "
+                "by a generated summary turn that the trainer learns on."
+            ),
+        ),
+    ] = MarkovianSummaryConfig()
 
 
 class OrchestratorConfig(BaseConfig):
