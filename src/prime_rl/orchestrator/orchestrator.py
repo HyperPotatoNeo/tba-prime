@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -205,6 +206,50 @@ async def orchestrate(config: OrchestratorConfig):
             f"Markovian Thinker enabled "
             f"(max_turns={config.markovian_thinker.max_turns})"
         )
+
+        # Install Markovian Summary (summarization-based compaction) on
+        # top of the Markovian Thinker interceptor. No-op when
+        # markovian_thinker.summary.enabled is False.
+        scfg = config.markovian_thinker.summary
+        if scfg.enabled:
+            from kv_eviction.env import configure_markovian_summary
+
+            configure_markovian_summary(
+                enabled=True,
+                mode=scfg.mode,
+                compaction_max_turns=scfg.compaction_max_turns,
+                max_len_summary=scfg.max_len_summary,
+                instruction_text=scfg.instruction_text,
+                temperature=scfg.temperature,
+                top_p=scfg.top_p,
+                on_error=scfg.on_error,
+                log_summaries=scfg.log_summaries,
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED"] = "1"
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MODE"] = scfg.mode
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_COMPACTION_MAX_TURNS"] = str(
+                scfg.compaction_max_turns
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MAX_LEN_SUMMARY"] = str(
+                scfg.max_len_summary
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_TEMPERATURE"] = str(
+                scfg.temperature
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_TOP_P"] = str(scfg.top_p)
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR"] = scfg.on_error
+            if scfg.log_summaries:
+                os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_LOG"] = "1"
+            # instruction_text may contain arbitrary characters (newlines,
+            # quotes); ship it as JSON to avoid escaping foot-guns.
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON"] = json.dumps(
+                {"instruction_text": scfg.instruction_text}
+            )
+            logger.info(
+                f"Markovian Summary enabled "
+                f"(mode={scfg.mode}, compaction_max_turns={scfg.compaction_max_turns}, "
+                f"max_len_summary={scfg.max_len_summary})"
+            )
 
     processor = None
     if is_vlm:
@@ -746,6 +791,20 @@ async def orchestrate(config: OrchestratorConfig):
             to_log["markovian/n_messages_dropped_per_step"] = mt_stats[
                 "n_messages_dropped"
             ]
+            if config.markovian_thinker.summary.enabled:
+                to_log["markovian_summary/n_per_step"] = mt_stats["n_summaries"]
+                to_log["markovian_summary/n_failures_per_step"] = mt_stats[
+                    "n_summary_failures"
+                ]
+                to_log["markovian_summary/prompt_tokens_per_step"] = mt_stats[
+                    "summary_prompt_tokens"
+                ]
+                to_log["markovian_summary/output_tokens_per_step"] = mt_stats[
+                    "summary_output_tokens"
+                ]
+                to_log["markovian_summary/latency_ms_per_step"] = mt_stats[
+                    "summary_latency_ms"
+                ]
 
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)
