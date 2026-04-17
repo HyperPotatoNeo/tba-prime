@@ -226,6 +226,7 @@ async def orchestrate(config: OrchestratorConfig):
                 compaction_max_turns=scfg.compaction_max_turns,
                 max_len_summary=scfg.max_len_summary,
                 instruction_text=scfg.instruction_text,
+                resume_text=scfg.resume_text,
                 temperature=scfg.temperature,
                 top_p=scfg.top_p,
                 on_error=scfg.on_error,
@@ -246,10 +247,13 @@ async def orchestrate(config: OrchestratorConfig):
             os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR"] = scfg.on_error
             if scfg.log_summaries:
                 os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_LOG"] = "1"
-            # instruction_text may contain arbitrary characters (newlines,
-            # quotes); ship it as JSON to avoid escaping foot-guns.
+            # instruction_text / resume_text may contain arbitrary characters
+            # (newlines, quotes); ship them as JSON to avoid escaping foot-guns.
             os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON"] = json.dumps(
-                {"instruction_text": scfg.instruction_text}
+                {
+                    "instruction_text": scfg.instruction_text,
+                    "resume_text": scfg.resume_text,
+                }
             )
             logger.info(
                 f"Markovian Summary enabled "

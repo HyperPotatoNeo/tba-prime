@@ -876,9 +876,12 @@ class MarkovianSummaryConfig(BaseConfig):
     Two transform modes — both ride on the existing Markovian Thinker
     interceptor plumbing:
 
-    - ``mode="markovian"`` — client-side full reset:
-      ``sys_prefix + [I, S] + tail``. vLLM-side compaction MUST be
-      disabled (the client handles all truncation).
+    - ``mode="markovian"`` — client-side partial reset:
+      ``sys_prefix + last_N_body + tail + [I, S] + [U_resume]``. vLLM-side
+      compaction MUST be disabled (the client handles all truncation).
+      ``N = markovian_thinker.stride`` (0 when unset → strict reset).
+      ``U_resume`` is a fresh pending user turn so vLLM has something to
+      answer against after the summary is spliced in.
 
     - ``mode="eviction"`` — append-only splice:
       ``sys_prefix + body + [I, S] + tail``. Some form of vLLM-side
@@ -898,7 +901,8 @@ class MarkovianSummaryConfig(BaseConfig):
         Field(
             description=(
                 "Which eviction backend the summary layers on top of. "
-                "'markovian' truncates client-side to `sys + [I, S] + tail`. "
+                "'markovian' truncates client-side to "
+                "`sys + last_N_body + tail + [I, S] + [U_resume]`. "
                 "'eviction' appends `[I, S]` before the tail and lets "
                 "vLLM-side compaction handle KV state."
             ),
@@ -947,6 +951,24 @@ class MarkovianSummaryConfig(BaseConfig):
         "everything important for the task — the current goal, the "
         "state you've observed, what you've already tried, and any "
         "facts you'll need to continue acting effectively."
+    )
+
+    resume_text: Annotated[
+        str,
+        Field(
+            description=(
+                "User-role prompt appended AFTER the summary exchange in "
+                "markovian mode so vLLM has a pending user turn to "
+                "generate an action against. The final splice shape is "
+                "`sys + last_N_body + tail + [I, S] + [U_resume]`, i.e. "
+                "the summary is injected as a completed side-exchange "
+                "after the most recent observation, then this message "
+                "prompts the model to resume acting."
+            ),
+        ),
+    ] = (
+        "Please continue from where you left off based on the summary "
+        "and the most recent observation."
     )
 
     temperature: Annotated[
@@ -1046,12 +1068,11 @@ class MarkovianThinkerConfig(BaseConfig):
                 "the `max_turns` trigger threshold). "
                 "When None (default), keeps `max_turns` groups — legacy "
                 "single-knob behavior. When set, must be in [1, max_turns]. "
-                "Also used by the markovian-mode summary splice: after "
-                "injecting the summary, the last `stride` real turn groups "
-                "are preserved, producing `sys + [I, S] + last_N_turns + "
-                "tail` instead of the strict full-reset `sys + [I, S] + "
-                "tail` (which you get with stride=None and the summary "
-                "feature's legacy defaults)."
+                "Also used by the markovian-mode summary splice: the "
+                "last `stride` real turn groups are preserved in front of "
+                "the tail, producing `sys + last_N_body + tail + [I, S] + "
+                "[U_resume]`. With stride=None (default), N=0 — i.e. a "
+                "strict full reset to `sys + tail + [I, S] + [U_resume]`."
             ),
         ),
     ] = None
