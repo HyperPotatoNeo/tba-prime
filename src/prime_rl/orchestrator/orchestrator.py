@@ -189,6 +189,7 @@ async def orchestrate(config: OrchestratorConfig):
             tokenizer=tokenizer,
             max_turns=config.markovian_thinker.max_turns,
             log_truncated_messages=config.markovian_thinker.log_truncated_messages,
+            stride=config.markovian_thinker.stride,
         )
         # Propagate to the verifiers env server subprocess. That
         # subprocess (mp.spawn) runs a fresh interpreter and would
@@ -200,11 +201,16 @@ async def orchestrate(config: OrchestratorConfig):
             config.markovian_thinker.max_turns
         )
         os.environ["KV_EVICTION_MARKOVIAN_MODEL"] = config.model.name
+        if config.markovian_thinker.stride is not None:
+            os.environ["KV_EVICTION_MARKOVIAN_STRIDE"] = str(
+                config.markovian_thinker.stride
+            )
         if config.markovian_thinker.log_truncated_messages:
             os.environ["KV_EVICTION_MARKOVIAN_LOG"] = "1"
         logger.info(
             f"Markovian Thinker enabled "
-            f"(max_turns={config.markovian_thinker.max_turns})"
+            f"(max_turns={config.markovian_thinker.max_turns}, "
+            f"stride={config.markovian_thinker.stride})"
         )
 
         # Install Markovian Summary (summarization-based compaction) on

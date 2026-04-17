@@ -227,3 +227,36 @@ def test_top_p_range():
             compaction_max_turns=4,
             top_p=0.0,
         )
+
+
+# ─── Stride (n_preserved_turns) ───
+
+
+def test_stride_none_validates_as_default():
+    """stride defaults to None; no regression on the baseline config."""
+    mt = MarkovianThinkerConfig(enabled=True, max_turns=4)
+    assert mt.stride is None
+
+
+def test_stride_accepted_when_le_max_turns():
+    mt = MarkovianThinkerConfig(enabled=True, max_turns=4, stride=2)
+    orch = _orch(markovian_thinker=mt, use_token_client=False)
+    RLConfig(**_rl_config(orchestrator=orch))
+
+
+def test_stride_equal_to_max_turns_ok():
+    mt = MarkovianThinkerConfig(enabled=True, max_turns=4, stride=4)
+    orch = _orch(markovian_thinker=mt, use_token_client=False)
+    RLConfig(**_rl_config(orchestrator=orch))
+
+
+def test_stride_greater_than_max_turns_rejected():
+    mt = MarkovianThinkerConfig(enabled=True, max_turns=3, stride=5)
+    orch = _orch(markovian_thinker=mt, use_token_client=False)
+    with pytest.raises(ValidationError, match="stride=5 must be <= max_turns=3"):
+        RLConfig(**_rl_config(orchestrator=orch))
+
+
+def test_stride_zero_rejected_by_pydantic_ge():
+    with pytest.raises(ValidationError):
+        MarkovianThinkerConfig(enabled=True, max_turns=4, stride=0)

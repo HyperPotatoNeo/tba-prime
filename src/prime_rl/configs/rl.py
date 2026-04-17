@@ -582,6 +582,14 @@ class RLConfig(BaseConfig):
                 "across turns, which client-side truncation breaks."
             )
 
+        if mt.stride is not None and mt.stride > mt.max_turns:
+            raise ValueError(
+                f"orchestrator.markovian_thinker.stride={mt.stride} must be "
+                f"<= max_turns={mt.max_turns}. Stride is the post-trigger "
+                "keep count; keeping more groups than the trigger threshold "
+                "is impossible — the truncation would never drop anything."
+            )
+
         return self
 
     @model_validator(mode="after")

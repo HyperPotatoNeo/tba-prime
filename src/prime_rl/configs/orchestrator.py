@@ -1024,16 +1024,37 @@ class MarkovianThinkerConfig(BaseConfig):
         Field(
             ge=1,
             description=(
-                "Max number of complete turn groups to retain in the "
-                "`messages` list. A turn group ends at each assistant "
-                "message without `tool_calls`. System prefix and in-flight "
-                "tail are always preserved regardless of this cap. "
-                "Default 6: aggressive enough to exercise the truncation "
-                "path on typical BabyAI/TextWorld episodes (~15-30 turns) "
-                "while leaving enough context for coherent action selection."
+                "Trigger threshold: truncation fires when the number of "
+                "complete turn groups in the `messages` list EXCEEDS this "
+                "value. A turn group ends at each assistant message without "
+                "`tool_calls`. System prefix and in-flight tail are always "
+                "preserved regardless of this cap. Default 6: aggressive "
+                "enough to exercise the truncation path on typical "
+                "BabyAI/TextWorld episodes (~15-30 turns) while leaving "
+                "enough context for coherent action selection."
             ),
         ),
     ] = 6
+
+    stride: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Optional: number of recent turn groups to PRESERVE after "
+                "a truncation trigger (the 'keep count', decoupled from "
+                "the `max_turns` trigger threshold). "
+                "When None (default), keeps `max_turns` groups — legacy "
+                "single-knob behavior. When set, must be in [1, max_turns]. "
+                "Also used by the markovian-mode summary splice: after "
+                "injecting the summary, the last `stride` real turn groups "
+                "are preserved, producing `sys + [I, S] + last_N_turns + "
+                "tail` instead of the strict full-reset `sys + [I, S] + "
+                "tail` (which you get with stride=None and the summary "
+                "feature's legacy defaults)."
+            ),
+        ),
+    ] = None
 
     log_truncated_messages: Annotated[
         bool,
