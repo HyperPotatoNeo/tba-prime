@@ -332,6 +332,9 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
     parser = make_arg_parser(parser)
     args = parser.parse_args(args=[], namespace=namespace)
     assert args is not None
+    # Ignore model-baked generation_config defaults so request-level sampling
+    # args like temperature/top_p are the only source of sampling behavior.
+    args.generation_config = "vllm"
     validate_parsed_serve_args(args)
 
     args.tool_call_parser = resolve_tool_call_parser(args.model, args.tool_call_parser)

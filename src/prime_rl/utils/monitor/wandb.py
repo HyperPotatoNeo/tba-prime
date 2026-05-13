@@ -61,34 +61,19 @@ class WandbMonitor(Monitor):
                 "This is an experimental feature. Disable with --wandb.shared False"
             )
         else:
+            run_id = None
             primary = False
             settings = wandb.Settings(
                 mode="offline" if config.offline else "online",
             )
-            # Resume the same wandb run across EAI restarts by persisting the
-            # run ID to output_dir. On a clean launch (output_dir wiped by
-            # clean_output_dir=true) no file exists → fresh run created and ID
-            # saved. On an EAI restart the file survives → same run resumed.
-            # Precedence: explicit config.id > persisted run_id_file > None.
-            run_id_file = Path(output_dir) / "wandb_run_id" if output_dir else None
-            if getattr(config, "id", None):
-                run_id = config.id
-                self.logger.info(f"Using explicit W&B run id {run_id}")
-            elif run_id_file and run_id_file.exists():
-                run_id = run_id_file.read_text().strip()
-                self.logger.info(f"Resuming W&B run {run_id}")
-            else:
-                run_id = None
 
         def init_wandb(max_retries: int):
             for attempt in range(max_retries):
                 try:
                     return wandb.init(
                         id=run_id,
-                        resume="allow" if run_id else None,
                         project=config.project,
                         name=config.name,
-                        group=getattr(config, "group", None),
                         dir=output_dir,
                         config=run_config.model_dump() if run_config else None,
                         settings=settings,
@@ -104,18 +89,13 @@ class WandbMonitor(Monitor):
         max_retries = 1 if not shared_mode or primary else 30
         self.wandb = init_wandb(max_retries)
 
-        # Persist run ID for restarts (no-op in shared mode, handled above).
-        if not shared_mode and run_id_file and self.wandb is not None:
-            run_id_file.parent.mkdir(parents=True, exist_ok=True)
-            run_id_file.write_text(self.wandb.id)
-
         wandb.define_metric("*", step_metric="step")
 
         # Optionally, initialize sample logging attributes
         if config is not None and isinstance(config, WandbWithExtrasConfig) and config.log_extras:
             if config.log_extras.samples:
                 self.last_log_samples_step = -1
-                self.samples_cols = ["step", "env_name", "task", "example_id", "messages", "input_ids", "reward", "compaction_events"]
+                self.samples_cols = ["step", "env_name", "task", "example_id", "messages", "input_ids", "reward"]
                 self.samples_table = wandb.Table(
                     columns=self.samples_cols,
                     log_mode="INCREMENTAL",
@@ -179,30 +159,6 @@ class WandbMonitor(Monitor):
             tokens = last_step["tokens"]
             full_ids = tokens["prompt_ids"] + tokens["completion_ids"]
             messages_text = self.tokenizer.decode(full_ids)
-
-            # Extract per-step compaction events from trajectory extras.
-            per_step_events = []
-            for traj_step in trajectory:
-                extras = traj_step.get("extras") or {}
-                raw = extras.get("compaction_events")
-                if raw:
-                    per_step_events.append([
-                        {
-                            "n": e.get("num_output_tokens_at_compaction", e[0] if isinstance(e, (list, tuple)) else 0),
-                            "evicted": e.get("tokens_evicted", e[1] if isinstance(e, (list, tuple)) else 0),
-                            "offset": e.get("position_offset_after", e[2] if isinstance(e, (list, tuple)) else 0),
-                            "prompt": e.get("num_prompt_tokens", (e[3] if len(e) >= 4 else 0) if isinstance(e, (list, tuple)) else 0),
-                        } if isinstance(e, dict) else {
-                            "n": e[0] if isinstance(e, (list, tuple)) else getattr(e, "num_output_tokens_at_compaction", 0),
-                            "evicted": e[1] if isinstance(e, (list, tuple)) else getattr(e, "tokens_evicted", 0),
-                            "offset": e[2] if isinstance(e, (list, tuple)) else getattr(e, "position_offset_after", 0),
-                            "prompt": (e[3] if len(e) >= 4 else 0) if isinstance(e, (list, tuple)) else getattr(e, "num_prompt_tokens", 0),
-                        }
-                        for e in raw
-                    ])
-                else:
-                    per_step_events.append(None)
-
             sample = {
                 "step": step,
                 "env_name": rollout.get("env_name"),
@@ -211,7 +167,6 @@ class WandbMonitor(Monitor):
                 "messages": messages_text,
                 "input_ids": str(full_ids),
                 "reward": rollout["reward"],
-                "compaction_events": json.dumps(per_step_events),
             }
             assert list(sample.keys()) == self.samples_cols, (
                 "Order of columns in the table must be the same as order of the keys here"

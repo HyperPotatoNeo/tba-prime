@@ -1,7 +1,6 @@
 import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before import
 
 from contextlib import nullcontext
-import gc
 import os
 import time
 
@@ -327,9 +326,6 @@ def train(config: TrainerConfig):
         ):
             save_ckpt_time = 0
 
-            gc.collect()
-            torch.cuda.empty_cache()
-
             if not config.ckpt.weights_only:
                 # Single-run: Save full checkpoint
                 logger.info(f"Saving checkpoint at step {progress.step}")
@@ -582,23 +578,7 @@ def train(config: TrainerConfig):
                     f"Check prepare_batch / _is_compaction_sample partitioning."
                 )
                 bs = config.compaction.block_size
-                pp = config.compaction.protected_prefix_tokens
-                if pp == -1:
-                    # Auto-detect: infer from first compaction event's
-                    # position_offset_after and tokens_evicted. The first
-                    # eviction starts at the block-aligned protected prefix,
-                    # so offset_after - evicted gives us the eviction start.
-                    # Under D5 unified dispatch, event-less samples also
-                    # pass through this branch; in that case pp is unused
-                    # downstream (no eviction math needed) — fall back to
-                    # mb_prompt_len so the effective-prompt calc is a no-op.
-                    if compaction_events:
-                        first_evt = compaction_events[0]
-                        pp = first_evt.position_offset_after - first_evt.tokens_evicted
-                    else:
-                        pp = mb_prompt_len
-                effective_prompt_len = min(pp, mb_prompt_len) if pp > 0 else mb_prompt_len
-                prompt_aligned_len = ((effective_prompt_len + bs - 1) // bs) * bs
+                prompt_aligned_len = ((mb_prompt_len + bs - 1) // bs) * bs
                 segment_boundaries = [
                     int(e.num_output_tokens_at_compaction) for e in compaction_events
                 ]
@@ -961,21 +941,6 @@ def train(config: TrainerConfig):
                 loss_tensor = loss_tensor.detach().to("cpu")
                 tensors[key].append(loss_tensor)
 
-            # Compaction metrics: track event counts and eviction volume
-            if compaction_events:
-                n_events = len(compaction_events)
-                total_evicted = sum(e.tokens_evicted for e in compaction_events)
-                tensors["compaction/num_events"].append(
-                    torch.tensor([float(n_events)])
-                )
-                tensors["compaction/tokens_evicted"].append(
-                    torch.tensor([float(total_evicted)])
-                )
-            elif use_segmented:
-                # Event-less sample in a compaction run — record zeros
-                tensors["compaction/num_events"].append(torch.tensor([0.0]))
-                tensors["compaction/tokens_evicted"].append(torch.tensor([0.0]))
-
             # Debug log with *local, micro step* stats. Entropy is now
             # computed for both the standard path (out["entropy"][loss_mask])
             # and the segmented path (per-segment compute_entropy over
@@ -1064,12 +1029,6 @@ def train(config: TrainerConfig):
         step_message += f" | LR: {current_lr:.2e} | Throughput: {throughput:.0f} tokens/s | MFU: {mfu:.1f}% | Peak Mem.: {peak_memory:.1f} GiB"
         if "max_vio/mean" in tensor_stats:
             step_message += f" | Max Vio: {tensor_stats['max_vio/mean']:.4f}"
-        if "compaction/num_events/mean" in tensor_stats:
-            step_message += (
-                f" | Compactions: {tensor_stats['compaction/num_events/mean']:.1f} avg"
-                f" / {tensor_stats['compaction/num_events/max']:.0f} max"
-                f" | Evicted: {tensor_stats['compaction/tokens_evicted/mean']:.0f} avg"
-            )
         logger.success(step_message)
 
         # Log performance metrics
@@ -1175,8 +1134,6 @@ def train(config: TrainerConfig):
 
     # Write final checkpoint (only for single-run mode; multi-run checkpoints are managed by MultiCheckpointManager)
     if config.max_concurrent_runs == 1 and ckpt_manager is not None:
-        gc.collect()
-        torch.cuda.empty_cache()
         if not (config.ckpt and config.ckpt.weights_only):
             logger.info("Writing final checkpoint")
             ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)

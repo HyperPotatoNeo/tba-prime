@@ -1,6 +1,5 @@
 import asyncio
 import gc
-import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -139,127 +138,6 @@ async def orchestrate(config: OrchestratorConfig):
     # Load tokenizer and processor (processor only for VLM models)
     logger.info(f"Initializing tokenizer for {config.model.name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
-
-    # Install block-aligned message padding interceptor (kv-eviction). No-op
-    # passthrough when compaction_padding.enabled is False.
-    if config.compaction_padding.enabled:
-        from kv_eviction.env import configure_message_padding
-        from kv_eviction.padding import (
-            resolve_filler_token_id,
-            resolve_im_end_token_id,
-        )
-
-        filler_id = resolve_filler_token_id(
-            tokenizer, config.compaction_padding.filler_token_id
-        )
-        im_end_id = (
-            config.compaction_padding.im_end_token_id
-            if config.compaction_padding.im_end_token_id is not None
-            else resolve_im_end_token_id(tokenizer)
-        )
-        configure_message_padding(
-            enabled=True,
-            tokenizer=tokenizer,
-            block_size=config.compaction_padding.block_size,
-            filler_token_id=filler_id,
-            im_end_token_id=im_end_id,
-        )
-        # Propagate to the verifiers env server subprocess spawned below.
-        # That subprocess (mp.spawn) runs a fresh interpreter and would
-        # otherwise see `_padding_config=None`, making the AsyncCompletions
-        # interceptor a no-op. kv_eviction.env autoconfigures from these
-        # vars at import time.
-        os.environ["KV_EVICTION_PADDING_MODEL"] = config.model.name
-        os.environ["KV_EVICTION_PADDING_BLOCK_SIZE"] = str(config.compaction_padding.block_size)
-        os.environ["KV_EVICTION_PADDING_FILLER_ID"] = str(filler_id)
-        os.environ["KV_EVICTION_PADDING_IM_END_ID"] = str(im_end_id)
-        logger.info(
-            f"Block-aligned message padding enabled "
-            f"(block_size={config.compaction_padding.block_size}, "
-            f"filler_token_id={filler_id}, im_end_token_id={im_end_id})"
-        )
-
-    # Install Markovian Thinker client-side message truncation
-    # (kv-eviction). No-op when markovian_thinker.enabled is False.
-    if config.markovian_thinker.enabled:
-        from kv_eviction.env import configure_markovian_thinker
-
-        configure_markovian_thinker(
-            enabled=True,
-            tokenizer=tokenizer,
-            max_turns=config.markovian_thinker.max_turns,
-            log_truncated_messages=config.markovian_thinker.log_truncated_messages,
-            stride=config.markovian_thinker.stride,
-        )
-        # Propagate to the verifiers env server subprocess. That
-        # subprocess (mp.spawn) runs a fresh interpreter and would
-        # otherwise see `_markovian_config=None`, making the
-        # AsyncCompletions interceptor a passthrough. kv_eviction.env
-        # autoconfigures from these vars at import time.
-        os.environ["KV_EVICTION_MARKOVIAN_ENABLED"] = "1"
-        os.environ["KV_EVICTION_MARKOVIAN_MAX_TURNS"] = str(
-            config.markovian_thinker.max_turns
-        )
-        os.environ["KV_EVICTION_MARKOVIAN_MODEL"] = config.model.name
-        if config.markovian_thinker.stride is not None:
-            os.environ["KV_EVICTION_MARKOVIAN_STRIDE"] = str(
-                config.markovian_thinker.stride
-            )
-        if config.markovian_thinker.log_truncated_messages:
-            os.environ["KV_EVICTION_MARKOVIAN_LOG"] = "1"
-        logger.info(
-            f"Markovian Thinker enabled "
-            f"(max_turns={config.markovian_thinker.max_turns}, "
-            f"stride={config.markovian_thinker.stride})"
-        )
-
-        # Install Markovian Summary (summarization-based compaction) on
-        # top of the Markovian Thinker interceptor. No-op when
-        # markovian_thinker.summary.enabled is False.
-        scfg = config.markovian_thinker.summary
-        if scfg.enabled:
-            from kv_eviction.env import configure_markovian_summary
-
-            configure_markovian_summary(
-                enabled=True,
-                mode=scfg.mode,
-                compaction_max_turns=scfg.compaction_max_turns,
-                max_len_summary=scfg.max_len_summary,
-                instruction_text=scfg.instruction_text,
-                resume_text=scfg.resume_text,
-                temperature=scfg.temperature,
-                top_p=scfg.top_p,
-                on_error=scfg.on_error,
-                log_summaries=scfg.log_summaries,
-            )
-            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED"] = "1"
-            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MODE"] = scfg.mode
-            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_COMPACTION_MAX_TURNS"] = str(
-                scfg.compaction_max_turns
-            )
-            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MAX_LEN_SUMMARY"] = str(
-                scfg.max_len_summary
-            )
-            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_TEMPERATURE"] = str(
-                scfg.temperature
-            )
-            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_TOP_P"] = str(scfg.top_p)
-            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR"] = scfg.on_error
-            if scfg.log_summaries:
-                os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_LOG"] = "1"
-            # instruction_text / resume_text may contain arbitrary characters
-            # (newlines, quotes); ship them as JSON to avoid escaping foot-guns.
-            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON"] = json.dumps(
-                {
-                    "instruction_text": scfg.instruction_text,
-                    "resume_text": scfg.resume_text,
-                }
-            )
-            logger.info(
-                f"Markovian Summary enabled "
-                f"(mode={scfg.mode}, compaction_max_turns={scfg.compaction_max_turns}, "
-                f"max_len_summary={scfg.max_len_summary})"
-            )
 
     processor = None
     if is_vlm:
@@ -569,19 +447,8 @@ async def orchestrate(config: OrchestratorConfig):
             vlm_cache = None
 
         # Process rollouts in parallel
-        log_evicted_text = (
-            config.compaction_padding.enabled
-            and config.compaction_padding.log_evicted_text
-        )
-
         def process_rollout(rollout: vf.RolloutOutput, rollout_idx: int) -> list[TrainingSample] | None:
-            return interleave_rollout(
-                rollout,
-                vlm_cache=vlm_cache,
-                cache_key=rollout_idx,
-                tokenizer=tokenizer if log_evicted_text else None,
-                log_evicted_text=log_evicted_text,
-            )
+            return interleave_rollout(rollout, vlm_cache=vlm_cache, cache_key=rollout_idx)
 
         loop = asyncio.get_event_loop()
         futures = [
@@ -788,33 +655,6 @@ async def orchestrate(config: OrchestratorConfig):
             env_metrics_df = metrics_df.loc[env_df.index]
             for metric in metrics_df.columns:
                 to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["example_id"])[metric].mean().mean()
-
-        # Drain Markovian Thinker truncation counters into the step
-        # metrics. Keys are absent when the feature is disabled (pop
-        # returns zero counters, but we only emit when enabled to keep
-        # the metric surface clean).
-        if config.markovian_thinker.enabled:
-            from kv_eviction.env import pop_markovian_stats
-
-            mt_stats = pop_markovian_stats()
-            to_log["markovian/n_truncations_per_step"] = mt_stats["n_truncations"]
-            to_log["markovian/n_messages_dropped_per_step"] = mt_stats[
-                "n_messages_dropped"
-            ]
-            if config.markovian_thinker.summary.enabled:
-                to_log["markovian_summary/n_per_step"] = mt_stats["n_summaries"]
-                to_log["markovian_summary/n_failures_per_step"] = mt_stats[
-                    "n_summary_failures"
-                ]
-                to_log["markovian_summary/prompt_tokens_per_step"] = mt_stats[
-                    "summary_prompt_tokens"
-                ]
-                to_log["markovian_summary/output_tokens_per_step"] = mt_stats[
-                    "summary_output_tokens"
-                ]
-                to_log["markovian_summary/latency_ms_per_step"] = mt_stats[
-                    "summary_latency_ms"
-                ]
 
         # Log metrics to monitor(s)
         monitor.log(to_log, step=progress.step)

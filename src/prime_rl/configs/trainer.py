@@ -76,23 +76,6 @@ class CompactionConfig(BaseConfig):
         ),
     ] = 16
 
-    protected_prefix_tokens: Annotated[
-        int,
-        Field(
-            ge=-1,
-            description=(
-                "Must match vLLM's --compaction-protected-prefix-tokens. "
-                "When > 0, eviction always starts at "
-                "ceil(protected_prefix / block_size) * block_size instead "
-                "of the per-sample prompt_aligned_len. This makes the "
-                "eviction boundary constant across all compaction events, "
-                "which is required for multi-turn compaction training. "
-                "-1 = auto-detect from system message (inferred from the "
-                "first compaction event's num_prompt_tokens)."
-            ),
-        ),
-    ] = 0
-
     bptt_segments: Annotated[
         int | None,
         Field(

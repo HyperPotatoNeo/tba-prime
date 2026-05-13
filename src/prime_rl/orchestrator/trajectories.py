@@ -1,20 +1,10 @@
 import base64
 import hashlib
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-
-# When the orchestrator enables Markovian Thinker, each extension-break
-# starts a fresh TrainingSample from a re-truncated prompt. The system
-# prefix must survive truncation — a silent drop would let the model
-# train without its instructions. We cheaply assert that every new
-# sample's prompt_ids begins with the same first token as the very
-# first sample's prompt_ids (typically `<|im_start|>`). Off by default
-# (gated by the env var the orchestrator sets when markovian is enabled).
-_MARKOVIAN_ASSERT_ENABLED = os.environ.get("KV_EVICTION_MARKOVIAN_ENABLED") == "1"
 
 import torch
 import verifiers as vf
@@ -246,116 +236,10 @@ def pretokenize_rollout_trajectory(
     return True
 
 
-def _build_summary_sample(
-    step: vf.TrajectoryStep,
-    *,
-    temperature: float,
-    has_error: bool,
-) -> TrainingSample | None:
-    """Construct a standalone TrainingSample from a summary payload
-    stashed on a trajectory step's extras.
-
-    Returns None when the step has no summary payload, or when the
-    payload is malformed (missing prompt/completion tokens, or logprobs
-    length mismatch with completion tokens). The regular per-step
-    sample emission is unaffected.
-
-    Full-credit: ``completion_mask`` is all-True when the rollout did
-    not error; for errored rollouts we zero the mask (same policy as
-    make_sample above). ``compaction_events`` is populated from the
-    payload in ``mode="eviction"`` (vLLM-side eviction can fire during
-    the summary call's own prefill/decode); ``None`` in
-    ``mode="markovian"`` where the summary call runs with vLLM
-    compaction off.
-    """
-    extras = step.get("extras") if isinstance(step, dict) else None
-    if not extras:
-        return None
-    payload = extras.get("summary_trainsample")
-    if not isinstance(payload, dict):
-        return None
-    try:
-        prompt_ids = [int(x) for x in (payload.get("prompt_token_ids") or [])]
-        completion_ids = [
-            int(x) for x in (payload.get("completion_token_ids") or [])
-        ]
-        completion_logprobs = [
-            float(x) for x in (payload.get("completion_logprobs") or [])
-        ]
-    except (TypeError, ValueError):
-        return None
-    if not prompt_ids or not completion_ids:
-        return None
-    if len(completion_logprobs) != len(completion_ids):
-        return None
-
-    # Coerce payload's ``compaction_events`` list to
-    # ``CompactionEventWire`` instances. Mirrors the same
-    # dict / list-tuple / typed handling as the regular per-step path
-    # in ``_compaction_events_from_step`` — summary payloads traverse
-    # the same msgspec boundary and can arrive as any of those shapes.
-    raw_events = payload.get("compaction_events")
-    summary_events: list[CompactionEventWire] | None = None
-    if raw_events:
-        coerced: list[CompactionEventWire] = []
-        for e in raw_events:
-            if isinstance(e, CompactionEventWire):
-                coerced.append(e)
-            elif isinstance(e, dict):
-                try:
-                    coerced.append(
-                        CompactionEventWire(
-                            num_output_tokens_at_compaction=int(
-                                e["num_output_tokens_at_compaction"]
-                            ),
-                            tokens_evicted=int(e["tokens_evicted"]),
-                            position_offset_after=int(e["position_offset_after"]),
-                            num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
-                            evict_start=int(e.get("evict_start", 0)),
-                        )
-                    )
-                except (KeyError, TypeError, ValueError):
-                    continue
-            elif isinstance(e, (list, tuple)) and len(e) >= 3:
-                try:
-                    coerced.append(
-                        CompactionEventWire(
-                            num_output_tokens_at_compaction=int(e[0]),
-                            tokens_evicted=int(e[1]),
-                            position_offset_after=int(e[2]),
-                            num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
-                            evict_start=int(e[4]) if len(e) >= 5 else 0,
-                        )
-                    )
-                except (TypeError, ValueError):
-                    continue
-        summary_events = coerced or None
-
-    completion_mask = (
-        [False] * len(completion_ids)
-        if has_error
-        else [True] * len(completion_ids)
-    )
-    return TrainingSample(
-        prompt_ids=prompt_ids,
-        prompt_mask=[False] * len(prompt_ids),
-        completion_ids=completion_ids,
-        completion_mask=completion_mask,
-        completion_logprobs=completion_logprobs,
-        completion_temperatures=[temperature] * len(completion_ids),
-        teacher_logprobs=None,
-        advantage=None,
-        routed_experts=None,
-        compaction_events=summary_events,
-    )
-
-
 def interleave_rollout(
     output: vf.RolloutOutput,
     vlm_cache: "VLMImageCache | None" = None,
     cache_key: int | None = None,
-    tokenizer: PreTrainedTokenizer | None = None,
-    log_evicted_text: bool = False,
 ) -> list[TrainingSample] | None:
     """
     Convert vf.RolloutOutput to trainable rollouts by interleaving trajectory steps
@@ -398,62 +282,9 @@ def interleave_rollout(
     def prepare_step_tokens(step: vf.TrajectoryStep, step_idx: int) -> dict[str, Any] | None:
         tokens = step["tokens"]
         if tokens is not None:
-            prompt_ids = list(tokens["prompt_ids"])
-            prompt_mask = [bool(i) for i in tokens["prompt_mask"]]
-
-            # Block-aligned padding mode: the kv_eviction interceptor
-            # stashed the EXACT padded token stream vLLM ran on in the
-            # step's extras. Override the verifiers-re-tokenized prompt_ids
-            # (which is unpadded) so the trainer sees what inference saw.
-            # prompt_mask is rebuilt as all-False because (a) every prompt
-            # position is no-gradient by construction and (b) the existing
-            # per-token verifiers mask applies to the unpadded sequence
-            # and can't be re-aligned cheaply.
-            extras = step.get("extras")
-            padded_ids = extras.get("prompt_token_ids") if extras else None
-            if padded_ids:
-                prompt_ids = [int(x) for x in padded_ids]
-                prompt_mask = [False] * len(prompt_ids)
-
-            # Admission-time compaction trim: the vLLM response carries
-            # the ORIGINAL (pre-trim) prompt_token_ids, but inference ran
-            # on the trimmed prompt. Replay the scheduler's token
-            # deletions so the trainer sees identical tokens + positions.
-            step_events = _compaction_events_from_step(step)
-            if step_events and padded_ids:
-                orig_len = len(prompt_ids)
-                prompt_ids, prompt_mask, step_events = _apply_admission_trim(
-                    prompt_ids, prompt_mask, step_events,
-                    step_idx=step_idx,
-                    example_id=output.get("example_id", "?"),
-                )
-                if len(prompt_ids) < orig_len:
-                    logger.info(
-                        f"[ADMISSION-TRIM] step {step_idx}: "
-                        f"prompt {orig_len} -> {len(prompt_ids)} tokens, "
-                        f"{len(step_events)} mid-gen events remaining"
-                    )
-                # Write surviving events back to the step's extras so the
-                # downstream step_compaction_events list sees the trimmed
-                # set (admission events consumed, only mid-gen remain).
-                if extras is not None:
-                    if step_events:
-                        extras["compaction_events"] = [
-                            {
-                                "num_output_tokens_at_compaction": e.num_output_tokens_at_compaction,
-                                "tokens_evicted": e.tokens_evicted,
-                                "position_offset_after": e.position_offset_after,
-                                "num_prompt_tokens": e.num_prompt_tokens,
-                                "evict_start": e.evict_start,
-                            }
-                            for e in step_events
-                        ]
-                    else:
-                        extras["compaction_events"] = None
-
             return {
-                "prompt_ids": prompt_ids,
-                "prompt_mask": prompt_mask,
+                "prompt_ids": list(tokens["prompt_ids"]),
+                "prompt_mask": [bool(i) for i in tokens["prompt_mask"]],
                 "completion_ids": list(tokens["completion_ids"]),
                 "completion_mask": [bool(i) for i in tokens["completion_mask"]],
                 "completion_logprobs": list(tokens["completion_logprobs"]),
@@ -462,59 +293,6 @@ def interleave_rollout(
 
         logger.warning(f"Missing rollout tokens for example {output['example_id']} step {step_idx}.")
         return None
-
-    def _apply_admission_trim(
-        prompt_ids: list[int],
-        prompt_mask: list[bool],
-        events: list[CompactionEventWire],
-        step_idx: int = -1,
-        example_id: Any = "?",
-    ) -> tuple[list[int], list[bool], list[CompactionEventWire]]:
-        """Apply admission-time compaction events to the prompt.
-
-        Admission events (num_output_tokens_at_compaction == 0) represent
-        token deletions that the vLLM scheduler applied to the prompt
-        BEFORE prefill. The response carries the original (pre-trim)
-        prompt, so we replay the deletions here so the trainer sees the
-        same tokens inference ran on.
-
-        Events are applied in order (oldest-first), matching the
-        scheduler's _apply_trim sequence. Each event's evict_start is
-        relative to the CURRENT (already-partially-trimmed) prompt.
-
-        Returns (trimmed_prompt, trimmed_mask, remaining_events) where
-        remaining_events contains only mid-generation events (output > 0).
-        """
-        trimmed_ids = list(prompt_ids)
-        trimmed_mask = list(prompt_mask)
-        remaining: list[CompactionEventWire] = []
-        ev_idx = 0
-        for evt in events:
-            if evt.num_output_tokens_at_compaction == 0:
-                start = evt.evict_start
-                end = start + evt.tokens_evicted
-                if log_evicted_text and tokenizer is not None:
-                    evicted_ids = trimmed_ids[start:end]
-                    text = tokenizer.decode(
-                        evicted_ids, skip_special_tokens=False
-                    )
-                    framed = "\n".join(
-                        f"  | {line}" for line in text.split("\n")
-                    )
-                    logger.info(
-                        f"[COMPACT-TEXT] ex={example_id} step={step_idx} "
-                        f"#{ev_idx} ADMISSION evict=[{start},{end}) "
-                        f"({evt.tokens_evicted} tokens, {len(text)} chars)\n"
-                        f"  {'-' * 70}\n"
-                        f"{framed}\n"
-                        f"  {'-' * 70}"
-                    )
-                del trimmed_ids[start:end]
-                del trimmed_mask[start:end]
-                ev_idx += 1
-            else:
-                remaining.append(evt)
-        return trimmed_ids, trimmed_mask, remaining
 
     def _compaction_events_from_step(
         step: vf.TrajectoryStep,
@@ -541,8 +319,6 @@ def interleave_rollout(
                         ),
                         tokens_evicted=int(e["tokens_evicted"]),
                         position_offset_after=int(e["position_offset_after"]),
-                        num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
-                        evict_start=int(e.get("evict_start", 0)),
                     )
                 )
             elif isinstance(e, (list, tuple)) and len(e) >= 3:
@@ -552,8 +328,6 @@ def interleave_rollout(
                         num_output_tokens_at_compaction=int(e[0]),
                         tokens_evicted=int(e[1]),
                         position_offset_after=int(e[2]),
-                        num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
-                        evict_start=int(e[4]) if len(e) >= 5 else 0,
                     )
                 )
         return out or None
@@ -566,142 +340,6 @@ def interleave_rollout(
             return None
         prepared_steps.append(prepared)
         step_compaction_events.append(_compaction_events_from_step(step))
-
-    # --- Diagnostic: detect coordinate mismatch between compaction events
-    # and completion_ids BEFORE the merge loop runs (and potentially asserts).
-    example_id = output.get("example_id", "?")
-    for diag_idx, (diag_tokens, diag_events) in enumerate(
-        zip(prepared_steps, step_compaction_events)
-    ):
-        if diag_events:
-            max_raw = max(e.num_output_tokens_at_compaction for e in diag_events)
-            clen = len(diag_tokens["completion_ids"])
-            plen = len(diag_tokens["prompt_ids"])
-            total_evicted = sum(e.tokens_evicted for e in diag_events)
-            # Notebook-style per-event log (one line per CompactionEvent).
-            # Mirrors experiments/debug_balrog/compaction_test.ipynb output:
-            #   #0 evicted=352 offset_after=352 prompt_tokens=996 ...
-            logger.info(
-                f"[COMPACT] ex={example_id} step={diag_idx} prompt_len={plen} "
-                f"completion_len={clen} events={len(diag_events)}"
-            )
-            for ev_idx, ev in enumerate(diag_events):
-                logger.info(
-                    f"[COMPACT]   #{ev_idx} evicted={ev.tokens_evicted} "
-                    f"offset_after={ev.position_offset_after} "
-                    f"prompt_tokens={ev.num_prompt_tokens} "
-                    f"output_at_compact={ev.num_output_tokens_at_compaction}"
-                )
-            # Debug-only: decode each event's evicted token range from the
-            # orchestrator's local (prompt + completion) buffer and log a
-            # framed `| ... |` block. Mirrors the notebook trace format
-            # (experiments/debug_balrog/compaction_test.ipynb / out_turn.txt).
-            #
-            # Range math (mirrors vLLM scheduler.py:_effective_prompt_tokens
-            # + evict_start computation):
-            #   1. protected_prefix_len = first <|im_end|> position + 1.
-            #      vLLM auto-detects this by scanning for eos_token_id; in
-            #      turn mode the protected region is exactly the system
-            #      message.
-            #   2. evict_base = align_up(protected_prefix_len, block_size).
-            #   3. position_offset_after is the cumulative count of evicted
-            #      tokens after this event. Events on a step are contiguous
-            #      and ordered, so for event N:
-            #         start = evict_base + (offset_after - tokens_evicted)
-            #         end   = evict_base + offset_after
-            #      The system prompt is never evicted, so the indices stay
-            #      valid into the orchestrator's (prompt+completion) buffer.
-            if log_evicted_text and tokenizer is not None:
-                # Use the EXACT padded prompt_token_ids vLLM ran on, taken
-                # from the kv_eviction interceptor's stash on extras. The
-                # `prepare_step_tokens` override should already substitute
-                # this — but reading extras directly avoids any ambiguity
-                # about which buffer (padded vs unpadded) we're slicing.
-                step_extras = trajectory[diag_idx].get("extras") or {}
-                padded_prompt_ids = step_extras.get("prompt_token_ids")
-                if padded_prompt_ids:
-                    prompt_ids_for_decode = [int(x) for x in padded_prompt_ids]
-                else:
-                    prompt_ids_for_decode = list(diag_tokens["prompt_ids"])
-                full_ids = prompt_ids_for_decode + list(
-                    diag_tokens["completion_ids"]
-                )
-                eos_id = tokenizer.eos_token_id
-                protected_prefix_len = len(prompt_ids_for_decode)  # fallback
-                if eos_id is not None:
-                    for i, tok_id in enumerate(prompt_ids_for_decode):
-                        if tok_id == eos_id:
-                            protected_prefix_len = i + 1
-                            break
-                # One-shot diagnostic per step: confirm we're slicing the
-                # padded buffer (filler count > 0 expected on multi-turn
-                # rollouts). Under AFTER-padding, <|im_end|> sits at its
-                # natural position; fillers occupy slots between
-                # <|im_end|> and the next block boundary. The useful
-                # invariant is therefore "first_boundary is block-
-                # aligned", not "first_im_end is aligned".
-                _filler_count = sum(
-                    1 for t in prompt_ids_for_decode if t == 151643
-                )
-                _first_im_end = (
-                    protected_prefix_len - 1
-                    if protected_prefix_len < len(prompt_ids_for_decode)
-                    else -1
-                )
-                _first_boundary = (
-                    ((_first_im_end + 1 + 15) // 16) * 16
-                    if _first_im_end >= 0 else -1
-                )
-                logger.info(
-                    f"[COMPACT-DEBUG] ex={example_id} step={diag_idx} "
-                    f"prompt_len={len(prompt_ids_for_decode)} "
-                    f"src={'extras' if padded_prompt_ids else 'prep'} "
-                    f"fillers={_filler_count} first_im_end={_first_im_end} "
-                    f"first_boundary={_first_boundary} "
-                    f"block_aligned={_first_boundary % 16 == 0 if _first_boundary >= 0 else 'n/a'}"
-                )
-                # block_size is the same as inference.vllm_extra.block_size.
-                # Hardcoded to 16 here to match the only supported value
-                # (PagedAttention block_size is fixed across the run).
-                block_size = 16
-                evict_base = (
-                    (protected_prefix_len + block_size - 1) // block_size
-                ) * block_size
-                for ev_idx, ev in enumerate(diag_events):
-                    start = evict_base + ev.position_offset_after - ev.tokens_evicted
-                    end = evict_base + ev.position_offset_after
-                    if start < 0 or end > len(full_ids) or start >= end:
-                        logger.warning(
-                            f"[COMPACT-TEXT] ex={example_id} step={diag_idx} "
-                            f"#{ev_idx} skipped: range [{start},{end}) outside "
-                            f"buffer (len={len(full_ids)})"
-                        )
-                        continue
-                    text = tokenizer.decode(
-                        full_ids[start:end], skip_special_tokens=False
-                    )
-                    framed = "\n".join(f"  | {line}" for line in text.split("\n"))
-                    logger.info(
-                        f"[COMPACT-TEXT] ex={example_id} step={diag_idx} "
-                        f"#{ev_idx} evict=[{start},{end}) "
-                        f"({ev.tokens_evicted} tokens, {len(text)} chars)\n"
-                        f"  {'-' * 70}\n"
-                        f"{framed}\n"
-                        f"  {'-' * 70}"
-                    )
-            events_summary = [(e.num_output_tokens_at_compaction, e.tokens_evicted)
-                              for e in diag_events]
-            logger.warning(
-                f"[DIAG] step {diag_idx}: max_event_raw={max_raw}  "
-                f"completion_ids_len={clen}  total_evicted={total_evicted}  "
-                f"gap={max_raw - clen}  events={events_summary}"
-            )
-            if max_raw > clen:
-                logger.error(
-                    f"[DIAG] MISMATCH step {diag_idx}: max_event_raw={max_raw} > "
-                    f"completion_ids_len={clen} (gap={max_raw - clen}). This will "
-                    f"cause non-monotonic boundary assertion in merge."
-                )
 
     def make_sample(
         tokens: dict[str, Any],
@@ -788,67 +426,20 @@ def interleave_rollout(
         if matched_idx is not None:
             # Extension holds - merge into matched sample
             prefix_tokens, sample, _ = active_samples[matched_idx]
-            prefix_len = len(prefix_tokens)
-
-            # Offset compaction events: num_output_tokens_at_compaction is
-            # per-turn-relative, shift to merged completion_ids coordinates.
-            step_events = step_compaction_events[step_idx]
-            if step_events is not None:
-                current_completion_len = len(sample.completion_ids)
-                new_prompt_ext_len = len(tokens["prompt_ids"]) - prefix_len
-                assert new_prompt_ext_len >= 0, (
-                    f"Step {step_idx} prompt ({len(tokens['prompt_ids'])} tokens) "
-                    f"shorter than matched prefix ({prefix_len} tokens)"
+            # Compaction + multi-step extension is not yet supported: the
+            # events from this step would need their num_output_tokens_at_compaction
+            # offset by the existing sample length AND merged with the previous
+            # step's events. Single-turn (trajectory length 1) is the only
+            # supported configuration for MKV-RL Phase 3 initial scope. Raise
+            # rather than silently produce wrong boundaries.
+            if step_compaction_events[step_idx] is not None:
+                raise NotImplementedError(
+                    f"Compaction events on extended trajectory step "
+                    f"{step_idx} are not supported yet. Use SingleTurnEnv "
+                    f"with compaction, or extend interleave_rollout to "
+                    f"offset and merge per-step events."
                 )
-                generation_offset = current_completion_len + new_prompt_ext_len
-
-                step_completion_len = len(tokens["completion_ids"])
-                prev_last = (sample.compaction_events[-1] if sample.compaction_events else None)
-                logger.warning(
-                    f"[DIAG-MERGE] step {step_idx}: "
-                    f"current_completion_len={current_completion_len}  "
-                    f"new_prompt_ext_len={new_prompt_ext_len}  "
-                    f"generation_offset={generation_offset}  "
-                    f"step_completion_ids_len={step_completion_len}  "
-                    f"prefix_len={prefix_len}  "
-                    f"num_events={len(step_events)}  "
-                    f"prev_last={prev_last}"
-                )
-
-                existing = sample.compaction_events or []
-                for e in step_events:
-                    offsetted = e.num_output_tokens_at_compaction + generation_offset
-                    if existing:
-                        prev = existing[-1].num_output_tokens_at_compaction
-                        assert offsetted >= prev, (
-                            f"Non-monotonic compaction boundary at step {step_idx}: "
-                            f"offsetted={offsetted} < prev={prev} "
-                            f"(raw={e.num_output_tokens_at_compaction}, "
-                            f"generation_offset={generation_offset})"
-                        )
-                        if offsetted == prev:
-                            # Two compaction events at the same merged position
-                            # (e.g. compaction fires at the very start of a new
-                            # turn, landing on the same boundary as the previous
-                            # turn's last event). Merge into the existing event.
-                            existing[-1] = CompactionEventWire(
-                                num_output_tokens_at_compaction=offsetted,
-                                tokens_evicted=existing[-1].tokens_evicted + e.tokens_evicted,
-                                position_offset_after=e.position_offset_after,
-                                num_prompt_tokens=e.num_prompt_tokens,
-                            )
-                            continue
-                    existing.append(
-                        CompactionEventWire(
-                            num_output_tokens_at_compaction=offsetted,
-                            tokens_evicted=e.tokens_evicted,
-                            position_offset_after=e.position_offset_after,
-                            num_prompt_tokens=e.num_prompt_tokens,
-                        )
-                    )
-                sample.compaction_events = existing
-
-            extend_sample(sample, prefix_len, step_idx=step_idx)
+            extend_sample(sample, len(prefix_tokens), step_idx=step_idx)
             active_samples[matched_idx][0] = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples[matched_idx][2] = step_idx
         else:
@@ -857,25 +448,6 @@ def interleave_rollout(
                 f"Extension property broke at step {step_idx + 1} for example {output['example_id']}. "
                 f"Starting new sample (active_prefixes={len(active_samples)}, step_prompt_len={len(step_prompt_ids)})."
             )
-
-            # Markovian Thinker sanity check: every post-truncation
-            # sample must begin with the same system-prefix token as the
-            # first sample. Catches silent regressions where truncation
-            # accidentally drops the system message.
-            if (
-                _MARKOVIAN_ASSERT_ENABLED
-                and step_prompt_ids
-                and first_tokens["prompt_ids"]
-            ):
-                expected_first = first_tokens["prompt_ids"][0]
-                assert step_prompt_ids[0] == expected_first, (
-                    f"[MARKOVIAN] system prefix missing at step {step_idx}: "
-                    f"expected first prompt token {expected_first}, "
-                    f"got {step_prompt_ids[0]}. This usually means "
-                    f"truncate_messages_to_last_k_turns dropped the "
-                    f"system message."
-                )
-
             new_prefix = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples.append(
                 [new_prefix, make_sample(tokens, step_compaction_events[step_idx]), step_idx]
@@ -890,25 +462,7 @@ def interleave_rollout(
             sample.pixel_values_shape = shape
             sample.image_grid_thw = grids
 
-    # Markovian Summary extension: for every trajectory step that carries
-    # an `extras["summary_trainsample"]` payload, emit a separate
-    # TrainingSample. These samples are full-credit (completion_mask
-    # all-True) and their logprobs come from the summary call itself.
-    # They inherit the rollout's advantage via the orchestrator's
-    # per-rollout advantage assignment after this function returns.
-    summary_samples: list[TrainingSample] = []
-    for step in trajectory:
-        s = _build_summary_sample(step, temperature=temperature, has_error=has_error)
-        if s is not None:
-            summary_samples.append(s)
-
-    regular_samples = [sample for _, sample, _ in active_samples]
-    # Summary samples appended AFTER the regular samples so they don't
-    # disturb per-rollout prefix-matching / merge invariants. Ordering
-    # within the return list does not affect training semantics (each
-    # sample trains independently); sharing the rollout's advantage
-    # assignment happens downstream.
-    return regular_samples + summary_samples
+    return [sample for _, sample, _ in active_samples]
 
 
 # =============================================================================

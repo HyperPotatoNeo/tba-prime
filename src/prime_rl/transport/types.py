@@ -31,20 +31,6 @@ class CompactionEventWire(
     # future non-FIFO strategies).
     position_offset_after: int
 
-    # Prompt length (in tokens) of the vLLM request that produced this event.
-    # Multi-turn: each turn is a separate vLLM request whose prompt grows with
-    # the conversation. The trainer uses this to verify eviction boundaries
-    # when protected_prefix_tokens is set. Default 0 preserves backward
-    # compatibility (omit_defaults=True on the struct).
-    num_prompt_tokens: int = 0
-
-    # Start position of the eviction range in the current (possibly
-    # already-partially-trimmed) token sequence. For admission-time events
-    # (num_output_tokens_at_compaction == 0) the orchestrator replays the
-    # same del prompt_ids[evict_start : evict_start + tokens_evicted] that
-    # the vLLM scheduler applied, so the trainer sees the trimmed prompt.
-    evict_start: int = 0
-
 
 # Orchestrator -> Packer
 class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):

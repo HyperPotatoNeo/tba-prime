@@ -34,31 +34,9 @@ from prime_rl.utils.monitor import get_monitor
 from prime_rl.utils.utils import capitalize
 
 
-def _env_worker_subprocess_entrypoint(*args, **kwargs):
-    """Target for the env WORKER subprocess (spawned by EnvRouter).
-
-    The worker is spawned via `mp.spawn` from inside the env server
-    subprocess and starts a fresh Python interpreter. Without this
-    wrapper the worker never imports kv_eviction, so the
-    AsyncCompletions.create monkey-patch (which implements block-
-    aligned message padding) never installs in the process that
-    actually issues chat.completions.create() calls.
-
-    Pickle's function-by-module-qualname reduction means that when
-    the server subprocess sets this function as the mp.spawn target,
-    the worker subprocess imports `prime_rl.orchestrator.envs` on
-    unpickle — which transitively imports kv_eviction at module top.
-    """
-    import kv_eviction  # noqa: F401 — installs monkey-patches + reads env vars
-    from verifiers.serve.server.env_worker import EnvWorker
-
-    EnvWorker.run_worker(*args, **kwargs)
-
-
 def _env_server_subprocess_entrypoint(*args, **kwargs):
     """Subprocess target that ensures kv_eviction's verifiers monkey-
-    patches are installed BEFORE ZMQEnvServer.run_server runs, and
-    that the env WORKER subprocesses it spawns also import kv_eviction.
+    patches are installed BEFORE ZMQEnvServer.run_server runs.
 
     The env server spawns via `mp.get_context("spawn").Process`, which
     starts a fresh Python interpreter. Without this wrapper the
@@ -68,18 +46,6 @@ def _env_server_subprocess_entrypoint(*args, **kwargs):
     rollouts and calls add_model_response.
     """
     import kv_eviction  # noqa: F401 — triggers monkey-patches at import
-
-    # Redirect env WORKER spawns to a target that imports kv_eviction
-    # first. EnvRouter.start_worker uses `target=EnvWorker.run_worker`;
-    # by replacing run_worker with our wrapper function here, the mp
-    # pickler records its module+qualname as
-    # `prime_rl.orchestrator.envs._env_worker_subprocess_entrypoint`,
-    # so the worker subprocess imports this module on unpickle (which
-    # runs `import kv_eviction` at module top).
-    from verifiers.serve.server.env_worker import EnvWorker as _EnvWorker
-
-    _EnvWorker.run_worker = _env_worker_subprocess_entrypoint  # type: ignore[assignment]
-
     ZMQEnvServer.run_server(*args, **kwargs)
 
 REQUIRED_STATE_COLUMNS = ["trajectory", "sampling_args"]
