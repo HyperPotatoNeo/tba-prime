@@ -114,6 +114,24 @@ class CompactionConfig(BaseConfig):
         ),
     ] = 1
 
+    per_call_dispatch: Annotated[
+        bool,
+        Field(
+            description=(
+                "When True and TrainingSample.calls is populated, route "
+                "through per_call_segmented_forward (one HF forward per "
+                "vLLM chat() call, with a persistent DynamicCache across "
+                "calls and eviction-aware position_ids for admission "
+                "events). When False, use the legacy segmented_forward "
+                "(block-FIFO per-stride drops in the merged sample) — "
+                "needed for mid-gen compaction. The per-call dispatch "
+                "falls back to legacy automatically if any call has "
+                "mid-gen events. See plans/single_forward_pre_eviction.md "
+                "Phase 5."
+            ),
+        ),
+    ] = False
+
 
 class GCConfig(BaseConfig):
     """Configures deterministic garbage collection to avoid stragglers in distributed training.

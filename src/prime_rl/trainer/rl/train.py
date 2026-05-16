@@ -65,6 +65,8 @@ from prime_rl.trainer.model import (
 try:
     from kv_eviction.segmented_forward import (
         compute_num_segments,
+        compute_num_per_call_forwards,
+        per_call_segmented_forward,
         segmented_forward,
     )
 except ImportError:
@@ -74,6 +76,8 @@ except ImportError:
     # raise with a clearer error if compaction is actually used.
     segmented_forward = None  # type: ignore[assignment]
     compute_num_segments = None  # type: ignore[assignment]
+    per_call_segmented_forward = None  # type: ignore[assignment]
+    compute_num_per_call_forwards = None  # type: ignore[assignment]
 from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.utils import (
@@ -619,10 +623,76 @@ def train(config: TrainerConfig):
                 # configure experiments so all rollouts exceed the compaction
                 # window (avoid mixing long and short rollouts in the same
                 # batch).
-                seq_len_local = input_ids.shape[1]
-                n_forwards_local = compute_num_segments(
-                    seq_len_local, mb_prompt_len, segment_boundaries
+                # Per-call dispatch (plans/single_forward_pre_eviction.md, Phase 5).
+                # When per_call_dispatch is enabled AND the micro-batch
+                # carries a `calls` list, route through per_call_segmented_forward.
+                # That function runs ONE HF forward per call against a
+                # persistent DynamicCache (carried across calls, detached
+                # between them). Admission events are handled inline via
+                # eviction-aware position_ids — no two-phase split, no
+                # cache splice. The all_reduce_MAX on per-rank forward
+                # counts (= len(calls)) keeps FSDP2 collectives synced.
+                #
+                # When ANY call has mid-gen compaction events
+                # (sliding-window block-FIFO firing during decode,
+                # num_output_tokens_at_compaction > 0), fall back to the
+                # legacy segmented_forward — its per-stride drop logic
+                # handles mid-gen correctly. The per-call path is the
+                # structural fix for ADMISSION (multi-turn KL gap) and
+                # doesn't duplicate mid-gen handling.
+                use_per_call_local = (
+                    config.compaction.per_call_dispatch
+                    and per_call_segmented_forward is not None
+                    and micro_batch.get("calls") is not None
                 )
+                # Cross-rank agreement on use_per_call BEFORE entering any
+                # branch-conditional dist.all_reduce. If ANY rank cannot
+                # dispatch per-call (its sample has no `calls` list — e.g.
+                # a Markovian Summary sample), ALL ranks fall back to
+                # legacy. Doing this MIN first avoids the deadlock where
+                # one rank enters the mid-gen all_reduce below while
+                # another skips it.
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    pc_t = torch.tensor(
+                        [int(use_per_call_local)],
+                        device="cuda", dtype=torch.int32,
+                    )
+                    dist.all_reduce(pc_t, op=dist.ReduceOp.MIN)
+                    use_per_call = bool(pc_t.item())
+                else:
+                    use_per_call = use_per_call_local
+
+                if use_per_call:
+                    has_midgen_local = any(
+                        any(
+                            int(getattr(e, "num_output_tokens_at_compaction", 0)) > 0
+                            for e in (call.compaction_events or [])
+                        )
+                        for call in micro_batch["calls"]
+                    )
+                    # If ANY rank has a mid-gen event, ALL ranks fall back
+                    # to legacy (per_call_segmented_forward defers mid-gen
+                    # handling to the legacy path).
+                    if dist.is_initialized() and dist.get_world_size() > 1:
+                        mg_t = torch.tensor(
+                            [int(has_midgen_local)],
+                            device="cuda", dtype=torch.int32,
+                        )
+                        dist.all_reduce(mg_t, op=dist.ReduceOp.MAX)
+                        has_midgen_local = bool(mg_t.item())
+                    if has_midgen_local:
+                        use_per_call = False
+
+                seq_len_local = input_ids.shape[1]
+                if use_per_call:
+                    n_forwards_local = compute_num_per_call_forwards(
+                        micro_batch["calls"]
+                    )
+                else:
+                    n_forwards_local = compute_num_segments(
+                        seq_len_local, mb_prompt_len, segment_boundaries
+                    )
+
                 if dist.is_initialized() and dist.get_world_size() > 1:
                     n_forwards_t = torch.tensor(
                         [n_forwards_local], device="cuda", dtype=torch.int32
@@ -735,6 +805,28 @@ def train(config: TrainerConfig):
                     seg_adv = advantages[:, tgt_start:tgt_end]
                     seg_mask = loss_mask[:, tgt_start:tgt_end]
                     seg_inf = inference_logprobs[:, tgt_start:tgt_end]
+                    # [DEBUG-KL] per-segment trainer-vs-inference logprob
+                    # comparison. Only logs the tokens with loss_mask=True
+                    # (completion tokens, not prompt). Tagged with the
+                    # merged-frame range so multiple segments are
+                    # distinguishable.
+                    try:
+                        _m1d = seg_mask.squeeze(0).bool()
+                        if _m1d.any():
+                            _t1d = seg_raw_logprobs.squeeze(0)
+                            _i1d = seg_inf.squeeze(0)
+                            _diff = (_t1d - _i1d)[_m1d]
+                            logger.warning(
+                                f"[DEBUG-KL] range=[{tgt_start},{tgt_end}) "
+                                f"n_masked={int(_m1d.sum().item())} "
+                                f"diff: mean={float(_diff.mean().item()):.4f} "
+                                f"max={float(_diff.max().item()):.4f} "
+                                f"min={float(_diff.min().item()):.4f} "
+                                f"trainer_lp[:5]={_t1d[_m1d][:5].tolist()} "
+                                f"inf_lp[:5]={_i1d[_m1d][:5].tolist()}"
+                            )
+                    except Exception:
+                        logger.exception("[DEBUG-KL] log failed")
                     seg_teach = (
                         teacher_logprobs[:, tgt_start:tgt_end]
                         if teacher_logprobs is not None
@@ -797,19 +889,30 @@ def train(config: TrainerConfig):
                     maybe_record_function("forward"),
                     maybe_activation_offloading(config.model.ac_offloading),
                 ):
-                    out = segmented_forward(
-                        model=model,
-                        input_ids=input_ids,
-                        position_ids=forward_position_ids,
-                        segment_boundaries=segment_boundaries,
-                        prompt_len=mb_prompt_len,
-                        prompt_aligned_len=prompt_aligned_len,
-                        stride=config.compaction.stride,
-                        temperature=temperatures,
-                        max_forward_passes=max_forwards,
-                        loss_fn=_segment_loss_fn,
-                        bptt_segments=config.compaction.bptt_segments,
-                    )
+                    if use_per_call:
+                        out = per_call_segmented_forward(
+                            model=model,
+                            calls=micro_batch["calls"],
+                            merged_input_ids=input_ids,
+                            merged_position_ids=forward_position_ids,
+                            loss_fn=_segment_loss_fn,
+                            max_forward_passes=max_forwards,
+                            device=input_ids.device,
+                        )
+                    else:
+                        out = segmented_forward(
+                            model=model,
+                            input_ids=input_ids,
+                            position_ids=forward_position_ids,
+                            segment_boundaries=segment_boundaries,
+                            prompt_len=mb_prompt_len,
+                            prompt_aligned_len=prompt_aligned_len,
+                            stride=config.compaction.stride,
+                            temperature=temperatures,
+                            max_forward_passes=max_forwards,
+                            loss_fn=_segment_loss_fn,
+                            bptt_segments=config.compaction.bptt_segments,
+                        )
 
                 # segmented_forward already ran backward per BPTT
                 # window; accumulated_loss is a detached scalar for
@@ -961,10 +1064,18 @@ def train(config: TrainerConfig):
                 loss_tensor = loss_tensor.detach().to("cpu")
                 tensors[key].append(loss_tensor)
 
-            # Compaction metrics: track event counts and eviction volume
-            if compaction_events:
-                n_events = len(compaction_events)
-                total_evicted = sum(e.tokens_evicted for e in compaction_events)
+            # Compaction metrics: track event counts and eviction volume.
+            # Under per-call dispatch the admission events live INSIDE
+            # call.compaction_events (the outer sample.compaction_events
+            # gets emptied by _apply_admission_trim). Aggregate from both
+            # sources so the metric reflects all events that fired.
+            metric_events = list(compaction_events or [])
+            if use_per_call and micro_batch.get("calls"):
+                for call in micro_batch["calls"]:
+                    metric_events.extend(call.compaction_events or [])
+            if metric_events:
+                n_events = len(metric_events)
+                total_evicted = sum(e.tokens_evicted for e in metric_events)
                 tensors["compaction/num_events"].append(
                     torch.tensor([float(n_events)])
                 )
@@ -1206,8 +1317,44 @@ def train(config: TrainerConfig):
 
 
 def main():
-    """Main entry-point for RL trainer. Run using `uv run trainer`"""
+    """Main entry-point for RL trainer. Run using `uv run trainer`.
+
+    Debugging: set ``PRIME_RL_TRAINER_DEBUGPY=<port>`` (default 5679) to
+    wait for a VS Code debugger to attach, or ``PRIME_RL_TRAINER_RPDB=<port>``
+    (default 4445) to drop into an rpdb gate (connect via ``nc 127.0.0.1
+    <port>``). Different default ports from the orchestrator's gate so
+    both can run simultaneously. The /opt/toolkit/libpretend LD_PRELOAD
+    shim blocks debugpy's adapter — we clear it temporarily during
+    debugpy.listen.
+    """
     set_proc_title("Trainer")
+    import os as _os
+    _dp = _os.environ.get("PRIME_RL_TRAINER_DEBUGPY", "").strip()
+    if _dp:
+        _orig_ld = _os.environ.pop("LD_PRELOAD", None)
+        import debugpy  # type: ignore[import-not-found]
+        port = int(_dp) if _dp.isdigit() else 5679
+        host = _os.environ.get("PRIME_RL_DEBUGPY_HOST", "127.0.0.1")
+        debugpy.listen((host, port))
+        if _orig_ld is not None:
+            _os.environ["LD_PRELOAD"] = _orig_ld
+        print(
+            f"[trainer] debugpy listening on {host}:{port} — "
+            "attach from VS Code / Cursor (Python: Remote Attach).",
+            flush=True,
+        )
+        debugpy.wait_for_client()
+        print("[trainer] debugger attached, continuing.", flush=True)
+    _rp = _os.environ.get("PRIME_RL_TRAINER_RPDB", "").strip()
+    if _rp:
+        import rpdb  # type: ignore[import-not-found]
+        port = int(_rp) if _rp.isdigit() else 4445
+        print(
+            f"[trainer] rpdb gate armed on 127.0.0.1:{port} — "
+            f"connect with: nc 127.0.0.1 {port}",
+            flush=True,
+        )
+        rpdb.set_trace(port=port)
     train(cli(TrainerConfig))
 
 
