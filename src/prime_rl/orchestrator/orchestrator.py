@@ -163,6 +163,7 @@ async def orchestrate(config: OrchestratorConfig):
             block_size=config.compaction_padding.block_size,
             filler_token_id=filler_id,
             im_end_token_id=im_end_id,
+            phase4_enabled=config.compaction_padding.phase4_enabled,
         )
         # Propagate to the verifiers env server subprocess spawned below.
         # That subprocess (mp.spawn) runs a fresh interpreter and would
@@ -173,10 +174,14 @@ async def orchestrate(config: OrchestratorConfig):
         os.environ["KV_EVICTION_PADDING_BLOCK_SIZE"] = str(config.compaction_padding.block_size)
         os.environ["KV_EVICTION_PADDING_FILLER_ID"] = str(filler_id)
         os.environ["KV_EVICTION_PADDING_IM_END_ID"] = str(im_end_id)
+        os.environ["KV_EVICTION_PADDING_PHASE4"] = (
+            "1" if config.compaction_padding.phase4_enabled else "0"
+        )
         logger.info(
             f"Block-aligned message padding enabled "
             f"(block_size={config.compaction_padding.block_size}, "
-            f"filler_token_id={filler_id}, im_end_token_id={im_end_id})"
+            f"filler_token_id={filler_id}, im_end_token_id={im_end_id}, "
+            f"phase4_enabled={config.compaction_padding.phase4_enabled})"
         )
 
     # Install Markovian Thinker client-side message truncation

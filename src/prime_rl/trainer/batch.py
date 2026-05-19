@@ -125,6 +125,12 @@ def prepare_sample(
         # original prompt length.
         prompt_len = min(len(training_example.prompt_ids), len(input_ids))
 
+    # Per-call breakdown for the per-call trainer rebuild (Phase B+).
+    # Forwarded as-is from TrainingSample.calls. Only set on compaction
+    # samples (the path the trainer dispatches through). None for
+    # non-compaction samples to preserve the existing wire format.
+    calls = training_example.calls if compaction_events or compaction_enabled else None
+
     return MicroBatch(
         input_ids=input_ids,
         advantages=advantages,
@@ -141,6 +147,7 @@ def prepare_sample(
         # kv-eviction compaction events + prompt_len
         compaction_events=compaction_events,
         prompt_len=prompt_len,
+        calls=calls,
     )
 
 

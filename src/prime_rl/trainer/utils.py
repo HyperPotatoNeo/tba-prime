@@ -392,6 +392,9 @@ def filter_rl_trainer_tensor_stats_for_wandb(metrics: dict[str, float | int]) ->
         "mismatch_kl/",
         "masked_mismatch_kl/",
         "unmasked_mismatch_kl/",
+        "mismatch_kl_token_weighted/",
+        "masked_mismatch_kl_token_weighted/",
+        "unmasked_mismatch_kl_token_weighted/",
     )
     out: dict[str, float | int] = {}
     for k, v in metrics.items():

@@ -2,6 +2,7 @@ import prime_rl._compat  # noqa: F401 — patch ring_flash_attn compat before im
 
 from contextlib import nullcontext
 import gc
+import math
 import os
 import time
 
@@ -37,7 +38,7 @@ from prime_rl.trainer.ckpt import setup_ckpt_managers
 from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
-from prime_rl.configs.trainer import TrainerConfig
+from prime_rl.configs.trainer import DefaultLossConfig, TrainerConfig
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
 from prime_rl.utils.cp import (
     gather_for_cp,
@@ -64,6 +65,7 @@ from prime_rl.trainer.model import (
 
 try:
     from kv_eviction.segmented_forward import (
+        _build_pre_trim_plan,
         compute_num_segments,
         compute_num_per_call_forwards,
         per_call_segmented_forward,
@@ -75,6 +77,7 @@ except ImportError:
     # is tolerated at module load; the assertion at the dispatch site will
     # raise with a clearer error if compaction is actually used.
     segmented_forward = None  # type: ignore[assignment]
+    _build_pre_trim_plan = None  # type: ignore[assignment]
     compute_num_segments = None  # type: ignore[assignment]
     per_call_segmented_forward = None  # type: ignore[assignment]
     compute_num_per_call_forwards = None  # type: ignore[assignment]
@@ -103,6 +106,382 @@ from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
 from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
+
+
+def _kve_top_mismatch_n() -> int:
+    raw = os.environ.get("KVE_TOP_MISMATCH_TOKENS", "")
+    if raw == "":
+        raw = os.environ.get("KVE_LOG_TOP_MISMATCH_TOKENS", "")
+    if raw == "":
+        return 0
+    if raw.lower() in {"1", "true", "yes", "on"}:
+        return 20
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _kve_call_mismatch_n() -> int:
+    raw = os.environ.get("KVE_CALL_MISMATCH_TOP", "")
+    if raw == "":
+        raw = os.environ.get("KVE_LOG_CALL_MISMATCH_SUMMARY", "")
+    if raw == "":
+        return 0
+    if raw.lower() in {"1", "true", "yes", "on"}:
+        return 20
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _kve_decode_one(tokenizer, token_id: int) -> str:
+    try:
+        text = tokenizer.decode([token_id], skip_special_tokens=False)
+    except Exception:
+        try:
+            text = tokenizer.convert_ids_to_tokens([token_id])[0]
+        except Exception:
+            text = ""
+    return repr(text).replace("\n", "\\n")
+
+
+def _kve_find_call_plan(call_plans, full_logit_start: int, full_logit_end: int):
+    if not call_plans:
+        return None
+    for plan in call_plans:
+        if (
+            int(plan.get("post_start", -1)) == full_logit_start
+            and int(plan.get("post_end", -1)) == full_logit_end
+        ):
+            return plan
+    for plan in call_plans:
+        start = int(plan.get("post_start", -1))
+        end = int(plan.get("post_end", -1))
+        if start <= full_logit_start and full_logit_end <= end:
+            return plan
+    return None
+
+
+def _kve_collect_top_mismatch_records(
+    *,
+    records: list[dict],
+    counts: dict[str, int],
+    top_n: int,
+    scope: str,
+    step: int,
+    micro_step: int,
+    full_logit_start: int,
+    full_logit_end: int,
+    tgt_start: int,
+    tgt_end: int,
+    trainer_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor,
+    labels: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    entropy: torch.Tensor | None,
+    loss_config,
+    call_plan,
+) -> None:
+    if top_n <= 0:
+        return
+    with torch.no_grad():
+        t = trainer_logprobs.detach().float().squeeze(0)
+        inf = inference_logprobs.detach().float().squeeze(0)
+        adv = advantages.detach().float().squeeze(0)
+        m_loss = loss_mask.detach().bool().squeeze(0)
+        lbl = labels.detach().squeeze(0)
+        diff = t - inf
+        prob_diff = torch.exp(t) - torch.exp(inf)
+        if isinstance(loss_config, DefaultLossConfig):
+            dppo_high = prob_diff > loss_config.dppo_mask_high
+            dppo_low = prob_diff < -loss_config.dppo_mask_low
+            dppo_mask = torch.where(adv > 0, dppo_high, dppo_low)
+        else:
+            dppo_mask = torch.zeros_like(m_loss)
+        keep_mask = m_loss & ~dppo_mask
+        normalized_scope = scope.lower()
+        if normalized_scope in {"loss", "loss_mask", "trainable", "all"}:
+            select = m_loss
+        elif normalized_scope in {"masked", "dppo_masked"}:
+            select = m_loss & dppo_mask
+        else:
+            select = keep_mask
+            normalized_scope = "keep"
+        counts["considered"] = counts.get("considered", 0) + int(select.sum().item())
+        if not select.any():
+            return
+        mismatch_kl = torch.exp(diff) - diff - 1.0
+        idx_all = torch.nonzero(select, as_tuple=False).flatten()
+        vals = mismatch_kl[idx_all]
+        k = min(top_n, int(vals.numel()))
+        top_vals, top_pos = torch.topk(vals, k=k)
+        idx = idx_all[top_pos]
+        ent = entropy.detach().float().squeeze(0) if entropy is not None else None
+        call_idx = call_plan.get("call_idx") if call_plan is not None else None
+        for rank, (local_i, kl_val) in enumerate(zip(idx.tolist(), top_vals.tolist()), start=1):
+            token_id = int(lbl[local_i].detach().cpu().item())
+            logit_pos = full_logit_start + int(local_i)
+            target_pos = tgt_start + int(local_i)
+            rec = {
+                "step": int(step),
+                "micro_step": int(micro_step),
+                "rank_in_segment": rank,
+                "kl": float(kl_val),
+                "diff": float(diff[local_i].detach().cpu().item()),
+                "trainer_lp": float(t[local_i].detach().cpu().item()),
+                "inference_lp": float(inf[local_i].detach().cpu().item()),
+                "prob_diff": float(prob_diff[local_i].detach().cpu().item()),
+                "advantage": float(adv[local_i].detach().cpu().item()),
+                "entropy": (
+                    float(ent[local_i].detach().cpu().item())
+                    if ent is not None else None
+                ),
+                "token_id": token_id,
+                "target_pos": target_pos,
+                "logit_pos": logit_pos,
+                "tgt_start": int(tgt_start),
+                "tgt_end": int(tgt_end),
+                "logit_start": int(full_logit_start),
+                "logit_end": int(full_logit_end),
+                "scope": normalized_scope,
+                "dppo_masked": bool(dppo_mask[local_i].detach().cpu().item()),
+                "keep": bool(keep_mask[local_i].detach().cpu().item()),
+                "call_idx": int(call_idx) if call_idx is not None else None,
+            }
+            if call_plan is not None:
+                rec.update({
+                    "has_admission": bool(call_plan.get("has_admission", False)),
+                    "sub_len": call_plan.get("sub_len"),
+                    "comp_len": call_plan.get("comp_len"),
+                    "pad_len": call_plan.get("pad_len"),
+                    "nuf_len": call_plan.get("nuf_len"),
+                    "writer_offset": call_plan.get("writer_offset"),
+                    "admission_offset_after": call_plan.get("admission_offset_after"),
+                    "admission_total_evicted": call_plan.get("admission_total_evicted"),
+                    "admission_nuf_len": call_plan.get("admission_nuf_len"),
+                    "synthetic_cached_tokens": call_plan.get("synthetic_cached_tokens"),
+                    "synthetic_nuf_len": call_plan.get("synthetic_nuf_len"),
+                    "synthetic_offset_after": call_plan.get("synthetic_offset_after"),
+                    "new_content_start_in_sub": call_plan.get("new_content_start_in_sub"),
+                })
+            records.append(rec)
+
+
+def _kve_log_top_mismatch_records(logger, tokenizer, records: list[dict], counts: dict[str, int], top_n: int) -> None:
+    if top_n <= 0 or not records:
+        return
+    rows = sorted(records, key=lambda r: r["kl"], reverse=True)[:top_n]
+    scope = rows[0].get("scope", "keep")
+    logger.warning(
+        f"[KVE-TOP-KL] step={rows[0]['step']} "
+        f"micro_step={rows[0]['micro_step']} scope={scope} "
+        f"considered={counts.get('considered', 0)} "
+        f"segments_sampled={len(records)} top_n={len(rows)}"
+    )
+    for i, rec in enumerate(rows, start=1):
+        token_text = _kve_decode_one(tokenizer, rec["token_id"])
+        entropy_text = (
+            "None" if rec["entropy"] is None else f"{rec['entropy']:.6g}"
+        )
+        logger.warning(
+            f"[KVE-TOP-KL] #{i:02d} kl={rec['kl']:.6g} "
+            f"diff={rec['diff']:.6g} T_lp={rec['trainer_lp']:.6g} "
+            f"V_lp={rec['inference_lp']:.6g} "
+            f"entropy={entropy_text} "
+            f"adv={rec['advantage']:.6g} prob_diff={rec['prob_diff']:.6g} "
+            f"pos={rec['target_pos']} logit_pos={rec['logit_pos']} "
+            f"tok={rec['token_id']} text={token_text} keep={int(rec['keep'])} "
+            f"dppo_masked={int(rec['dppo_masked'])} "
+            f"call={rec.get('call_idx')} admission={rec.get('has_admission')} "
+            f"range=[{rec['tgt_start']},{rec['tgt_end']}) "
+            f"logit_range=[{rec['logit_start']},{rec['logit_end']}) "
+            f"sub_len={rec.get('sub_len')} comp_len={rec.get('comp_len')} "
+            f"pad_len={rec.get('pad_len')} nuf={rec.get('nuf_len')} "
+            f"adm_nuf={rec.get('admission_nuf_len')} "
+            f"evicted={rec.get('admission_total_evicted')} "
+            f"synth_cached={rec.get('synthetic_cached_tokens')} "
+            f"synth_nuf={rec.get('synthetic_nuf_len')} "
+            f"writer_off={rec.get('writer_offset')} "
+            f"adm_off={rec.get('admission_offset_after')} "
+            f"new_start={rec.get('new_content_start_in_sub')}"
+        )
+
+
+def _kve_collect_call_mismatch_record(
+    *,
+    records: list[dict],
+    counts: dict[str, int],
+    scope: str,
+    step: int,
+    micro_step: int,
+    full_logit_start: int,
+    full_logit_end: int,
+    tgt_start: int,
+    tgt_end: int,
+    trainer_logprobs: torch.Tensor,
+    inference_logprobs: torch.Tensor,
+    labels: torch.Tensor,
+    advantages: torch.Tensor,
+    loss_mask: torch.Tensor,
+    entropy: torch.Tensor | None,
+    loss_config,
+    call_plan,
+) -> None:
+    with torch.no_grad():
+        t = trainer_logprobs.detach().float().squeeze(0)
+        inf = inference_logprobs.detach().float().squeeze(0)
+        adv = advantages.detach().float().squeeze(0)
+        m_loss = loss_mask.detach().bool().squeeze(0)
+        lbl = labels.detach().squeeze(0)
+        diff = t - inf
+        prob_diff = torch.exp(t) - torch.exp(inf)
+        if isinstance(loss_config, DefaultLossConfig):
+            dppo_high = prob_diff > loss_config.dppo_mask_high
+            dppo_low = prob_diff < -loss_config.dppo_mask_low
+            dppo_mask = torch.where(adv > 0, dppo_high, dppo_low)
+        else:
+            dppo_mask = torch.zeros_like(m_loss)
+        keep_mask = m_loss & ~dppo_mask
+        normalized_scope = scope.lower()
+        if normalized_scope in {"loss", "loss_mask", "trainable", "all"}:
+            select = m_loss
+        elif normalized_scope in {"masked", "dppo_masked"}:
+            select = m_loss & dppo_mask
+        else:
+            select = keep_mask
+            normalized_scope = "keep"
+        n_selected = int(select.sum().item())
+        counts["considered"] = counts.get("considered", 0) + n_selected
+        counts["segments"] = counts.get("segments", 0) + 1
+        if n_selected == 0:
+            return
+        mismatch_kl = torch.exp(diff) - diff - 1.0
+        selected_kl = mismatch_kl[select]
+        selected_diff = diff[select]
+        max_kl, local_selected_idx = torch.max(selected_kl, dim=0)
+        selected_positions = torch.nonzero(select, as_tuple=False).flatten()
+        local_i = int(selected_positions[int(local_selected_idx.item())].item())
+        token_id = int(lbl[local_i].detach().cpu().item())
+        ent = entropy.detach().float().squeeze(0) if entropy is not None else None
+        rec = {
+            "step": int(step),
+            "micro_step": int(micro_step),
+            "scope": normalized_scope,
+            "n": n_selected,
+            "mean_kl": float(selected_kl.mean().detach().cpu().item()),
+            "max_kl": float(max_kl.detach().cpu().item()),
+            "mean_abs_diff": float(selected_diff.abs().mean().detach().cpu().item()),
+            "max_abs_diff": float(selected_diff.abs().max().detach().cpu().item()),
+            "max_diff": float(diff[local_i].detach().cpu().item()),
+            "max_trainer_lp": float(t[local_i].detach().cpu().item()),
+            "max_inference_lp": float(inf[local_i].detach().cpu().item()),
+            "max_entropy": (
+                float(ent[local_i].detach().cpu().item())
+                if ent is not None else None
+            ),
+            "max_advantage": float(adv[local_i].detach().cpu().item()),
+            "token_id": token_id,
+            "target_pos": tgt_start + local_i,
+            "logit_pos": full_logit_start + local_i,
+            "tgt_start": int(tgt_start),
+            "tgt_end": int(tgt_end),
+            "logit_start": int(full_logit_start),
+            "logit_end": int(full_logit_end),
+            "call_idx": (
+                int(call_plan.get("call_idx"))
+                if call_plan is not None and call_plan.get("call_idx") is not None
+                else None
+            ),
+        }
+        if call_plan is not None:
+            rec.update({
+                "has_admission": bool(call_plan.get("has_admission", False)),
+                "sub_len": call_plan.get("sub_len"),
+                "comp_len": call_plan.get("comp_len"),
+                "pad_len": call_plan.get("pad_len"),
+                "nuf_len": call_plan.get("nuf_len"),
+                "writer_offset": call_plan.get("writer_offset"),
+                "admission_offset_after": call_plan.get("admission_offset_after"),
+                "admission_total_evicted": call_plan.get("admission_total_evicted"),
+                "admission_nuf_len": call_plan.get("admission_nuf_len"),
+                "synthetic_cached_tokens": call_plan.get("synthetic_cached_tokens"),
+                "synthetic_nuf_len": call_plan.get("synthetic_nuf_len"),
+                "synthetic_offset_after": call_plan.get("synthetic_offset_after"),
+                "new_content_start_in_sub": call_plan.get("new_content_start_in_sub"),
+            })
+        records.append(rec)
+
+
+def _kve_log_call_mismatch_records(
+    logger,
+    tokenizer,
+    records: list[dict],
+    counts: dict[str, int],
+    top_n: int,
+) -> None:
+    if top_n <= 0 or not records:
+        return
+    rows = sorted(records, key=lambda r: r["max_kl"], reverse=True)[:top_n]
+    threshold_raw = os.environ.get("KVE_CALL_MISMATCH_THRESHOLD", "0.1")
+    try:
+        threshold = float(threshold_raw)
+    except ValueError:
+        threshold = 0.1
+    first_bad = None
+    for rec in sorted(records, key=lambda r: (r["call_idx"] is None, r["call_idx"] or -1, r["tgt_start"])):
+        if rec["max_kl"] >= threshold:
+            first_bad = rec
+            break
+    first_text = "none"
+    if first_bad is not None:
+        first_text = (
+            f"call={first_bad.get('call_idx')} "
+            f"max={first_bad['max_kl']:.6g} "
+            f"mean={first_bad['mean_kl']:.6g} "
+            f"admission={first_bad.get('has_admission')} "
+            f"range=[{first_bad['tgt_start']},{first_bad['tgt_end']})"
+        )
+    logger.warning(
+        f"[KVE-CALL-KL] step={records[0]['step']} "
+        f"micro_step={records[0]['micro_step']} scope={records[0]['scope']} "
+        f"considered={counts.get('considered', 0)} "
+        f"segments={counts.get('segments', 0)} calls_with_tokens={len(records)} "
+        f"threshold={threshold:g} first_bad={first_text} top_n={len(rows)}"
+    )
+    for i, rec in enumerate(rows, start=1):
+        token_text = _kve_decode_one(tokenizer, rec["token_id"])
+        entropy_text = (
+            "None"
+            if rec["max_entropy"] is None
+            else f"{rec['max_entropy']:.6g}"
+        )
+        logger.warning(
+            f"[KVE-CALL-KL] #{i:02d} call={rec.get('call_idx')} "
+            f"max={rec['max_kl']:.6g} mean={rec['mean_kl']:.6g} "
+            f"n={rec['n']} mean_abs_diff={rec['mean_abs_diff']:.6g} "
+            f"max_abs_diff={rec['max_abs_diff']:.6g} "
+            f"max_diff={rec['max_diff']:.6g} "
+            f"T_lp={rec['max_trainer_lp']:.6g} "
+            f"V_lp={rec['max_inference_lp']:.6g} "
+            f"entropy={entropy_text} adv={rec['max_advantage']:.6g} "
+            f"tok={rec['token_id']} text={token_text} "
+            f"pos={rec['target_pos']} logit_pos={rec['logit_pos']} "
+            f"admission={rec.get('has_admission')} "
+            f"range=[{rec['tgt_start']},{rec['tgt_end']}) "
+            f"logit_range=[{rec['logit_start']},{rec['logit_end']}) "
+            f"sub_len={rec.get('sub_len')} comp_len={rec.get('comp_len')} "
+            f"pad_len={rec.get('pad_len')} nuf={rec.get('nuf_len')} "
+            f"adm_nuf={rec.get('admission_nuf_len')} "
+            f"evicted={rec.get('admission_total_evicted')} "
+            f"synth_cached={rec.get('synthetic_cached_tokens')} "
+            f"synth_nuf={rec.get('synthetic_nuf_len')} "
+            f"writer_off={rec.get('writer_offset')} "
+            f"adm_off={rec.get('admission_offset_after')} "
+            f"new_start={rec.get('new_content_start_in_sub')}"
+        )
 
 
 @clean_exit
@@ -746,6 +1125,31 @@ def train(config: TrainerConfig):
                 accumulated_entropy_masked: list[torch.Tensor] = []
 
                 full_seq_len = input_ids.shape[1]
+                kve_top_mismatch_n = _kve_top_mismatch_n()
+                kve_top_mismatch_scope = os.environ.get(
+                    "KVE_TOP_MISMATCH_SCOPE", "keep"
+                )
+                kve_call_mismatch_n = _kve_call_mismatch_n()
+                kve_call_mismatch_scope = os.environ.get(
+                    "KVE_CALL_MISMATCH_SCOPE",
+                    os.environ.get("KVE_TOP_MISMATCH_SCOPE", "keep"),
+                )
+                kve_top_mismatch_records: list[dict] = []
+                kve_top_mismatch_counts: dict[str, int] = {}
+                kve_call_mismatch_records: list[dict] = []
+                kve_call_mismatch_counts: dict[str, int] = {}
+                kve_call_plans = None
+                if (
+                    (kve_top_mismatch_n > 0 or kve_call_mismatch_n > 0)
+                    and use_per_call
+                    and _build_pre_trim_plan is not None
+                ):
+                    try:
+                        kve_call_plans, _ = _build_pre_trim_plan(
+                            micro_batch["calls"]
+                        )
+                    except Exception:
+                        logger.exception("[KVE-TOP-KL] failed to build call plan")
 
                 def _segment_loss_fn(
                     seg_logits: torch.Tensor,  # [1, seg_owned_logits, vocab]
@@ -805,6 +1209,85 @@ def train(config: TrainerConfig):
                     seg_adv = advantages[:, tgt_start:tgt_end]
                     seg_mask = loss_mask[:, tgt_start:tgt_end]
                     seg_inf = inference_logprobs[:, tgt_start:tgt_end]
+
+                    # ── KVE per-token (V_lp, T_lp) dump for KL scatter
+                    # analysis. Each call to _segment_loss_fn corresponds
+                    # to ONE call/turn in the per-call dispatch path, so
+                    # we tag rows with tgt_start (= unique key within a
+                    # sample; pre-eviction calls have smaller tgt_start
+                    # than post-eviction calls). Set
+                    # KVE_DUMP_LOGPROB_CSV=<path> to enable. By default
+                    # this appends one row per loss_mask=True completion
+                    # token. Set KVE_DUMP_LOGPROB_FILTER=keep to dump only
+                    # tokens that survive DPPO masking and therefore
+                    # contribute to the policy-gradient term.
+                    _csv_path = os.environ.get("KVE_DUMP_LOGPROB_CSV", "")
+                    if _csv_path:
+                        _t = seg_raw_logprobs.squeeze(0).detach().float()
+                        _i = seg_inf.squeeze(0).detach().float()
+                        _a = seg_adv.squeeze(0).detach().float()
+                        _loss_m = seg_mask.squeeze(0).bool()
+                        if isinstance(config.loss, DefaultLossConfig):
+                            _prob_diff = torch.exp(_t) - torch.exp(_i)
+                            _dppo_high = _prob_diff > config.loss.dppo_mask_high
+                            _dppo_low = _prob_diff < -config.loss.dppo_mask_low
+                            _dppo_m = torch.where(_a > 0, _dppo_high, _dppo_low)
+                        else:
+                            _prob_diff = torch.exp(_t) - torch.exp(_i)
+                            _dppo_m = torch.zeros_like(_loss_m)
+                        _keep_m = _loss_m & ~_dppo_m
+                        _csv_filter = os.environ.get(
+                            "KVE_DUMP_LOGPROB_FILTER", "loss_mask"
+                        ).lower()
+                        if _csv_filter in {"keep", "unmasked", "kept"}:
+                            _msk = _keep_m
+                        elif _csv_filter in {"dppo_masked", "masked"}:
+                            _msk = _loss_m & _dppo_m
+                        else:
+                            _msk = _loss_m
+                        if _msk.any():
+                            _t1d = _t.cpu()
+                            _i1d = _i.cpu()
+                            _a1d = _a.cpu()
+                            _pd1d = _prob_diff.cpu()
+                            _loss_cpu = _loss_m.cpu()
+                            _dppo_cpu = _dppo_m.cpu()
+                            _keep_cpu = _keep_m.cpu()
+                            _lbl = seg_labels.squeeze(0).detach().cpu()
+                            _mcpu = _msk.cpu()
+                            _needs_header = (
+                                not os.path.exists(_csv_path)
+                                or os.path.getsize(_csv_path) == 0
+                            )
+                            with open(_csv_path, "a") as _f:
+                                if _needs_header:
+                                    _f.write(
+                                        "step,micro_step,tgt_start,pos,token_id,"
+                                        "trainer_lp,inference_lp,diff,k3,advantage,"
+                                        "prob_diff,loss_mask,dppo_masked,keep_mask\n"
+                                    )
+                                for _j in range(_t1d.shape[0]):
+                                    if not _mcpu[_j].item():
+                                        continue
+                                    _diff = float(_t1d[_j].item() - _i1d[_j].item())
+                                    try:
+                                        _k3 = math.exp(_diff) - _diff - 1.0
+                                    except OverflowError:
+                                        _k3 = float("inf")
+                                    _f.write(
+                                        f"{progress.step},{micro_step},{tgt_start},"
+                                        f"{tgt_start + _j},"
+                                        f"{int(_lbl[_j].item())},"
+                                        f"{float(_t1d[_j].item()):.6f},"
+                                        f"{float(_i1d[_j].item()):.6f},"
+                                        f"{_diff:.6f},"
+                                        f"{_k3:.6f},"
+                                        f"{float(_a1d[_j].item()):.6f},"
+                                        f"{float(_pd1d[_j].item()):.6f},"
+                                        f"{int(_loss_cpu[_j].item())},"
+                                        f"{int(_dppo_cpu[_j].item())},"
+                                        f"{int(_keep_cpu[_j].item())}\n"
+                                    )
                     # [DEBUG-KL] per-segment trainer-vs-inference logprob
                     # comparison. Only logs the tokens with loss_mask=True
                     # (completion tokens, not prompt). Tagged with the
@@ -852,6 +1335,66 @@ def train(config: TrainerConfig):
                         accumulated_loss_tensors.setdefault(mk, []).append(
                             mv.detach()
                         )
+                    # Token-weighted KL diagnostics for segmented
+                    # execution. The built-in loss metrics above are
+                    # per-segment means, so downstream aggregation is a
+                    # mean-of-means. These values store the per-token k3
+                    # KL samples directly; downstream tensor_stats then
+                    # reports a true token-weighted mean.
+                    with torch.no_grad():
+                        seg_loss_mask_1d = seg_mask.squeeze(0).bool()
+                        if seg_loss_mask_1d.any():
+                            seg_trainer_lp_1d = seg_raw_logprobs.squeeze(0)
+                            seg_inf_lp_1d = seg_inf.squeeze(0)
+                            seg_adv_1d = seg_adv.squeeze(0)
+                            seg_log_ratio = seg_trainer_lp_1d - seg_inf_lp_1d
+                            seg_token_kl = (
+                                torch.exp(seg_log_ratio) - seg_log_ratio - 1.0
+                            )
+                            accumulated_loss_tensors.setdefault(
+                                "mismatch_kl_token_weighted", []
+                            ).append(
+                                seg_token_kl[seg_loss_mask_1d]
+                                .detach()
+                                .to("cpu", dtype=torch.float32)
+                            )
+
+                            if isinstance(config.loss, DefaultLossConfig):
+                                seg_prob_diff = (
+                                    torch.exp(seg_trainer_lp_1d)
+                                    - torch.exp(seg_inf_lp_1d)
+                                )
+                                seg_dppo_high = (
+                                    seg_prob_diff > config.loss.dppo_mask_high
+                                )
+                                seg_dppo_low = (
+                                    seg_prob_diff < -config.loss.dppo_mask_low
+                                )
+                                seg_dppo_mask = torch.where(
+                                    seg_adv_1d > 0,
+                                    seg_dppo_high,
+                                    seg_dppo_low,
+                                )
+                                seg_keep_mask = seg_loss_mask_1d & ~seg_dppo_mask
+                                seg_masked_mask = seg_loss_mask_1d & seg_dppo_mask
+                                if seg_keep_mask.any():
+                                    accumulated_loss_tensors.setdefault(
+                                        "unmasked_mismatch_kl_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_token_kl[seg_keep_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                if seg_masked_mask.any():
+                                    accumulated_loss_tensors.setdefault(
+                                        "masked_mismatch_kl_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_token_kl[seg_masked_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
 
                     # Per-segment entropy over OWNED target tokens masked
                     # by loss_mask. seg_logits_effective is already
@@ -877,6 +1420,57 @@ def train(config: TrainerConfig):
                         )
                         seg_entropy = lse - torch.sum(
                             pd * seg_logits_effective, dim=-1
+                        )
+                    if kve_top_mismatch_n > 0:
+                        call_plan = _kve_find_call_plan(
+                            kve_call_plans,
+                            int(full_logit_start),
+                            int(full_logit_end),
+                        )
+                        _kve_collect_top_mismatch_records(
+                            records=kve_top_mismatch_records,
+                            counts=kve_top_mismatch_counts,
+                            top_n=kve_top_mismatch_n,
+                            scope=kve_top_mismatch_scope,
+                            step=progress.step,
+                            micro_step=micro_step,
+                            full_logit_start=full_logit_start,
+                            full_logit_end=effective_logit_end,
+                            tgt_start=tgt_start,
+                            tgt_end=tgt_end,
+                            trainer_logprobs=seg_raw_logprobs,
+                            inference_logprobs=seg_inf,
+                            labels=seg_labels,
+                            advantages=seg_adv,
+                            loss_mask=seg_mask,
+                            entropy=seg_entropy,
+                            loss_config=config.loss,
+                            call_plan=call_plan,
+                        )
+                    if kve_call_mismatch_n > 0:
+                        call_plan = _kve_find_call_plan(
+                            kve_call_plans,
+                            int(full_logit_start),
+                            int(full_logit_end),
+                        )
+                        _kve_collect_call_mismatch_record(
+                            records=kve_call_mismatch_records,
+                            counts=kve_call_mismatch_counts,
+                            scope=kve_call_mismatch_scope,
+                            step=progress.step,
+                            micro_step=micro_step,
+                            full_logit_start=full_logit_start,
+                            full_logit_end=effective_logit_end,
+                            tgt_start=tgt_start,
+                            tgt_end=tgt_end,
+                            trainer_logprobs=seg_raw_logprobs,
+                            inference_logprobs=seg_inf,
+                            labels=seg_labels,
+                            advantages=seg_adv,
+                            loss_mask=seg_mask,
+                            entropy=seg_entropy,
+                            loss_config=config.loss,
+                            call_plan=call_plan,
                         )
                     accumulated_entropy_masked.append(
                         seg_entropy.squeeze(0)[seg_mask.squeeze(0).bool()]
@@ -914,6 +1508,23 @@ def train(config: TrainerConfig):
                             bptt_segments=config.compaction.bptt_segments,
                         )
 
+                if kve_top_mismatch_n > 0:
+                    _kve_log_top_mismatch_records(
+                        logger,
+                        tokenizer,
+                        kve_top_mismatch_records,
+                        kve_top_mismatch_counts,
+                        kve_top_mismatch_n,
+                    )
+                if kve_call_mismatch_n > 0:
+                    _kve_log_call_mismatch_records(
+                        logger,
+                        tokenizer,
+                        kve_call_mismatch_records,
+                        kve_call_mismatch_counts,
+                        kve_call_mismatch_n,
+                    )
+
                 # segmented_forward already ran backward per BPTT
                 # window; accumulated_loss is a detached scalar for
                 # logging. Aggregate per-segment metrics with
@@ -946,7 +1557,9 @@ def train(config: TrainerConfig):
                 # loss); only the derived metrics like mismatch_kl
                 # drift. TODO: switch to weighted (sum, denom)
                 # accumulation if this metric skew matters for
-                # analysis.
+                # analysis. We additionally emit
+                # *_token_weighted metrics above by storing per-token
+                # KL samples directly.
                 loss = out["loss"]
                 loss_tensors: dict[str, torch.Tensor] = {}
                 for k, v in accumulated_loss_tensors.items():
@@ -1106,6 +1719,14 @@ def train(config: TrainerConfig):
                 )
             if "mismatch_kl" in tensors and len(tensors["mismatch_kl"]) > 0:
                 micro_step_message += f" | Mismatch KL: {tensors['mismatch_kl'][-1].mean().item():.4f}"
+            if (
+                "mismatch_kl_token_weighted" in tensors
+                and len(tensors["mismatch_kl_token_weighted"]) > 0
+            ):
+                micro_step_message += (
+                    " | Token KL: "
+                    f"{tensors['mismatch_kl_token_weighted'][-1].mean().item():.4f}"
+                )
             if "max_vio" in tensors and len(tensors["max_vio"]) > 0:
                 micro_step_message += f" | Max Vio: {tensors['max_vio'][-1].mean().item():.4f}"
             logger.debug(micro_step_message)
@@ -1170,6 +1791,22 @@ def train(config: TrainerConfig):
         step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Loss: {tensor_stats['loss/mean']:.4f} | Entropy: {tensor_stats['entropy/mean']:.4f}"
         if "mismatch_kl/mean" in tensor_stats:
             step_message += f" | Mismatch KL: {tensor_stats['mismatch_kl/mean']:.4f}"
+        if "unmasked_mismatch_kl/mean" in tensor_stats:
+            step_message += f" | Unmasked KL: {tensor_stats['unmasked_mismatch_kl/mean']:.4f}"
+        if "masked_mismatch_kl/mean" in tensor_stats:
+            step_message += f" | Masked KL: {tensor_stats['masked_mismatch_kl/mean']:.4f}"
+        if "mismatch_kl_token_weighted/mean" in tensor_stats:
+            step_message += f" | Token KL: {tensor_stats['mismatch_kl_token_weighted/mean']:.4f}"
+        if "unmasked_mismatch_kl_token_weighted/mean" in tensor_stats:
+            step_message += (
+                " | Token Unmasked KL: "
+                f"{tensor_stats['unmasked_mismatch_kl_token_weighted/mean']:.4f}"
+            )
+        if "masked_mismatch_kl_token_weighted/mean" in tensor_stats:
+            step_message += (
+                " | Token Masked KL: "
+                f"{tensor_stats['masked_mismatch_kl_token_weighted/mean']:.4f}"
+            )
         if grad_norm is not None:
             step_message += f" | Grad. Norm: {grad_norm:.4f}"
         step_message += f" | LR: {current_lr:.2e} | Throughput: {throughput:.0f} tokens/s | MFU: {mfu:.1f}% | Peak Mem.: {peak_memory:.1f} GiB"

@@ -30,7 +30,7 @@ if not hasattr(vf, "RolloutOutput"):
     vf.RolloutOutput = vf.State  # type: ignore[attr-defined]
 
 from prime_rl.transport import TrainingSample
-from prime_rl.transport.types import CompactionEventWire
+from prime_rl.transport.types import CallWire, CompactionEventWire
 from prime_rl.utils.chat_template import (
     common_prefix_len,
     deserialize_tool_calls,
@@ -312,6 +312,21 @@ def _build_summary_sample(
                             position_offset_after=int(e["position_offset_after"]),
                             num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
                             evict_start=int(e.get("evict_start", 0)),
+                            new_user_fragment_len=int(
+                                e.get("new_user_fragment_len", 0)
+                            ),
+                            kept_indices=[
+                                int(x) for x in (e.get("kept_indices") or [])
+                            ],
+                            kept_token_ids=[
+                                int(x) for x in (e.get("kept_token_ids") or [])
+                            ],
+                            last_turn_evicted=int(
+                                e.get("last_turn_evicted", -1)
+                            ),
+                            num_turns_evicted_after=int(
+                                e.get("num_turns_evicted_after", 0)
+                            ),
                         )
                     )
                 except (KeyError, TypeError, ValueError):
@@ -325,6 +340,15 @@ def _build_summary_sample(
                             position_offset_after=int(e[2]),
                             num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
                             evict_start=int(e[4]) if len(e) >= 5 else 0,
+                            new_user_fragment_len=int(e[5]) if len(e) >= 6 else 0,
+                            kept_indices=[int(x) for x in e[6]]
+                            if len(e) >= 7 and e[6]
+                            else [],
+                            kept_token_ids=[int(x) for x in e[7]]
+                            if len(e) >= 8 and e[7]
+                            else [],
+                            last_turn_evicted=int(e[8]) if len(e) >= 9 else -1,
+                            num_turns_evicted_after=int(e[9]) if len(e) >= 10 else 0,
                         )
                     )
                 except (TypeError, ValueError):
@@ -415,11 +439,20 @@ def interleave_rollout(
                 prompt_ids = [int(x) for x in padded_ids]
                 prompt_mask = [False] * len(prompt_ids)
 
+            # Capture the PRE-trim submitted prompt + the full event list
+            # (admission + mid-gen) BEFORE _apply_admission_trim mutates
+            # them. The per-call trainer rebuild (Phase B+) needs the
+            # pre-trim prompt for phase-1 of the two-phase forward.
+            submitted_pre_trim: list[int] = list(prompt_ids)
+            step_events = _compaction_events_from_step(step)
+            all_events_pre_trim: list[CompactionEventWire] = (
+                list(step_events) if step_events else []
+            )
+
             # Admission-time compaction trim: the vLLM response carries
             # the ORIGINAL (pre-trim) prompt_token_ids, but inference ran
             # on the trimmed prompt. Replay the scheduler's token
             # deletions so the trainer sees identical tokens + positions.
-            step_events = _compaction_events_from_step(step)
             if step_events and padded_ids:
                 orig_len = len(prompt_ids)
                 prompt_ids, prompt_mask, step_events = _apply_admission_trim(
@@ -445,11 +478,30 @@ def interleave_rollout(
                                 "position_offset_after": e.position_offset_after,
                                 "num_prompt_tokens": e.num_prompt_tokens,
                                 "evict_start": e.evict_start,
+                                "new_user_fragment_len": e.new_user_fragment_len,
+                                "kept_indices": list(e.kept_indices),
+                                "kept_token_ids": list(e.kept_token_ids),
+                                "last_turn_evicted": e.last_turn_evicted,
+                                "num_turns_evicted_after": e.num_turns_evicted_after,
                             }
                             for e in step_events
                         ]
                     else:
                         extras["compaction_events"] = None
+
+            # vLLM auto-pad: filler token ids appended to this call's KV
+            # cache after sampling stopped (so the trailing block lands in
+            # the prefix cache). The trainer needs these per-call so its
+            # persistent_cache layout matches vLLM's. Empty list when
+            # auto-pad did not fire for this call.
+            trailing_pad_ids: list[int] = []
+            if extras is not None:
+                raw_pad = extras.get("padding_token_ids")
+                if raw_pad:
+                    try:
+                        trailing_pad_ids = [int(x) for x in raw_pad]
+                    except (TypeError, ValueError):
+                        trailing_pad_ids = []
 
             return {
                 "prompt_ids": prompt_ids,
@@ -458,6 +510,13 @@ def interleave_rollout(
                 "completion_mask": [bool(i) for i in tokens["completion_mask"]],
                 "completion_logprobs": list(tokens["completion_logprobs"]),
                 "routed_experts": tokens.get("routed_experts"),
+                # Per-call rebuild: pre-trim submitted prompt + all events
+                # (admission + mid-gen). The trainer's two-phase forward
+                # needs the pre-trim prompt to run phase 1 over
+                # [0, evict_end).
+                "submitted_prompt_ids_pre_trim": submitted_pre_trim,
+                "all_compaction_events_pre_trim": all_events_pre_trim,
+                "trailing_pad_ids": trailing_pad_ids,
             }
 
         logger.warning(f"Missing rollout tokens for example {output['example_id']} step {step_idx}.")
@@ -543,6 +602,21 @@ def interleave_rollout(
                         position_offset_after=int(e["position_offset_after"]),
                         num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
                         evict_start=int(e.get("evict_start", 0)),
+                        new_user_fragment_len=int(
+                            e.get("new_user_fragment_len", 0)
+                        ),
+                        kept_indices=[
+                            int(x) for x in (e.get("kept_indices") or [])
+                        ],
+                        kept_token_ids=[
+                            int(x) for x in (e.get("kept_token_ids") or [])
+                        ],
+                        last_turn_evicted=int(
+                            e.get("last_turn_evicted", -1)
+                        ),
+                        num_turns_evicted_after=int(
+                            e.get("num_turns_evicted_after", 0)
+                        ),
                     )
                 )
             elif isinstance(e, (list, tuple)) and len(e) >= 3:
@@ -554,6 +628,15 @@ def interleave_rollout(
                         position_offset_after=int(e[2]),
                         num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
                         evict_start=int(e[4]) if len(e) >= 5 else 0,
+                        new_user_fragment_len=int(e[5]) if len(e) >= 6 else 0,
+                        kept_indices=[int(x) for x in e[6]]
+                        if len(e) >= 7 and e[6]
+                        else [],
+                        kept_token_ids=[int(x) for x in e[7]]
+                        if len(e) >= 8 and e[7]
+                        else [],
+                        last_turn_evicted=int(e[8]) if len(e) >= 9 else -1,
+                        num_turns_evicted_after=int(e[9]) if len(e) >= 10 else 0,
                     )
                 )
         return out or None
@@ -733,11 +816,25 @@ def interleave_rollout(
         )
 
     def extend_sample(sample: TrainingSample, prefix_len: int, step_idx: int) -> None:
-        """Extend an existing sample with a new trajectory step (extension property holds)."""
+        """Extend an existing sample with a new trajectory step (extension property holds).
+
+        ``prefix_len`` is in PRE-TRIM step coord (= length of the matched
+        stored prefix, which is the prior cumulative POST-TRIM state and
+        equal to V's ``prev_kept_state`` for this step). Admission
+        deletions for this step (if any) must have already been applied
+        to ``sample``'s cumulative arrays by the caller; the slice
+        ``submitted_prompt_ids_pre_trim[prefix_len:]`` is just the
+        new_user_fragment (untouched by admissions, which evict from the
+        prior region).
+        """
         tokens = prepared_steps[step_idx]
 
-        # Extend with new prompt tokens (mask=False, no gradient)
-        new_prompt_ids = tokens["prompt_ids"][prefix_len:]
+        # Extend with new prompt tokens (mask=False, no gradient). Use
+        # PRE-TRIM here so admission steps slice the new_user_fragment
+        # correctly — admissions delete from prior cumulative content
+        # (applied earlier) and never touch the tail.
+        step_pre_trim = tokens["submitted_prompt_ids_pre_trim"]
+        new_prompt_ids = step_pre_trim[prefix_len:]
         sample.completion_ids.extend(new_prompt_ids)
         sample.completion_mask.extend([False] * len(new_prompt_ids))
         sample.completion_logprobs.extend([0.0] * len(new_prompt_ids))
@@ -765,75 +862,130 @@ def interleave_rollout(
             expected_len = len(sample.prompt_ids) + len(sample.completion_ids)
             sample.routed_experts = _align_routed_experts(sample.routed_experts, expected_len)
 
-    # Track [prefix_tokens, sample, last_step_idx] per active sample
+    # Track [prefix_tokens, sample, last_step_idx, step_idx_list] per
+    # active sample. The 4th element accumulates ALL merged step indices
+    # so we can emit one CallWire per call after merging completes.
     active_samples: list[list] = []
 
     first_tokens = prepared_steps[0]
     first_prefix = first_tokens["prompt_ids"] + first_tokens["completion_ids"]
+    # Phase A.4: sample.compaction_events is consumed by the legacy
+    # segmented_forward path (mid-gen handling). Admission/synthetic
+    # events live PER-CALL on CallWire.compaction_events and must NOT
+    # leak into the merged list.
+    first_events_raw = step_compaction_events[0]
+    first_events_seed = (
+        [e for e in first_events_raw
+         if int(e.num_output_tokens_at_compaction) > 0]
+        if first_events_raw else None
+    ) or None
     active_samples.append(
-        [first_prefix, make_sample(first_tokens, step_compaction_events[0]), 0]
+        [first_prefix, make_sample(first_tokens, first_events_seed), 0, [0]]
     )
 
     for step_idx, _step in enumerate(trajectory[1:], start=1):
         tokens = prepared_steps[step_idx]
-        step_prompt_ids = tokens["prompt_ids"]
+        step_pre_trim = tokens["submitted_prompt_ids_pre_trim"]
+        # step_compaction_events[step_idx] holds ONLY surviving (mid-gen)
+        # events after prepare_step_tokens stripped admission entries via
+        # _apply_admission_trim. To see admission events here we need the
+        # untouched PRE-TRIM list captured before the strip.
+        step_events_all = tokens.get("all_compaction_events_pre_trim") or []
+        step_events_midgen = step_compaction_events[step_idx]
 
-        # Check if this step extends ANY active prefix
+        # Phase A.2: when a step has any mid-generation compaction event,
+        # don't merge — start a new sample. Mid-gen samples are routed to
+        # legacy segmented_forward (its segment_boundaries machinery is
+        # incompatible with per-call admission splicing) and we keep the
+        # admission-only-stays-per-call invariant clean.
+        has_midgen = step_events_midgen is not None and any(
+            int(e.num_output_tokens_at_compaction) > 0
+            for e in step_events_midgen
+        )
+
+        # Phase A.1: extension check uses PRE-TRIM step prompt against the
+        # stored POST-TRIM cumulative prefix. They agree up through prior
+        # cumulative content because step N's pre-trim prompt =
+        # prev_kept_state_N + new_user_N, and prev_kept_state_N is exactly
+        # the sample's POST-TRIM cumulative state (V's KV cache view at
+        # the start of step N). POST-TRIM step_prompt_ids fails this check
+        # whenever step N also has an admission event — that's the bug.
+        # Strict-length (>) prevents over-merging on zero-delta extensions.
         matched_idx = None
-        for idx, (prefix_tokens, _, _) in enumerate(active_samples):
-            if step_prompt_ids[: len(prefix_tokens)] == prefix_tokens:
-                matched_idx = idx
-                break
+        if not has_midgen:
+            for idx, entry in enumerate(active_samples):
+                prefix_tokens = entry[0]
+                if (
+                    len(step_pre_trim) > len(prefix_tokens)
+                    and step_pre_trim[: len(prefix_tokens)] == prefix_tokens
+                ):
+                    matched_idx = idx
+                    break
 
         if matched_idx is not None:
             # Extension holds - merge into matched sample
-            prefix_tokens, sample, _ = active_samples[matched_idx]
-            prefix_len = len(prefix_tokens)
+            prefix_tokens = active_samples[matched_idx][0]
+            sample = active_samples[matched_idx][1]
+            # IMMUTABLE: where step's new_user_fragment begins in PRE-TRIM
+            # coord. Used by extend_sample to slice the new content.
+            orig_prefix_len = len(prefix_tokens)
 
-            # Offset compaction events: num_output_tokens_at_compaction is
-            # per-turn-relative, shift to merged completion_ids coordinates.
-            step_events = step_compaction_events[step_idx]
-            if step_events is not None:
+            # Phase A.3 (REVERTED): we do NOT delete admission ranges
+            # from the sample's cumulative arrays. Keeping mb.input_ids
+            # in PRE-TRIM cumulative coord matches the trainer's
+            # per-call pre_trim_ids 1:1, so seg_loss_fn aligns logits
+            # against the right labels. V's cache state is mirrored on
+            # the trainer side by splicing persistent_cache during call
+            # N>0's admission (Phase B), which only affects the K
+            # context — not the input tokens or the loss positions.
+            admission_evts = [
+                e for e in step_events_all
+                if int(e.num_output_tokens_at_compaction) == 0
+                and int(e.tokens_evicted) > 0
+            ]
+
+            # Offset mid-gen events into merged completion coord.
+            # Admission/synthetic events live PER-CALL on CallWire and
+            # are NOT added to sample.compaction_events (Phase A.4) —
+            # that field is the legacy segmented_forward's input and it
+            # consumes only mid-generation boundaries.
+            midgen_events = (
+                [e for e in step_events_midgen
+                 if int(e.num_output_tokens_at_compaction) > 0]
+                if step_events_midgen else []
+            )
+            if midgen_events:
+                # new content in pre-trim = step_pre_trim[orig_prefix_len:]
+                # = new_user_fragment. Admissions don't touch the tail,
+                # so this length is the new content's POST-TRIM length too.
+                new_prompt_ext_len = (
+                    len(step_pre_trim) - orig_prefix_len
+                )
+                # current_completion_len: POST admission deletions, BEFORE
+                # the upcoming new_user_fragment append.
                 current_completion_len = len(sample.completion_ids)
-                new_prompt_ext_len = len(tokens["prompt_ids"]) - prefix_len
-                assert new_prompt_ext_len >= 0, (
-                    f"Step {step_idx} prompt ({len(tokens['prompt_ids'])} tokens) "
-                    f"shorter than matched prefix ({prefix_len} tokens)"
+                generation_offset = (
+                    current_completion_len + new_prompt_ext_len
                 )
-                generation_offset = current_completion_len + new_prompt_ext_len
-
-                step_completion_len = len(tokens["completion_ids"])
-                prev_last = (sample.compaction_events[-1] if sample.compaction_events else None)
-                logger.warning(
-                    f"[DIAG-MERGE] step {step_idx}: "
-                    f"current_completion_len={current_completion_len}  "
-                    f"new_prompt_ext_len={new_prompt_ext_len}  "
-                    f"generation_offset={generation_offset}  "
-                    f"step_completion_ids_len={step_completion_len}  "
-                    f"prefix_len={prefix_len}  "
-                    f"num_events={len(step_events)}  "
-                    f"prev_last={prev_last}"
-                )
-
                 existing = sample.compaction_events or []
-                for e in step_events:
-                    offsetted = e.num_output_tokens_at_compaction + generation_offset
+                for e in midgen_events:
+                    offsetted = (
+                        int(e.num_output_tokens_at_compaction)
+                        + generation_offset
+                    )
                     if existing:
                         prev = existing[-1].num_output_tokens_at_compaction
                         assert offsetted >= prev, (
-                            f"Non-monotonic compaction boundary at step {step_idx}: "
-                            f"offsetted={offsetted} < prev={prev} "
+                            f"Non-monotonic compaction boundary at step "
+                            f"{step_idx}: offsetted={offsetted} < prev={prev} "
                             f"(raw={e.num_output_tokens_at_compaction}, "
                             f"generation_offset={generation_offset})"
                         )
                         if offsetted == prev:
-                            # Two compaction events at the same merged position
-                            # (e.g. compaction fires at the very start of a new
-                            # turn, landing on the same boundary as the previous
-                            # turn's last event). Merge into the existing event.
                             existing[-1] = CompactionEventWire(
                                 num_output_tokens_at_compaction=offsetted,
-                                tokens_evicted=existing[-1].tokens_evicted + e.tokens_evicted,
+                                tokens_evicted=existing[-1].tokens_evicted
+                                + e.tokens_evicted,
                                 position_offset_after=e.position_offset_after,
                                 num_prompt_tokens=e.num_prompt_tokens,
                             )
@@ -848,11 +1000,23 @@ def interleave_rollout(
                     )
                 sample.compaction_events = existing
 
-            extend_sample(sample, prefix_len, step_idx=step_idx)
+            if admission_evts:
+                logger.info(
+                    f"[ADM-MERGE] step {step_idx}: "
+                    f"merged_into_sample_idx={matched_idx} "
+                    f"call_idx={len(active_samples[matched_idx][3])} "
+                    f"n_admission_evts={len(admission_evts)} "
+                    f"total_evicted={sum(int(e.tokens_evicted) for e in admission_evts)} "
+                    f"new_user_len={len(step_pre_trim) - orig_prefix_len}"
+                )
+
+            extend_sample(sample, orig_prefix_len, step_idx=step_idx)
             active_samples[matched_idx][0] = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples[matched_idx][2] = step_idx
+            active_samples[matched_idx][3].append(step_idx)
         else:
             # No prefix matches - start a new sample
+            step_prompt_ids = tokens["prompt_ids"]
             logger.debug(
                 f"Extension property broke at step {step_idx + 1} for example {output['example_id']}. "
                 f"Starting new sample (active_prefixes={len(active_samples)}, step_prompt_len={len(step_prompt_ids)})."
@@ -878,17 +1042,60 @@ def interleave_rollout(
 
             new_prefix = tokens["prompt_ids"] + tokens["completion_ids"]
             active_samples.append(
-                [new_prefix, make_sample(tokens, step_compaction_events[step_idx]), step_idx]
+                [new_prefix, make_sample(tokens, step_compaction_events[step_idx]), step_idx, [step_idx]]
             )
 
     # Attach images once per sample using only the last merged step
     if vlm_cache is not None:
         key = output["example_id"] if cache_key is None else cache_key
-        for _, sample, last_step_idx in active_samples:
+        for entry in active_samples:
+            sample = entry[1]
+            last_step_idx = entry[2]
             pv, shape, grids = vlm_cache.get_for_step(key, last_step_idx)
             sample.pixel_values = pv
             sample.pixel_values_shape = shape
             sample.image_grid_thw = grids
+
+    # Emit per-call breakdown (Phase B of plans/two_phase_per_call_trainer.md).
+    # One CallWire per vLLM chat() call (= per merged step) per sample.
+    # Used by the trainer's per-call segmented forward in Phase C+.
+    for entry in active_samples:
+        sample = entry[1]
+        step_idx_list = entry[3]
+        calls: list[CallWire] = []
+        for sidx in step_idx_list:
+            prepared = prepared_steps[sidx]
+            calls.append(
+                CallWire(
+                    submitted_prompt_ids=list(
+                        prepared.get("submitted_prompt_ids_pre_trim")
+                        or prepared["prompt_ids"]
+                    ),
+                    completion_ids=list(prepared["completion_ids"]),
+                    completion_logprobs=list(prepared["completion_logprobs"]),
+                    completion_temperatures=[temperature]
+                    * len(prepared["completion_ids"]),
+                    compaction_events=list(
+                        prepared.get("all_compaction_events_pre_trim") or []
+                    ),
+                    trailing_pad_ids=list(
+                        prepared.get("trailing_pad_ids") or []
+                    ),
+                )
+            )
+        sample.calls = calls
+
+        # Self-consistency check: sum of all call completion lengths +
+        # cross-call prefix-extension prompt deltas should equal the
+        # merged sample's completion length. We don't have the
+        # extension deltas trivially here (they're computed inline in
+        # extend_sample as new_prompt_ids), so we just verify the
+        # weaker invariant that the number of calls matches the merge
+        # bookkeeping.
+        assert len(sample.calls) == len(step_idx_list), (
+            f"call/step_idx mismatch: {len(sample.calls)} calls vs "
+            f"{len(step_idx_list)} merged steps"
+        )
 
     # Markovian Summary extension: for every trajectory step that carries
     # an `extras["summary_trainsample"]` payload, emit a separate
@@ -902,7 +1109,7 @@ def interleave_rollout(
         if s is not None:
             summary_samples.append(s)
 
-    regular_samples = [sample for _, sample, _ in active_samples]
+    regular_samples = [entry[1] for entry in active_samples]
     # Summary samples appended AFTER the regular samples so they don't
     # disturb per-rollout prefix-matching / merge invariants. Ordering
     # within the return list does not affect training semantics (each

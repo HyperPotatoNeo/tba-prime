@@ -11,7 +11,7 @@ from prime_rl.trainer.rl.packer import BasePacker, setup_packer
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.world import get_world
 from prime_rl.transport import MicroBatch, MicroBatchReceiver, TransportConfig, setup_micro_batch_receiver
-from prime_rl.transport.types import CompactionEventWire
+from prime_rl.transport.types import CallWire, CompactionEventWire
 
 
 class TensorMicroBatch(TypedDict):
@@ -44,6 +44,10 @@ class TensorMicroBatch(TypedDict):
     compaction_events: list[CompactionEventWire] | None
     # Prompt length for the single sample in a compaction micro batch.
     prompt_len: int | None
+    # Per-call breakdown for the per-call trainer dispatch (Phase B+ of
+    # plans/two_phase_per_call_trainer.md). None for non-compaction
+    # micro batches.
+    calls: list[CallWire] | None
 
 
 class FakeDataLoader:
@@ -225,8 +229,9 @@ class DataLoader:
             )  # [1, seq_len, layers, topk]
             if micro_batch.routed_experts is not None
             else None,
-            # kv-eviction: compaction_events and prompt_len are passed through
-            # unchanged (list of msgspec structs + scalar int; no tensor form).
+            # kv-eviction: compaction_events, prompt_len, and calls are passed
+            # through unchanged (msgspec structs + scalar int; no tensor form).
             compaction_events=micro_batch.compaction_events,
             prompt_len=micro_batch.prompt_len,
+            calls=micro_batch.calls,
         )

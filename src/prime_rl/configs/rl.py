@@ -741,6 +741,23 @@ class RLConfig(BaseConfig):
                 "inference and trainer block sizes, and compaction must be "
                 "active. Mismatches:\n  - " + joined
             )
+
+        # Phase4 incremental prompt assembly requires the vLLM server to
+        # run with enable_prefix_caching=True; the prev_kept portion of
+        # each subsequent call's prompt MUST hit the cache or the rollout
+        # is slower than full-history render with no benefit. Catch the
+        # config error at load time instead of letting it silently regress.
+        if padding.phase4_enabled and self.inference is not None:
+            if not self.inference.enable_prefix_caching:
+                raise ValueError(
+                    "orchestrator.compaction_padding.phase4_enabled=True "
+                    "requires inference.enable_prefix_caching=true. "
+                    "Phase4 submits prev_kept_state + new_user_fragment "
+                    "per call, which is faster than full-history render "
+                    "only when the prev_kept portion hits the prefix "
+                    "cache. Either flip enable_prefix_caching=true or "
+                    "disable phase4_enabled."
+                )
         return self
 
     ### Auto-setup and validate shared configs

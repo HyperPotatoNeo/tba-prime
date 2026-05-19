@@ -861,6 +861,23 @@ class CompactionPaddingConfig(BaseConfig):
         ),
     ] = False
 
+    phase4_enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "Phase4 incremental prompt assembly. When True, after the "
+                "first chat call in a rollout, subsequent calls submit "
+                "prev_kept_state + padded_new_user_fragment instead of "
+                "re-rendering the full chat history (mirrors "
+                "experiments/textworld_env/compaction_debug.py). Requires "
+                "inference.enable_prefix_caching=true on the vLLM server "
+                "to actually realize the cache hit on prev_kept. The "
+                "trainer/orchestrator-side state is per-rollout (per "
+                "asyncio task) and GC'd when the rollout coroutine ends."
+            ),
+        ),
+    ] = False
+
 
 class MarkovianSummaryConfig(BaseConfig):
     """Summarization-based eviction layered on top of Markovian Thinker.
