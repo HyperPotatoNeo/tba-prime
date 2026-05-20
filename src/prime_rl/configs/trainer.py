@@ -101,15 +101,13 @@ class CompactionConfig(BaseConfig):
                 "per-segment backward mode. 1 (default) = M3 semantics, one "
                 "backward per segment, O(1 segment) memory. K > 1 = TBPTT(K), "
                 "gradients flow through retained KV within K consecutive "
-                "segments before detach, O(K segments) memory. None = full "
-                "trajectory in one BPTT window (M4 semantics, G_distal term "
-                "preserved) — requires enough memory to hold every segment's "
-                "activations simultaneously. Only consulted when window_size "
-                "> 0. NOTE: values other than 1 are currently restricted to "
-                "single-GPU runs; under multi-rank FSDP2 the reduce-scatter "
-                "count mismatch between ranks with differing per-sample "
-                "segment counts would deadlock (see the runtime check in "
-                "train.py). Multi-rank K > 1 is a TODO for a future round."
+                "segments before detach, O(K segments) memory. -1 or None = "
+                "full trajectory in one BPTT window (M4 semantics, G_distal "
+                "term preserved) — requires enough memory to hold every "
+                "segment's activations simultaneously. Only consulted when "
+                "window_size > 0. Under multi-rank FSDP2, values other than "
+                "1 require per_call_dispatch=True; legacy segmented_forward "
+                "still supports K > 1 only on single-GPU runs."
             ),
         ),
     ] = 1
@@ -994,11 +992,12 @@ class TrainerConfig(BaseConfig):
                 )
             if (
                 self.compaction.bptt_segments is not None
+                and self.compaction.bptt_segments != -1
                 and self.compaction.bptt_segments < 1
             ):
                 raise ValueError(
-                    f"trainer.compaction.bptt_segments must be None or >= 1, "
-                    f"got {self.compaction.bptt_segments}."
+                    f"trainer.compaction.bptt_segments must be -1, None, "
+                    f"or >= 1, got {self.compaction.bptt_segments}."
                 )
             if self.model.ac is not None:
                 # Per-block activation checkpointing + use_cache=True +

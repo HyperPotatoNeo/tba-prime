@@ -67,6 +67,7 @@ try:
     from kv_eviction.segmented_forward import (
         _build_pre_trim_plan,
         compute_num_segments,
+        compute_per_call_bptt_window_forward_counts,
         compute_num_per_call_forwards,
         per_call_segmented_forward,
         segmented_forward,
@@ -79,6 +80,7 @@ except ImportError:
     segmented_forward = None  # type: ignore[assignment]
     _build_pre_trim_plan = None  # type: ignore[assignment]
     compute_num_segments = None  # type: ignore[assignment]
+    compute_per_call_bptt_window_forward_counts = None  # type: ignore[assignment]
     per_call_segmented_forward = None  # type: ignore[assignment]
     compute_num_per_call_forwards = None  # type: ignore[assignment]
 from prime_rl.trainer.parallel_dims import get_parallel_dims
@@ -535,32 +537,24 @@ def train(config: TrainerConfig):
     # Initialize parallel dimensions
     parallel_dims = get_parallel_dims(config.model)
 
-    # Early check: reject bptt_segments != 1 under multi-rank FSDP2.
-    # Compaction's per-segment backward mode issues one backward per
-    # BPTT window, and the number of real backwards per rank is
-    # ceil(per_rank_segments / K). Under DP > 1 this count varies
-    # across ranks and the dummy-pass padding inside segmented_forward
-    # can't compensate, which would deadlock on reduce-scatter at the
-    # first compaction micro-batch. Fail at training init (before any
-    # model load or data fetch) so a misconfigured run crashes
-    # immediately instead of after a few mixed-sample steps.
-    # TODO: implement max_backwards all-reduce + mixed dummy padding
-    # in segmented_forward so bptt_segments > 1 works under FSDP2.
+    # Legacy segmented_forward still cannot safely run BPTT windows
+    # under multi-rank FSDP2: ranks can enter backward at different
+    # segment counts. The per-call dispatch has explicit per-window
+    # forward padding below, so it is allowed through this early guard.
     if (
         config.compaction.window_size > 0
         and config.compaction.bptt_segments != 1
+        and not config.compaction.per_call_dispatch
         and dist.is_initialized()
         and dist.get_world_size() > 1
     ):
         raise ValueError(
             "Compaction with trainer.compaction.bptt_segments != 1 is not "
-            "yet supported under multi-rank FSDP2 data parallelism due to "
-            "a reduce-scatter count mismatch in the dummy-pass padding "
-            "inside segmented_forward. Got world_size="
+            "supported under multi-rank FSDP2 when "
+            "trainer.compaction.per_call_dispatch is false. Got world_size="
             f"{dist.get_world_size()}, bptt_segments="
-            f"{config.compaction.bptt_segments}. Set "
-            "trainer.compaction.bptt_segments=1 (the default) for "
-            "multi-rank compaction runs, or run on a single GPU."
+            f"{config.compaction.bptt_segments}. Enable per_call_dispatch, "
+            "set bptt_segments=1, or run on a single GPU."
         )
 
     # For single-run, check for checkpoint to resume from
@@ -880,6 +874,7 @@ def train(config: TrainerConfig):
             # plans/phase3_training_integration.md D5 section.
             compaction_events = micro_batch.get("compaction_events") or []
             use_segmented = config.compaction.window_size > 0
+            use_per_call = False
 
             # Defense-in-depth: verify every DP rank made the SAME branch
             # decision at this step index. prepare_batch partitions by
@@ -937,10 +932,9 @@ def train(config: TrainerConfig):
                     "The TrainerConfig validator rejects this combination at "
                     "config load; this runtime assert is defense-in-depth."
                 )
-                # FSDP2 + multi-rank bptt_segments != 1 constraint is
-                # already rejected at training init (see the early
-                # check after get_parallel_dims); no per-micro-batch
-                # re-check needed here.
+                # Legacy fallback still cannot run bptt_segments != 1
+                # under multi-rank FSDP2. Per-call dispatch handles it
+                # by synchronizing forward counts at each BPTT window.
                 mb_prompt_len = micro_batch.get("prompt_len")
                 assert mb_prompt_len is not None, (
                     "prompt_len missing on micro_batch in compaction run "
@@ -1062,6 +1056,21 @@ def train(config: TrainerConfig):
                     if has_midgen_local:
                         use_per_call = False
 
+                if (
+                    not use_per_call
+                    and config.compaction.bptt_segments != 1
+                    and dist.is_initialized()
+                    and dist.get_world_size() > 1
+                ):
+                    raise ValueError(
+                        "trainer.compaction.bptt_segments != 1 under "
+                        "multi-rank FSDP2 requires per-call compaction "
+                        "dispatch for every rank in the step. This "
+                        "micro-batch fell back to legacy segmented_forward "
+                        "(missing calls or mid-generation compaction event). "
+                        "Use bptt_segments=1 for legacy/mixed samples."
+                    )
+
                 seq_len_local = input_ids.shape[1]
                 if use_per_call:
                     n_forwards_local = compute_num_per_call_forwards(
@@ -1080,6 +1089,43 @@ def train(config: TrainerConfig):
                     max_forwards = int(n_forwards_t.item())
                 else:
                     max_forwards = n_forwards_local
+
+                max_bptt_window_forward_passes = None
+                if use_per_call and config.compaction.bptt_segments != 1:
+                    assert compute_per_call_bptt_window_forward_counts is not None
+                    local_window_forwards = (
+                        compute_per_call_bptt_window_forward_counts(
+                            micro_batch["calls"],
+                            config.compaction.bptt_segments,
+                        )
+                    )
+                    if dist.is_initialized() and dist.get_world_size() > 1:
+                        n_windows_t = torch.tensor(
+                            [len(local_window_forwards)],
+                            device="cuda",
+                            dtype=torch.int32,
+                        )
+                        dist.all_reduce(n_windows_t, op=dist.ReduceOp.MAX)
+                        max_windows = int(n_windows_t.item())
+                        local_windows_t = torch.zeros(
+                            max_windows,
+                            device="cuda",
+                            dtype=torch.int32,
+                        )
+                        if local_window_forwards:
+                            local_windows_t[: len(local_window_forwards)] = (
+                                torch.tensor(
+                                    local_window_forwards,
+                                    device="cuda",
+                                    dtype=torch.int32,
+                                )
+                            )
+                        dist.all_reduce(local_windows_t, op=dist.ReduceOp.MAX)
+                        max_bptt_window_forward_passes = [
+                            int(x) for x in local_windows_t.cpu().tolist()
+                        ]
+                    else:
+                        max_bptt_window_forward_passes = local_window_forwards
 
                 # Per-segment loss closure. segmented_forward will call
                 # this after every segment's forward with the segment's
@@ -1288,28 +1334,6 @@ def train(config: TrainerConfig):
                                         f"{int(_dppo_cpu[_j].item())},"
                                         f"{int(_keep_cpu[_j].item())}\n"
                                     )
-                    # [DEBUG-KL] per-segment trainer-vs-inference logprob
-                    # comparison. Only logs the tokens with loss_mask=True
-                    # (completion tokens, not prompt). Tagged with the
-                    # merged-frame range so multiple segments are
-                    # distinguishable.
-                    try:
-                        _m1d = seg_mask.squeeze(0).bool()
-                        if _m1d.any():
-                            _t1d = seg_raw_logprobs.squeeze(0)
-                            _i1d = seg_inf.squeeze(0)
-                            _diff = (_t1d - _i1d)[_m1d]
-                            logger.warning(
-                                f"[DEBUG-KL] range=[{tgt_start},{tgt_end}) "
-                                f"n_masked={int(_m1d.sum().item())} "
-                                f"diff: mean={float(_diff.mean().item()):.4f} "
-                                f"max={float(_diff.max().item()):.4f} "
-                                f"min={float(_diff.min().item()):.4f} "
-                                f"trainer_lp[:5]={_t1d[_m1d][:5].tolist()} "
-                                f"inf_lp[:5]={_i1d[_m1d][:5].tolist()}"
-                            )
-                    except Exception:
-                        logger.exception("[DEBUG-KL] log failed")
                     seg_teach = (
                         teacher_logprobs[:, tgt_start:tgt_end]
                         if teacher_logprobs is not None
@@ -1491,6 +1515,10 @@ def train(config: TrainerConfig):
                             merged_position_ids=forward_position_ids,
                             loss_fn=_segment_loss_fn,
                             max_forward_passes=max_forwards,
+                            max_bptt_window_forward_passes=(
+                                max_bptt_window_forward_passes
+                            ),
+                            bptt_segments=config.compaction.bptt_segments,
                             device=input_ids.device,
                         )
                     else:

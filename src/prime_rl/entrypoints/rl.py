@@ -571,7 +571,32 @@ def rl(config: RLConfig):
         rl_local(config)
 
 
+def _maybe_start_debugpy() -> None:
+    """Start a debugpy listener and (by default) wait for a client to attach.
+
+    Gated by env vars so production runs are unaffected:
+        DEBUG=1           enable the listener
+        DEBUG_PORT=5678   port to listen on
+        DEBUG_HOST=0.0.0.0  bind host; use 0.0.0.0 for remote attach via port-forward
+        DEBUG_NOWAIT=1    listen but don't block on attach
+    """
+    if os.environ.get("DEBUG", "0") != "1":
+        return
+    import debugpy
+
+    port = int(os.environ.get("DEBUG_PORT", "5678"))
+    host = os.environ.get("DEBUG_HOST", "0.0.0.0")
+    debugpy.listen((host, port))
+    if os.environ.get("DEBUG_NOWAIT", "0") == "1":
+        print(f"[debugpy] listening on {host}:{port} (not waiting)", flush=True)
+        return
+    print(f"[debugpy] waiting for debugger on {host}:{port}...", flush=True)
+    debugpy.wait_for_client()
+    print("[debugpy] client attached, continuing", flush=True)
+
+
 def main():
+    _maybe_start_debugpy()
     set_proc_title("Launcher")
     rl(cli(RLConfig))
 

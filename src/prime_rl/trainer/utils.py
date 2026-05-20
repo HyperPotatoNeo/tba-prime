@@ -349,13 +349,62 @@ class Tensors(defaultdict):
         assert dist.is_initialized(), "Tensors requires a distributed environment"
         super().__init__(list)
 
+    @staticmethod
+    def _dtype_from_name(dtype_name: str) -> torch.dtype:
+        if dtype_name.startswith("torch."):
+            dtype_name = dtype_name.removeprefix("torch.")
+        dtype = getattr(torch, dtype_name, None)
+        if not isinstance(dtype, torch.dtype):
+            raise ValueError(f"Unsupported tensor dtype name: {dtype_name!r}")
+        return dtype
+
     def compute_stats(self) -> dict[str, float | int]:
         """Synchronize the tensor statistic across all ranks for each key and compute relevant statistics."""
 
         metrics = {}
-        for key in list(self.keys()):
+        local_keys = sorted(self.keys())
+        local_dtypes = {
+            key: str(self[key][0].dtype)
+            for key in local_keys
+            if len(self[key]) > 0
+        }
+        if dist.get_world_size() > 1:
+            gathered_keys: list[list[str]] = [
+                [] for _ in range(dist.get_world_size())
+            ]
+            dist.all_gather_object(gathered_keys, local_keys)
+            keys = sorted({key for rank_keys in gathered_keys for key in rank_keys})
+
+            gathered_dtypes: list[dict[str, str]] = [
+                {} for _ in range(dist.get_world_size())
+            ]
+            dist.all_gather_object(gathered_dtypes, local_dtypes)
+            dtype_by_key: dict[str, torch.dtype] = {}
+            for key in keys:
+                for rank_dtypes in gathered_dtypes:
+                    if key in rank_dtypes:
+                        dtype_by_key[key] = self._dtype_from_name(rank_dtypes[key])
+                        break
+        else:
+            keys = local_keys
+            dtype_by_key = {
+                key: self._dtype_from_name(dtype_name)
+                for key, dtype_name in local_dtypes.items()
+            }
+
+        for key in keys:
             # All-gather tensors across steps and ranks (get global distribution)
-            tensors = torch.cat(self.pop(key), dim=0).to("cuda")
+            if key in self and len(self[key]) > 0:
+                tensors = torch.cat(self.pop(key), dim=0).to(
+                    device="cuda",
+                    dtype=dtype_by_key[key],
+                )
+            else:
+                tensors = torch.empty(
+                    0,
+                    dtype=dtype_by_key[key],
+                    device="cuda",
+                )
             assert tensors.ndim == 1, "Can only aggregate 1D tensors"
             tensors = flexible_all_gather(tensors)
             assert tensors.ndim == 1, "Can only aggregate 1D tensors"

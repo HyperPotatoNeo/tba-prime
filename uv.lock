@@ -440,7 +440,7 @@ dependencies = [
     { name = "verifiers", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/code-env/@905f3374/code_env-0.1.1-py3-none-any.whl", hash = "sha256:52e88748eeee933add11e3f485e2d9e4d4515cdc609acbd5789862adbd541ac8" },
+    { url = "https://hub.primeintellect.ai/primeintellect/code-env/@2e4fb479/code_env-0.1.1-py3-none-any.whl", hash = "sha256:42a5c0b9bf6d858ff1f71a779d38e5268fb03f63ed347a736eb6938859303177" },
 ]
 
 [[package]]
@@ -452,7 +452,7 @@ dependencies = [
     { name = "verifiers", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/color-codeword/@80a7a5ac/color_codeword-0.1.0-py3-none-any.whl", hash = "sha256:c8be97a91ca823074bfdd2756803d74833fe43b0d09c755b96fb432f9c0d3047" },
+    { url = "https://hub.primeintellect.ai/primeintellect/color-codeword/@828f24c5/color_codeword-0.1.0-py3-none-any.whl", hash = "sha256:5bf72f74d6ee001b6be96768dd269e8762617dd3644238bda7623f58a6bc069a" },
 ]
 
 [[package]]
@@ -873,8 +873,8 @@ dependencies = [
     { name = "torch", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/test/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:10a730d5e1a1c23afd930ce419ee425cd1925a16b7eac789dfe98c3ca39bc009" },
-    { url = "https://download.pytorch.org/whl/test/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:bbb51d13d7aa1bfe04ef8875ed1bf630ebb116775084a5df612495e10609cd76" },
+    { url = "https://download.pytorch.org/whl/test/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:10a730d5e1a1c23afd930ce419ee425cd1925a16b7eac789dfe98c3ca39bc009", upload-time = "2026-02-14T04:28:12Z" },
+    { url = "https://download.pytorch.org/whl/test/cu128/flash_attn_3-3.0.0-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:bbb51d13d7aa1bfe04ef8875ed1bf630ebb116775084a5df612495e10609cd76", upload-time = "2026-02-14T04:28:05Z" },
 ]
 
 [[package]]
@@ -1574,7 +1574,7 @@ dependencies = [
     { name = "verifiers", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/logic-env/@faee829c/logic_env-0.1.0-py3-none-any.whl", hash = "sha256:789523bfbd87af97d67422b1ba6f89c181d8d33e4b6aedce629c312b0ab4ed1f" },
+    { url = "https://hub.primeintellect.ai/primeintellect/logic-env/@7bded58d/logic_env-0.1.0-py3-none-any.whl", hash = "sha256:3ecc5f31feb13fb5bd8d9a091d1d7cf0e6a8687c758f9b2a04e5f1b3b0c235a8" },
 ]
 
 [[package]]
@@ -2705,6 +2705,7 @@ quack = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "debugpy", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "ipykernel", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "ipywidgets", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "pre-commit", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -2779,6 +2780,7 @@ provides-extras = ["flash-attn", "flash-attn-3", "flash-attn-cute", "envs", "dis
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "debugpy", specifier = ">=1.8.0" },
     { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "ipywidgets", specifier = ">=8.1.7" },
     { name = "pre-commit", specifier = ">=4.2.0" },
@@ -3716,8 +3718,8 @@ dependencies = [
     { name = "typing-extensions", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6f09cdf2415516be028ae82e6b985bcfc3eac37bc52ab401142689f6224516ca" },
-    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:628e89bd5110ced7debee2a57c69959725b7fbc64eab81a39dd70e46c7e28ba5" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6f09cdf2415516be028ae82e6b985bcfc3eac37bc52ab401142689f6224516ca", upload-time = "2026-01-21T15:22:03Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:628e89bd5110ced7debee2a57c69959725b7fbc64eab81a39dd70e46c7e28ba5", upload-time = "2026-01-21T15:22:11Z" },
 ]
 
 [[package]]
