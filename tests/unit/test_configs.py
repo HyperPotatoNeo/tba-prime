@@ -159,3 +159,66 @@ def test_removed_fused_lm_head_chunk_size_field_is_rejected():
 def test_selective_activation_checkpointing_requires_custom_impl():
     with pytest.raises(ValidationError, match="Selective activation checkpointing requires model.impl='custom'"):
         TrainerModelConfig.model_validate({"impl": "hf", "ac": {"mode": "selective"}})
+
+
+def test_flex_attention_masked_dispatch_forces_full_bptt():
+    config = TrainerConfig.model_validate(
+        {
+            "model": {"impl": "hf", "attn": "flex_attention"},
+            "compaction": {
+                "window_size": 1024,
+                "stride": 16,
+                "block_size": 16,
+                "bptt_segments": 1,
+                "masked_forward_dispatch": "flex_attention",
+            },
+        }
+    )
+
+    assert config.compaction.masked_forward_dispatch == "flex_attention"
+    assert config.compaction.bptt_segments == -1
+
+
+def test_flex_debug_is_legacy_alias_for_flex_attention_dispatch():
+    config = TrainerConfig.model_validate(
+        {
+            "model": {"impl": "hf", "attn": "flex_attention"},
+            "compaction": {
+                "window_size": 1024,
+                "stride": 16,
+                "block_size": 16,
+                "masked_forward_dispatch": "flex_debug",
+            },
+        }
+    )
+
+    assert config.compaction.masked_forward_dispatch == "flex_attention"
+    assert config.compaction.bptt_segments == -1
+
+
+def test_flex_attention_masked_dispatch_requires_eviction():
+    with pytest.raises(ValidationError, match="only supported with KV eviction"):
+        TrainerConfig.model_validate(
+            {
+                "model": {"impl": "hf", "attn": "flex_attention"},
+                "compaction": {"masked_forward_dispatch": "flex_attention"},
+            }
+        )
+
+
+def test_flex_attention_masked_dispatch_requires_flex_attention_model():
+    with pytest.raises(
+        ValidationError,
+        match="requires trainer.model.attn='flex_attention'",
+    ):
+        TrainerConfig.model_validate(
+            {
+                "model": {"impl": "hf", "attn": "flash_attention_2"},
+                "compaction": {
+                    "window_size": 1024,
+                    "stride": 16,
+                    "block_size": 16,
+                    "masked_forward_dispatch": "flex_attention",
+                },
+            }
+        )

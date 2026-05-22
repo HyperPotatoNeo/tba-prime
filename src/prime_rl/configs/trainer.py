@@ -17,7 +17,9 @@ from prime_rl.utils.config import BaseConfig
 
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
-AttnImplementation: TypeAlias = Literal["sdpa", "flash_attention_2", "flash_attention_3", "fa4"]
+AttnImplementation: TypeAlias = Literal[
+    "sdpa", "flash_attention_2", "flash_attention_3", "fa4", "flex_attention"
+]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 
 # User-facing name -> internal name. Users set `flash_attention_4` in configs,
@@ -129,6 +131,30 @@ class CompactionConfig(BaseConfig):
             ),
         ),
     ] = False
+
+    masked_forward_dispatch: Annotated[
+        Literal["off", "flex_attention", "flex_debug"],
+        Field(
+            description=(
+                "Compaction trainer dispatch. 'off' keeps the normal "
+                "segmented/per-call cache replay. 'flex_attention' routes "
+                "admission-only KV-eviction call traces through a single "
+                "full-chain flex_attention forward with a KV-liveness "
+                "BlockMask. This forces bptt_segments=-1 because it is "
+                "full-BPTT and requires trainer.model.attn='flex_attention'. "
+                "'flex_debug' is accepted as a legacy alias for "
+                "'flex_attention'."
+            ),
+        ),
+    ] = "off"
+
+    @model_validator(mode="after")
+    def normalize_flex_attention_dispatch(self):
+        if self.masked_forward_dispatch == "flex_debug":
+            self.masked_forward_dispatch = "flex_attention"
+        if self.masked_forward_dispatch == "flex_attention":
+            self.bptt_segments = -1
+        return self
 
 
 class GCConfig(BaseConfig):
@@ -947,19 +973,31 @@ class TrainerConfig(BaseConfig):
           custom llama path (impl="custom") asserts past_key_values is None.
           impl="auto" resolves to "custom" for supported architectures (e.g.
           Qwen3-4B), so it is also rejected.
-        - attn="flash_attention_2" is required so the trainer's per-segment
-          attention kernel matches vLLM's decode kernel numerically. SDPA
-          and other backends produce ~0.002/layer divergence that compounds
-          to large train-inference KL across Qwen3-4B's 36 layers.
+        - attn="flash_attention_2" is the default cache-replay path because it
+          matches vLLM's decode kernel numerically. attn="flex_attention" is
+          reserved for the masked full-chain dispatch below.
         - compaction.stride must be positive and a multiple of
           compaction.block_size (matches the vLLM-side constraint).
         """
+        flex_dispatch = self.compaction.masked_forward_dispatch == "flex_attention"
+        if flex_dispatch and self.compaction.window_size <= 0:
+            raise ValueError(
+                "trainer.compaction.masked_forward_dispatch='flex_attention' "
+                "is only supported with KV eviction "
+                "(trainer.compaction.window_size > 0)."
+            )
         if self.compaction.window_size > 0:
-            if self.model.attn != "flash_attention_2":
+            if flex_dispatch and self.model.attn != "flex_attention":
+                raise ValueError(
+                    "trainer.compaction.masked_forward_dispatch='flex_attention' "
+                    "requires trainer.model.attn='flex_attention'."
+                )
+            if self.model.attn not in {"flash_attention_2", "flex_attention"}:
                 raise ValueError(
                     f"trainer.compaction.window_size > 0 requires "
-                    f"trainer.model.attn='flash_attention_2' to match vLLM's "
-                    f"inference kernel numerics. Got attn={self.model.attn!r}."
+                    f"trainer.model.attn='flash_attention_2' for cache replay "
+                    f"or 'flex_attention' for masked FlexAttention. Got "
+                    f"attn={self.model.attn!r}."
                 )
             if self.model.impl != "hf":
                 raise ValueError(
@@ -999,7 +1037,7 @@ class TrainerConfig(BaseConfig):
                     f"trainer.compaction.bptt_segments must be -1, None, "
                     f"or >= 1, got {self.compaction.bptt_segments}."
                 )
-            if self.model.ac is not None:
+            if self.model.ac is not None and not flex_dispatch:
                 # Per-block activation checkpointing + use_cache=True +
                 # DynamicCache is a known broken combination: prime-rl's
                 # apply_ac wraps every decoder layer with torch.utils.
@@ -1024,16 +1062,15 @@ class TrainerConfig(BaseConfig):
                 # single-segment case.
                 #
                 # Fix: remove [trainer.model.ac] from the RL config when
-                # compaction is enabled. Memory budget is still fine
-                # because segmented_forward's per-segment backward bounds
-                # activation memory to O(1 segment), which is tighter than
-                # per-block AC on the full sequence. (Smoke #4 post-fix
-                # peak memory was 43.7 GiB on 80 GB A100s — lower than
-                # the AC-enabled baseline's 59 GiB.)
+                # using the cache-replay compaction paths. The FlexAttention
+                # path is intentionally exempt because it uses a single
+                # masked full-sequence forward instead of mutating
+                # DynamicCache across replayed segments.
                 raise ValueError(
                     "trainer.compaction.window_size > 0 is incompatible "
                     "with per-block activation checkpointing "
-                    "(trainer.model.ac != None). Prime-rl's per-block "
+                    "(trainer.model.ac != None) on cache-replay "
+                    "compaction paths. Prime-rl's per-block "
                     "checkpoint_wrapper re-runs each decoder layer's "
                     "forward during backward under non-reentrant mode, "
                     "and each re-run calls DynamicCache.update() again, "
@@ -1042,10 +1079,10 @@ class TrainerConfig(BaseConfig):
                     "(saved cache length N vs recomputed 2N). Per-segment "
                     "backward does NOT sidestep this — the double-update "
                     "happens inside backward of a single segment. Set "
-                    "`trainer.model.ac = None` or remove the "
-                    "[trainer.model.ac] section entirely. Peak activation "
-                    "memory is still O(1 segment) because segmented_forward "
-                    "frees activations between per-segment backwards."
+                    "`trainer.model.ac = None`, remove the "
+                    "[trainer.model.ac] section entirely, or use "
+                    "trainer.compaction.masked_forward_dispatch='flex_attention' "
+                    "for the masked full-sequence FlexAttention path."
                 )
         return self
 

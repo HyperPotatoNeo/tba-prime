@@ -69,6 +69,7 @@ try:
         compute_num_segments,
         compute_per_call_bptt_window_forward_counts,
         compute_num_per_call_forwards,
+        flex_mask_segmented_forward,
         per_call_segmented_forward,
         segmented_forward,
     )
@@ -81,6 +82,7 @@ except ImportError:
     _build_pre_trim_plan = None  # type: ignore[assignment]
     compute_num_segments = None  # type: ignore[assignment]
     compute_per_call_bptt_window_forward_counts = None  # type: ignore[assignment]
+    flex_mask_segmented_forward = None  # type: ignore[assignment]
     per_call_segmented_forward = None  # type: ignore[assignment]
     compute_num_per_call_forwards = None  # type: ignore[assignment]
 from prime_rl.trainer.parallel_dims import get_parallel_dims
@@ -545,6 +547,7 @@ def train(config: TrainerConfig):
         config.compaction.window_size > 0
         and config.compaction.bptt_segments != 1
         and not config.compaction.per_call_dispatch
+        and config.compaction.masked_forward_dispatch != "flex_attention"
         and dist.is_initialized()
         and dist.get_world_size() > 1
     ):
@@ -875,6 +878,7 @@ def train(config: TrainerConfig):
             compaction_events = micro_batch.get("compaction_events") or []
             use_segmented = config.compaction.window_size > 0
             use_per_call = False
+            use_flex_mask = False
 
             # Defense-in-depth: verify every DP rank made the SAME branch
             # decision at this step index. prepare_batch partitions by
@@ -912,11 +916,10 @@ def train(config: TrainerConfig):
                     "compaction.window_size is 0. The trainer's compaction "
                     "config must mirror the inference engine's config."
                 )
-                assert config.model.attn == "flash_attention_2", (
-                    f"Compaction requires attn='flash_attention_2' to match "
-                    f"vLLM's inference kernel numerics and avoid spurious "
-                    f"train-vs-inference KL. Got attn={config.model.attn!r}. "
-                    f"Set trainer.model.attn='flash_attention_2' in the config."
+                assert config.model.attn in {"flash_attention_2", "flex_attention"}, (
+                    f"Compaction requires attn='flash_attention_2' for cache replay "
+                    f"or 'flex_attention' for masked FlexAttention. Got "
+                    f"attn={config.model.attn!r}."
                 )
                 assert config.model.impl == "hf", (
                     f"Compaction requires impl='hf' (the custom llama path "
@@ -1013,29 +1016,42 @@ def train(config: TrainerConfig):
                 # handles mid-gen correctly. The per-call path is the
                 # structural fix for ADMISSION (multi-turn KL gap) and
                 # doesn't duplicate mid-gen handling.
+                use_flex_mask_local = (
+                    config.compaction.masked_forward_dispatch == "flex_attention"
+                    and flex_mask_segmented_forward is not None
+                    and micro_batch.get("calls") is not None
+                )
                 use_per_call_local = (
                     config.compaction.per_call_dispatch
                     and per_call_segmented_forward is not None
                     and micro_batch.get("calls") is not None
+                    and not use_flex_mask_local
                 )
-                # Cross-rank agreement on use_per_call BEFORE entering any
+                # Cross-rank agreement on the call-based dispatch BEFORE entering any
                 # branch-conditional dist.all_reduce. If ANY rank cannot
-                # dispatch per-call (its sample has no `calls` list — e.g.
+                # dispatch through calls (its sample has no `calls` list — e.g.
                 # a Markovian Summary sample), ALL ranks fall back to
                 # legacy. Doing this MIN first avoids the deadlock where
                 # one rank enters the mid-gen all_reduce below while
                 # another skips it.
                 if dist.is_initialized() and dist.get_world_size() > 1:
+                    flex_t = torch.tensor(
+                        [int(use_flex_mask_local)],
+                        device="cuda", dtype=torch.int32,
+                    )
                     pc_t = torch.tensor(
                         [int(use_per_call_local)],
                         device="cuda", dtype=torch.int32,
                     )
+                    dist.all_reduce(flex_t, op=dist.ReduceOp.MIN)
                     dist.all_reduce(pc_t, op=dist.ReduceOp.MIN)
-                    use_per_call = bool(pc_t.item())
+                    use_flex_mask = bool(flex_t.item())
+                    use_per_call = bool(pc_t.item()) and not use_flex_mask
                 else:
+                    use_flex_mask = use_flex_mask_local
                     use_per_call = use_per_call_local
 
-                if use_per_call:
+                if use_flex_mask or use_per_call:
                     has_midgen_local = any(
                         any(
                             int(getattr(e, "num_output_tokens_at_compaction", 0)) > 0
@@ -1054,10 +1070,23 @@ def train(config: TrainerConfig):
                         dist.all_reduce(mg_t, op=dist.ReduceOp.MAX)
                         has_midgen_local = bool(mg_t.item())
                     if has_midgen_local:
+                        use_flex_mask = False
                         use_per_call = False
 
                 if (
+                    config.compaction.masked_forward_dispatch == "flex_attention"
+                    and not use_flex_mask
+                ):
+                    raise ValueError(
+                        "trainer.compaction.masked_forward_dispatch='flex_attention' "
+                        "requires kv_eviction.flex_mask_segmented_forward, "
+                        "TrainingSample.calls on every rank, and no mid-generation "
+                        "compaction events."
+                    )
+
+                if (
                     not use_per_call
+                    and not use_flex_mask
                     and config.compaction.bptt_segments != 1
                     and dist.is_initialized()
                     and dist.get_world_size() > 1
@@ -1072,7 +1101,9 @@ def train(config: TrainerConfig):
                     )
 
                 seq_len_local = input_ids.shape[1]
-                if use_per_call:
+                if use_flex_mask:
+                    n_forwards_local = 1
+                elif use_per_call:
                     n_forwards_local = compute_num_per_call_forwards(
                         micro_batch["calls"]
                     )
@@ -1187,7 +1218,7 @@ def train(config: TrainerConfig):
                 kve_call_plans = None
                 if (
                     (kve_top_mismatch_n > 0 or kve_call_mismatch_n > 0)
-                    and use_per_call
+                    and (use_per_call or use_flex_mask)
                     and _build_pre_trim_plan is not None
                 ):
                     try:
@@ -1507,7 +1538,17 @@ def train(config: TrainerConfig):
                     maybe_record_function("forward"),
                     maybe_activation_offloading(config.model.ac_offloading),
                 ):
-                    if use_per_call:
+                    if use_flex_mask:
+                        out = flex_mask_segmented_forward(
+                            model=model,
+                            calls=micro_batch["calls"],
+                            merged_input_ids=input_ids,
+                            merged_position_ids=forward_position_ids,
+                            loss_fn=_segment_loss_fn,
+                            max_forward_passes=max_forwards,
+                            device=input_ids.device,
+                        )
+                    elif use_per_call:
                         out = per_call_segmented_forward(
                             model=model,
                             calls=micro_batch["calls"],
@@ -1711,7 +1752,7 @@ def train(config: TrainerConfig):
             # gets emptied by _apply_admission_trim). Aggregate from both
             # sources so the metric reflects all events that fired.
             metric_events = list(compaction_events or [])
-            if use_per_call and micro_batch.get("calls"):
+            if (use_per_call or use_flex_mask) and micro_batch.get("calls"):
                 for call in micro_batch["calls"]:
                     metric_events.extend(call.compaction_events or [])
             if metric_events:
