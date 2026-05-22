@@ -29,6 +29,65 @@ EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 _ATTN_ALIASES = {"flash_attention_4": "fa4"}
 
 
+class CompactionDistillationConfig(BaseConfig):
+    """Trainer-side self-distillation for masked KV-eviction training."""
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "When true, run a trainer-side full-causal teacher forward "
+                "alongside the masked FlexAttention student forward and "
+                "compute reverse-KL distillation signals."
+            ),
+        ),
+    ] = False
+
+    estimator: Annotated[
+        Literal["rb_full", "rb_topk", "k1_sample"],
+        Field(
+            description=(
+                "Reverse-KL estimator for KL(student || teacher). rb_full "
+                "uses the full student vocabulary distribution, rb_topk "
+                "Rao-Blackwellizes over the top-k student tokens, and "
+                "k1_sample uses the sampled label logprob difference."
+            ),
+        ),
+    ] = "rb_topk"
+
+    top_k: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Top-k student tokens for estimator='rb_topk'.",
+        ),
+    ] = 100
+
+    reward_coef: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Coefficient for trainer-side per-token reward shaping. "
+                "The selected estimator is subtracted from advantages under "
+                "the loss mask."
+            ),
+        ),
+    ] = 0.0
+
+    loss_coef: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Coefficient for an auxiliary direct reverse-KL loss. Keep "
+                "0.0 to log metrics and/or shape rewards without adding a "
+                "direct KL loss term."
+            ),
+        ),
+    ] = 0.0
+
+
 class CompactionConfig(BaseConfig):
     """Configures KV cache compaction for the trainer's segmented forward.
 
@@ -147,6 +206,16 @@ class CompactionConfig(BaseConfig):
             ),
         ),
     ] = "off"
+
+    distillation: Annotated[
+        CompactionDistillationConfig,
+        Field(
+            description=(
+                "Optional trainer-side self-distillation for the masked "
+                "FlexAttention KV-eviction path."
+            ),
+        ),
+    ] = CompactionDistillationConfig()
 
     @model_validator(mode="after")
     def normalize_flex_attention_dispatch(self):
@@ -985,6 +1054,11 @@ class TrainerConfig(BaseConfig):
                 "trainer.compaction.masked_forward_dispatch='flex_attention' "
                 "is only supported with KV eviction "
                 "(trainer.compaction.window_size > 0)."
+            )
+        if self.compaction.distillation.enabled and not flex_dispatch:
+            raise ValueError(
+                "trainer.compaction.distillation.enabled=true requires "
+                "trainer.compaction.masked_forward_dispatch='flex_attention'."
             )
         if self.compaction.window_size > 0:
             if flex_dispatch and self.model.attn != "flex_attention":

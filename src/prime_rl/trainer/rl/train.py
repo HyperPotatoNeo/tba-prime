@@ -55,6 +55,7 @@ from prime_rl.trainer.rl.loss import (
     shift_tensor_left,
     shift_tensor_right,
 )
+from prime_rl.trainer.rl.distillation import compute_reverse_kl_terms
 from prime_rl.trainer.model import (
     forward,
     setup_tokenizer,
@@ -1202,6 +1203,11 @@ def train(config: TrainerConfig):
                 accumulated_entropy_masked: list[torch.Tensor] = []
 
                 full_seq_len = input_ids.shape[1]
+                distill_cfg = config.compaction.distillation
+                distill_enabled = use_flex_mask and distill_cfg.enabled
+                distill_adv_adjustment = (
+                    torch.zeros_like(advantages) if distill_enabled else None
+                )
                 kve_top_mismatch_n = _kve_top_mismatch_n()
                 kve_top_mismatch_scope = os.environ.get(
                     "KVE_TOP_MISMATCH_SCOPE", "keep"
@@ -1227,6 +1233,320 @@ def train(config: TrainerConfig):
                         )
                     except Exception:
                         logger.exception("[KVE-TOP-KL] failed to build call plan")
+
+                def _append_distill_metric(
+                    name: str,
+                    values: torch.Tensor,
+                    mask: torch.Tensor,
+                ) -> None:
+                    if mask.any():
+                        accumulated_loss_tensors.setdefault(name, []).append(
+                            values[mask].detach().to("cpu", dtype=torch.float32)
+                        )
+
+                distill_compact_state: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+
+                def _distill_effective_slice(
+                    logits: torch.Tensor,
+                    full_logit_start: int,
+                    full_logit_end: int,
+                ) -> tuple[torch.Tensor, int]:
+                    if full_logit_end >= full_seq_len:
+                        effective_logit_end = full_seq_len - 1
+                        logits = logits[
+                            :, : effective_logit_end - full_logit_start, :
+                        ]
+                    else:
+                        effective_logit_end = full_logit_end
+                    return logits, effective_logit_end
+
+                def _distill_labels_and_mask(
+                    full_logit_start: int,
+                    effective_logit_end: int,
+                ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+                    distill_labels = labels[:, full_logit_start:effective_logit_end]
+                    tgt_start = full_logit_start + 1
+                    tgt_end = effective_logit_end + 1
+                    distill_mask = loss_mask[:, tgt_start:tgt_end].bool()
+                    return distill_labels, distill_mask, tgt_start, tgt_end
+
+                def _segment_distillation_prepare_fn(
+                    student_logits: torch.Tensor,
+                    full_logit_start: int,
+                    full_logit_end: int,
+                ) -> None:
+                    if distill_cfg.estimator != "rb_topk":
+                        return
+                    student_eff, effective_logit_end = _distill_effective_slice(
+                        student_logits,
+                        full_logit_start,
+                        full_logit_end,
+                    )
+                    if effective_logit_end <= full_logit_start:
+                        return
+                    _, distill_mask, _, _ = _distill_labels_and_mask(
+                        full_logit_start,
+                        effective_logit_end,
+                    )
+                    if not distill_mask.any():
+                        return
+                    k = max(1, min(int(distill_cfg.top_k), student_eff.shape[-1]))
+                    _, top_idx = torch.topk(student_eff.float(), k=k, dim=-1)
+                    distill_compact_state[(full_logit_start, effective_logit_end)] = {
+                        "top_idx": top_idx.detach().to("cpu"),
+                    }
+
+                def _segment_distillation_teacher_fn(
+                    teacher_logits: torch.Tensor,
+                    full_logit_start: int,
+                    full_logit_end: int,
+                ) -> None:
+                    teacher_eff, effective_logit_end = _distill_effective_slice(
+                        teacher_logits,
+                        full_logit_start,
+                        full_logit_end,
+                    )
+                    if effective_logit_end <= full_logit_start:
+                        return
+                    distill_labels, distill_mask, _, _ = _distill_labels_and_mask(
+                        full_logit_start,
+                        effective_logit_end,
+                    )
+                    if not distill_mask.any():
+                        return
+
+                    key = (full_logit_start, effective_logit_end)
+                    state = distill_compact_state.setdefault(key, {})
+                    teacher_float = teacher_eff.float()
+                    teacher_logz = torch.logsumexp(
+                        teacher_float, dim=-1, keepdim=True
+                    )
+                    selected_teacher = (
+                        torch.gather(
+                            teacher_float,
+                            dim=-1,
+                            index=distill_labels.unsqueeze(-1),
+                        ).squeeze(-1)
+                        - teacher_logz.squeeze(-1)
+                    )
+                    state["selected_teacher_logp"] = selected_teacher.detach().to("cpu")
+
+                    if distill_cfg.estimator == "rb_topk":
+                        top_idx_cpu = state.get("top_idx")
+                        if top_idx_cpu is None:
+                            raise RuntimeError(
+                                "RB-topk distillation teacher hook ran before "
+                                "student support preparation."
+                            )
+                        top_idx = top_idx_cpu.to(
+                            device=teacher_eff.device, non_blocking=True
+                        )
+                        top_teacher_logp = (
+                            torch.gather(teacher_float, dim=-1, index=top_idx)
+                            - teacher_logz
+                        )
+                        state["top_teacher_logp"] = top_teacher_logp.detach().to("cpu")
+
+                def _segment_distillation_loss_fn(
+                    student_logits: torch.Tensor,
+                    full_logit_start: int,
+                    full_logit_end: int,
+                ) -> torch.Tensor:
+                    student_eff, effective_logit_end = _distill_effective_slice(
+                        student_logits,
+                        full_logit_start,
+                        full_logit_end,
+                    )
+                    if effective_logit_end <= full_logit_start:
+                        return student_logits.sum() * 0.0
+                    key = (full_logit_start, effective_logit_end)
+                    state = distill_compact_state.get(key)
+                    if state is None:
+                        return student_eff.sum() * 0.0
+                    distill_labels, distill_mask, tgt_start, tgt_end = (
+                        _distill_labels_and_mask(
+                            full_logit_start,
+                            effective_logit_end,
+                        )
+                    )
+                    if not distill_mask.any():
+                        return student_eff.sum() * 0.0
+
+                    selected_teacher_cpu = state.get("selected_teacher_logp")
+                    if selected_teacher_cpu is None:
+                        raise RuntimeError(
+                            "distillation teacher selected logprobs are missing"
+                        )
+                    student_float = student_eff.float()
+                    student_logz = torch.logsumexp(
+                        student_float, dim=-1, keepdim=True
+                    )
+                    selected_student = (
+                        torch.gather(
+                            student_float,
+                            dim=-1,
+                            index=distill_labels.unsqueeze(-1),
+                        ).squeeze(-1)
+                        - student_logz.squeeze(-1)
+                    )
+                    selected_teacher = selected_teacher_cpu.to(
+                        device=student_eff.device, non_blocking=True
+                    )
+                    selected_k1 = selected_student - selected_teacher
+
+                    topk_mass: torch.Tensor | None = None
+                    if distill_cfg.estimator == "k1_sample":
+                        kl = selected_k1
+                    elif distill_cfg.estimator == "rb_topk":
+                        top_idx_cpu = state.get("top_idx")
+                        top_teacher_cpu = state.get("top_teacher_logp")
+                        if top_idx_cpu is None or top_teacher_cpu is None:
+                            raise RuntimeError(
+                                "RB-topk distillation support is incomplete"
+                            )
+                        top_idx = top_idx_cpu.to(
+                            device=student_eff.device, non_blocking=True
+                        )
+                        top_teacher_logp = top_teacher_cpu.to(
+                            device=student_eff.device, non_blocking=True
+                        )
+                        top_student_logits = torch.gather(
+                            student_float,
+                            dim=-1,
+                            index=top_idx,
+                        )
+                        top_student_logp = top_student_logits - student_logz
+                        top_prob = top_student_logp.exp()
+                        kl = (
+                            top_prob * (top_student_logp - top_teacher_logp)
+                        ).sum(dim=-1)
+                        topk_mass = top_prob.sum(dim=-1)
+                    else:
+                        raise ValueError(
+                            f"compact distillation does not support "
+                            f"estimator={distill_cfg.estimator!r}"
+                        )
+
+                    reward_signal = kl
+                    if distill_adv_adjustment is not None and distill_cfg.reward_coef > 0:
+                        shaped_reward = -distill_cfg.reward_coef * reward_signal.detach()
+                        distill_adv_adjustment[:, tgt_start:tgt_end] = torch.where(
+                            distill_mask,
+                            shaped_reward,
+                            torch.zeros_like(shaped_reward),
+                        )
+                        _append_distill_metric(
+                            "distill/reward",
+                            shaped_reward,
+                            distill_mask,
+                        )
+
+                    _append_distill_metric(
+                        "distill/student_teacher_kl",
+                        kl,
+                        distill_mask,
+                    )
+                    _append_distill_metric(
+                        "distill/reverse_kl",
+                        kl,
+                        distill_mask,
+                    )
+                    _append_distill_metric(
+                        "distill/k1_sample",
+                        selected_k1,
+                        distill_mask,
+                    )
+                    if topk_mass is not None:
+                        _append_distill_metric(
+                            "distill/topk_mass",
+                            topk_mass,
+                            distill_mask,
+                        )
+
+                    if distill_cfg.loss_coef <= 0:
+                        return student_eff.sum() * 0.0
+                    return (
+                        distill_cfg.loss_coef
+                        * kl[distill_mask].sum()
+                        / loss_scale
+                    )
+
+                def _segment_distillation_fn(
+                    student_logits: torch.Tensor,
+                    teacher_logits: torch.Tensor,
+                    full_logit_start: int,
+                    full_logit_end: int,
+                ) -> torch.Tensor:
+                    if full_logit_end >= full_seq_len:
+                        effective_logit_end = full_seq_len - 1
+                        student_eff = student_logits[
+                            :, : effective_logit_end - full_logit_start, :
+                        ]
+                        teacher_eff = teacher_logits[
+                            :, : effective_logit_end - full_logit_start, :
+                        ]
+                    else:
+                        effective_logit_end = full_logit_end
+                        student_eff = student_logits
+                        teacher_eff = teacher_logits
+                    if effective_logit_end <= full_logit_start:
+                        return student_logits.sum() * 0.0
+
+                    distill_labels = labels[:, full_logit_start:effective_logit_end]
+                    tgt_start = full_logit_start + 1
+                    tgt_end = effective_logit_end + 1
+                    distill_mask = loss_mask[:, tgt_start:tgt_end].bool()
+                    terms = compute_reverse_kl_terms(
+                        student_logits=student_eff,
+                        teacher_logits=teacher_eff,
+                        labels=distill_labels,
+                        estimator=distill_cfg.estimator,
+                        top_k=distill_cfg.top_k,
+                    )
+
+                    reward_signal = terms.kl
+                    if distill_adv_adjustment is not None and distill_cfg.reward_coef > 0:
+                        shaped_reward = -distill_cfg.reward_coef * reward_signal.detach()
+                        distill_adv_adjustment[:, tgt_start:tgt_end] = torch.where(
+                            distill_mask,
+                            shaped_reward,
+                            torch.zeros_like(shaped_reward),
+                        )
+                        _append_distill_metric(
+                            "distill/reward",
+                            shaped_reward,
+                            distill_mask,
+                        )
+
+                    _append_distill_metric(
+                        "distill/student_teacher_kl",
+                        terms.kl,
+                        distill_mask,
+                    )
+                    _append_distill_metric(
+                        "distill/reverse_kl",
+                        terms.kl,
+                        distill_mask,
+                    )
+                    _append_distill_metric(
+                        "distill/k1_sample",
+                        terms.selected_k1,
+                        distill_mask,
+                    )
+                    if terms.topk_mass is not None:
+                        _append_distill_metric(
+                            "distill/topk_mass",
+                            terms.topk_mass,
+                            distill_mask,
+                        )
+
+                    if distill_cfg.loss_coef <= 0 or not distill_mask.any():
+                        return student_eff.sum() * 0.0
+                    return (
+                        distill_cfg.loss_coef
+                        * terms.kl[distill_mask].sum()
+                        / loss_scale
+                    )
 
                 def _segment_loss_fn(
                     seg_logits: torch.Tensor,  # [1, seg_owned_logits, vocab]
@@ -1284,6 +1604,8 @@ def train(config: TrainerConfig):
                     tgt_start = full_logit_start + 1
                     tgt_end = effective_logit_end + 1
                     seg_adv = advantages[:, tgt_start:tgt_end]
+                    if distill_adv_adjustment is not None:
+                        seg_adv = seg_adv + distill_adv_adjustment[:, tgt_start:tgt_end]
                     seg_mask = loss_mask[:, tgt_start:tgt_end]
                     seg_inf = inference_logprobs[:, tgt_start:tgt_end]
 
@@ -1546,6 +1868,30 @@ def train(config: TrainerConfig):
                             merged_position_ids=forward_position_ids,
                             loss_fn=_segment_loss_fn,
                             max_forward_passes=max_forwards,
+                            distillation_fn=(
+                                _segment_distillation_fn
+                                if distill_enabled
+                                and distill_cfg.estimator == "rb_full"
+                                else None
+                            ),
+                            distillation_prepare_fn=(
+                                _segment_distillation_prepare_fn
+                                if distill_enabled
+                                and distill_cfg.estimator == "rb_topk"
+                                else None
+                            ),
+                            distillation_teacher_fn=(
+                                _segment_distillation_teacher_fn
+                                if distill_enabled
+                                and distill_cfg.estimator != "rb_full"
+                                else None
+                            ),
+                            distillation_loss_fn=(
+                                _segment_distillation_loss_fn
+                                if distill_enabled
+                                and distill_cfg.estimator != "rb_full"
+                                else None
+                            ),
                             device=input_ids.device,
                         )
                     elif use_per_call:
@@ -1875,6 +2221,21 @@ def train(config: TrainerConfig):
             step_message += (
                 " | Token Masked KL: "
                 f"{tensor_stats['masked_mismatch_kl_token_weighted/mean']:.4f}"
+            )
+        if "distill/student_teacher_kl/mean" in tensor_stats:
+            step_message += (
+                " | Student-Teacher KL: "
+                f"{tensor_stats['distill/student_teacher_kl/mean']:.4f}"
+            )
+        if "distill/k1_sample/mean" in tensor_stats:
+            step_message += (
+                " | ST K1: "
+                f"{tensor_stats['distill/k1_sample/mean']:.4f}"
+            )
+        if "distill/topk_mass/mean" in tensor_stats:
+            step_message += (
+                " | ST TopK Mass: "
+                f"{tensor_stats['distill/topk_mass/mean']:.3f}"
             )
         if grad_norm is not None:
             step_message += f" | Grad. Norm: {grad_norm:.4f}"

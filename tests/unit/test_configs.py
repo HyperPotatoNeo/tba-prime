@@ -222,3 +222,45 @@ def test_flex_attention_masked_dispatch_requires_flex_attention_model():
                 },
             }
         )
+
+
+def test_compaction_distillation_requires_flex_attention_dispatch():
+    with pytest.raises(
+        ValidationError,
+        match="distillation.enabled=true requires",
+    ):
+        TrainerConfig.model_validate(
+            {
+                "model": {"impl": "hf", "attn": "flash_attention_2"},
+                "compaction": {
+                    "window_size": 1024,
+                    "stride": 16,
+                    "block_size": 16,
+                    "distillation": {"enabled": True},
+                },
+            }
+        )
+
+
+def test_compaction_distillation_loads_with_flex_attention_dispatch():
+    config = TrainerConfig.model_validate(
+        {
+            "model": {"impl": "hf", "attn": "flex_attention"},
+            "compaction": {
+                "window_size": 1024,
+                "stride": 16,
+                "block_size": 16,
+                "masked_forward_dispatch": "flex_attention",
+                "distillation": {
+                    "enabled": True,
+                    "estimator": "rb_topk",
+                    "top_k": 32,
+                    "reward_coef": 0.1,
+                },
+            },
+        }
+    )
+
+    assert config.compaction.distillation.enabled is True
+    assert config.compaction.distillation.top_k == 32
+    assert config.compaction.distillation.reward_coef == 0.1
