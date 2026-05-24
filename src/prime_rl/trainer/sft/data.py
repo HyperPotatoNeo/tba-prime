@@ -1,10 +1,11 @@
 import json
 import uuid
 from collections import defaultdict
-from typing import Literal, TypedDict, cast
+from pathlib import Path
+from typing import Literal, NotRequired, TypedDict, cast
 
 import torch
-from datasets import Dataset, interleave_datasets, load_dataset
+from datasets import Dataset, interleave_datasets, load_dataset, load_from_disk
 from jaxtyping import Bool, Int
 from torch import Tensor
 from torch.distributed.checkpoint.stateful import Stateful
@@ -12,12 +13,20 @@ from torch.utils.data import IterableDataset, get_worker_info
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers.tokenization_utils import PreTrainedTokenizer
 
-from prime_rl.configs.sft import DataConfig, LossMaskConfig, SFTDataConfig
+from prime_rl.configs.sft import (
+    DataConfig,
+    LossMaskConfig,
+    SFTCompactionConfig,
+    SFTDataConfig,
+)
+from prime_rl.transport.types import CallWire, CompactionEventWire
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.chat_template import (
     build_incremental_token_mask,
     deserialize_tool_calls,
     normalize_messages,
+    render_messages,
+    should_add_generation_prompt,
     strip_message_content,
 )
 from prime_rl.utils.logger import get_logger
@@ -30,6 +39,7 @@ class Sample(TypedDict):
     position_ids: list[int]
     loss_mask: list[bool]
     target_ids: list[int]
+    calls: NotRequired[list[CallWire]]
 
 
 class Batch(TypedDict):
@@ -37,6 +47,239 @@ class Batch(TypedDict):
     position_ids: Int[Tensor, "batch seq"]
     target_ids: Int[Tensor, "batch seq"]
     loss_mask: Bool[Tensor, "batch seq"]
+    calls: NotRequired[list[CallWire] | None]
+
+
+FILLER_TOKEN_ID = 151643
+
+
+def _pad_after_im_end(
+    tokenizer: PreTrainedTokenizer,
+    token_ids: list[int],
+    *,
+    block_size: int,
+) -> list[int]:
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    out: list[int] = []
+    for token_id in token_ids:
+        out.append(int(token_id))
+        if int(token_id) == int(im_end_id):
+            n_pad = (block_size - (len(out) % block_size)) % block_size
+            out.extend([FILLER_TOKEN_ID] * n_pad)
+    return out
+
+
+def _pad_fragment_after_im_end(
+    tokenizer: PreTrainedTokenizer,
+    start_offset: int,
+    text: str,
+    *,
+    block_size: int,
+) -> list[int]:
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    raw = tokenizer.encode(text, add_special_tokens=False)
+    out: list[int] = []
+    running = int(start_offset)
+    for token_id in raw:
+        out.append(int(token_id))
+        running += 1
+        if int(token_id) == int(im_end_id):
+            n_pad = (block_size - (running % block_size)) % block_size
+            out.extend([FILLER_TOKEN_ID] * n_pad)
+            running += n_pad
+    return out
+
+
+def _completion_delta(
+    tokenizer: PreTrainedTokenizer,
+    messages: list[dict],
+    assistant_idx: int,
+) -> list[int]:
+    prompt_ids = render_messages(
+        tokenizer,
+        messages[:assistant_idx],
+        add_generation_prompt=True,
+    )
+    full_ids = render_messages(
+        tokenizer,
+        messages[: assistant_idx + 1],
+        add_generation_prompt=False,
+    )
+    assert prompt_ids == full_ids[: len(prompt_ids)], (
+        "Mismatch in assistant completion incremental tokenization."
+    )
+    return [int(x) for x in full_ids[len(prompt_ids) :]]
+
+
+def _build_incremental_token_mask_and_calls(
+    tokenizer: PreTrainedTokenizer,
+    messages: list[dict],
+    *,
+    role_to_mask,
+    tools: list[dict] | None,
+    chat_template_kwargs: dict | None,
+    compaction_config: SFTCompactionConfig,
+) -> tuple[list[int], list[bool], list[CallWire]]:
+    if tools not in (None, []):
+        raise ValueError("SFT compaction call synthesis does not support tools")
+    if chat_template_kwargs not in (None, {}):
+        raise ValueError(
+            "SFT compaction call synthesis does not support chat_template_kwargs"
+        )
+
+    block_size = compaction_config.block_size
+    assistant_indices = [
+        idx for idx, message in enumerate(messages)
+        if message.get("role") == "assistant"
+    ]
+    if not assistant_indices:
+        raise ValueError("SFT compaction requires at least one assistant message")
+
+    first_assistant_idx = assistant_indices[0]
+    first_prompt_raw = render_messages(
+        tokenizer,
+        messages[:first_assistant_idx],
+        add_generation_prompt=True,
+    )
+    first_prompt = _pad_after_im_end(
+        tokenizer,
+        [int(x) for x in first_prompt_raw],
+        block_size=block_size,
+    )
+    if compaction_config.protected_prefix_tokens > 0:
+        protected_prefix_len = compaction_config.protected_prefix_tokens
+    else:
+        im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        first_im_end = first_prompt.index(int(im_end_id))
+        protected_prefix_len = (
+            ((first_im_end + 1 + block_size - 1) // block_size) * block_size
+        )
+
+    pre_trim_ids: list[int] = []
+    token_mask: list[bool] = []
+    calls: list[CallWire] = []
+    prev_state = list(first_prompt)
+    completed_turn_lengths: list[int] = []
+    position_offset_after = 0
+
+    for turn_idx, assistant_idx in enumerate(assistant_indices):
+        assistant_message = messages[assistant_idx]
+        if turn_idx == 0:
+            submitted = list(first_prompt)
+            current_user_fragment_len = len(first_prompt) - protected_prefix_len
+        else:
+            user_idx = assistant_idx - 1
+            if user_idx < 0 or messages[user_idx].get("role") != "user":
+                raise ValueError(
+                    "SFT compaction expects user/assistant turns after the system prompt"
+                )
+            user_content = messages[user_idx].get("content") or ""
+            fragment = (
+                "\n<|im_start|>user\n"
+                f"{user_content}"
+                "<|im_end|>\n<|im_start|>assistant\n"
+            )
+            user_fragment = _pad_fragment_after_im_end(
+                tokenizer,
+                len(prev_state),
+                fragment,
+                block_size=block_size,
+            )
+            submitted = list(prev_state) + user_fragment
+            current_user_fragment_len = len(user_fragment)
+
+        events: list[CompactionEventWire] = []
+        kept_prompt = list(submitted)
+        if len(completed_turn_lengths) + 1 > compaction_config.max_turns:
+            evict_turns = min(
+                compaction_config.eviction_turn_stride,
+                len(completed_turn_lengths),
+            )
+            tokens_evicted = sum(completed_turn_lengths[:evict_turns])
+            if tokens_evicted > 0:
+                evict_start = protected_prefix_len
+                position_offset_after += tokens_evicted
+                kept_prompt = (
+                    submitted[:evict_start]
+                    + submitted[evict_start + tokens_evicted :]
+                )
+                events.append(
+                    CompactionEventWire(
+                        num_output_tokens_at_compaction=0,
+                        tokens_evicted=tokens_evicted,
+                        position_offset_after=position_offset_after,
+                        num_prompt_tokens=len(kept_prompt),
+                        evict_start=evict_start,
+                        new_user_fragment_len=max(1, current_user_fragment_len),
+                        last_turn_evicted=evict_turns - 1,
+                        num_turns_evicted_after=evict_turns,
+                    )
+                )
+                del completed_turn_lengths[:evict_turns]
+
+        completion_ids = _completion_delta(tokenizer, messages, assistant_idx)
+        state_without_pad = kept_prompt + completion_ids
+        trailing_pad_len = (block_size - (len(state_without_pad) % block_size)) % block_size
+        trailing_pad = [FILLER_TOKEN_ID] * trailing_pad_len
+
+        calls.append(
+            CallWire(
+                submitted_prompt_ids=list(submitted),
+                completion_ids=list(completion_ids),
+                completion_logprobs=[0.0] * len(completion_ids),
+                completion_temperatures=[1.0] * len(completion_ids),
+                compaction_events=events,
+                trailing_pad_ids=trailing_pad,
+            )
+        )
+
+        if turn_idx == 0:
+            new_prompt_piece = submitted
+            prompt_mask = [False] * len(new_prompt_piece)
+            current_turn_len = (
+                len(submitted) - protected_prefix_len
+                + len(completion_ids)
+                + trailing_pad_len
+            )
+        else:
+            prior_post_len = len(prev_state)
+            new_prompt_piece = submitted[prior_post_len:]
+            prompt_mask = [False] * len(new_prompt_piece)
+            current_turn_len = (
+                len(new_prompt_piece) + len(completion_ids) + trailing_pad_len
+            )
+
+        pre_trim_ids.extend(new_prompt_piece)
+        token_mask.extend(prompt_mask)
+        assistant_mask = bool(role_to_mask(assistant_message))
+        pre_trim_ids.extend(completion_ids)
+        token_mask.extend([assistant_mask] * len(completion_ids))
+        pre_trim_ids.extend(trailing_pad)
+        token_mask.extend([False] * trailing_pad_len)
+
+        completed_turn_lengths.append(current_turn_len)
+        prev_state = state_without_pad + trailing_pad
+
+    return pre_trim_ids, token_mask, calls
+
+
+def _trim_last_call_to_input_length(calls: list[CallWire], trim_tokens: int) -> list[CallWire]:
+    if trim_tokens <= 0:
+        return calls
+    if not calls:
+        return calls
+    out = list(calls)
+    last = out[-1]
+    keep = max(0, len(last.completion_ids) - trim_tokens)
+    out[-1] = CallWire(
+        submitted_prompt_ids=list(last.submitted_prompt_ids),
+        completion_ids=list(last.completion_ids[:keep]),
+        completion_logprobs=list(last.completion_logprobs[:keep]),
+        completion_temperatures=list(last.completion_temperatures[:keep]),
+        compaction_events=list(last.compaction_events),
+        trailing_pad_ids=[],
+    )
+    return out
 
 
 class StatefulIterableDataset(Stateful, IterableDataset):
@@ -126,6 +369,7 @@ class SFTDataset(StatefulIterableDataset):
         loss_mask_config: LossMaskConfig = LossMaskConfig(),
         max_examples: int | None = None,
         max_epochs: int | None = None,
+        compaction_config: SFTCompactionConfig | None = None,
     ):
         super().__init__()
         self.logger = get_logger()
@@ -138,6 +382,7 @@ class SFTDataset(StatefulIterableDataset):
         self.loss_mask_config = loss_mask_config
         self.max_examples = max_examples
         self.max_epochs = max_epochs
+        self.compaction_config = compaction_config
 
         if self.tokenizer is None:
             self.logger.warning("No tokenizer provided, will not process examples")
@@ -204,6 +449,31 @@ class SFTDataset(StatefulIterableDataset):
                     return True if self.loss_mask_config.tool else False
                 case _:
                     raise ValueError(f"Invalid message role: {message['role']}")
+
+        if self.compaction_config is not None and self.compaction_config.enabled:
+            input_ids, token_mask, calls = _build_incremental_token_mask_and_calls(
+                self.tokenizer,
+                messages,
+                role_to_mask=should_mask,
+                tools=tools,
+                chat_template_kwargs=example.get("chat_template_kwargs", {}),
+                compaction_config=self.compaction_config,
+            )
+            if len(input_ids) > self.seq_len:
+                self.logger.warning(
+                    f"Skipping compaction example {example.get('__index', '')} "
+                    f"because it has {len(input_ids)} tokens, exceeding seq_len={self.seq_len}."
+                )
+                return None
+            target_ids = input_ids[1:] + [0]
+            loss_mask = token_mask[1:] + [False]
+            return {
+                "input_ids": input_ids,
+                "target_ids": target_ids,
+                "loss_mask": loss_mask,
+                "position_ids": list(range(len(input_ids))),
+                "calls": calls,
+            }
 
         input_ids, loss_mask = build_incremental_token_mask(
             self.tokenizer,
@@ -328,6 +598,33 @@ class CatDataset(StatefulIterableDataset):
                 packed_samples, seq_len = defaultdict(list), 0
 
 
+class PadCompactionDataset(StatefulIterableDataset):
+    """Pad one synthetic compaction sample to a fixed length without packing."""
+
+    def __init__(self, dataset: StatefulIterableDataset, seq_len: int):
+        self.dataset = dataset
+        self.seq_len = seq_len
+
+    def state_dict(self) -> dict:
+        return {"dataset": self.dataset.state_dict()}
+
+    def load_state_dict(self, state_dict: dict):
+        self.dataset.load_state_dict(state_dict["dataset"])
+
+    def __iter__(self):
+        for sample in self.dataset:
+            pad_len = self.seq_len - len(sample["input_ids"])
+            if pad_len < 0:
+                continue
+            yield {
+                "input_ids": sample["input_ids"] + [0] * pad_len,
+                "target_ids": sample["target_ids"] + [0] * pad_len,
+                "loss_mask": sample["loss_mask"] + [False] * pad_len,
+                "position_ids": sample["position_ids"] + [0] * pad_len,
+                "calls": sample["calls"],
+            }
+
+
 class StackDataset(StatefulIterableDataset):
     """A dataset that stacks samples into batch with a fixed area"""
 
@@ -438,16 +735,19 @@ class StackDataset(StatefulIterableDataset):
 
 
 def stack_collate(samples: list[Sample]) -> Batch:
-    return {
+    batch = {
         "input_ids": torch.tensor(samples[0]["input_ids"], dtype=torch.long, device="cuda"),
         "position_ids": torch.tensor(samples[0]["position_ids"], dtype=torch.long, device="cuda"),
         "loss_mask": torch.tensor(samples[0]["loss_mask"], dtype=torch.bool, device="cuda"),
         "target_ids": torch.tensor(samples[0]["target_ids"], dtype=torch.long, device="cuda"),
     }
+    if "calls" in samples[0]:
+        batch["calls"] = samples[0]["calls"]
+    return batch
 
 
 def cat_collate(samples: list[Sample]) -> Batch:
-    return {
+    batch = {
         "input_ids": torch.stack([torch.tensor(sample["input_ids"]) for sample in samples], dim=0).long().to("cuda"),
         "position_ids": torch.stack([torch.tensor(sample["position_ids"]) for sample in samples], dim=0)
         .long()
@@ -455,6 +755,9 @@ def cat_collate(samples: list[Sample]) -> Batch:
         "loss_mask": torch.stack([torch.tensor(sample["loss_mask"]) for sample in samples], dim=0).bool().to("cuda"),
         "target_ids": torch.stack([torch.tensor(sample["target_ids"]) for sample in samples], dim=0).long().to("cuda"),
     }
+    if "calls" in samples[0]:
+        batch["calls"] = samples[0]["calls"]
+    return batch
 
 
 def setup_and_interleave_datasets(
@@ -491,6 +794,9 @@ def setup_and_interleave_datasets(
 def load_sft_dataset(config: SFTDataConfig) -> Dataset:
     """Load and interleave the raw HF dataset. This is the expensive I/O step."""
     logger = get_logger()
+    dataset_path = Path(config.name)
+    if dataset_path.exists() and (dataset_path / "dataset_info.json").exists():
+        return cast(Dataset, load_from_disk(str(dataset_path)))
     if config.subsets is None and config.splits is None:
         return setup_and_interleave_datasets(
             dataset_name=config.name,
@@ -532,6 +838,7 @@ def setup_dataset(
     *,
     max_epochs: int | None = None,
     raw_dataset: Dataset | None = None,
+    compaction_config: SFTCompactionConfig | None = None,
 ) -> StatefulIterableDataset:
     if config.type == "fake":
         return FakeDataset(
@@ -549,12 +856,20 @@ def setup_dataset(
             loss_mask_config=config.loss_mask,
             non_dp_size=non_dp_size,
             max_epochs=max_epochs,
+            compaction_config=compaction_config,
         )
     else:
         raise ValueError(f"Invalid dataset type: {config.type}")
 
 
-def setup_dataloader(dataset: StatefulIterableDataset, config: DataConfig) -> StatefulDataLoader:
+def setup_dataloader(
+    dataset: StatefulIterableDataset,
+    config: DataConfig,
+    compaction_config: SFTCompactionConfig | None = None,
+) -> StatefulDataLoader:
+    if compaction_config is not None and compaction_config.enabled:
+        padded_dataset = PadCompactionDataset(dataset, config.seq_len)
+        return StatefulDataLoader(padded_dataset, batch_size=1, collate_fn=cat_collate)
     if config.pack_function == "stack":
         stacking_dataset = StackDataset(dataset, config.seq_len * config.micro_batch_size)
         return StatefulDataLoader(stacking_dataset, batch_size=1, collate_fn=stack_collate)

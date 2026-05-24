@@ -117,6 +117,31 @@ class SFTValConfig(BaseConfig):
 DataConfig: TypeAlias = Annotated[FakeDataConfig | SFTDataConfig, Field(discriminator="type")]
 
 
+class SFTCompactionConfig(BaseConfig):
+    """Synthetic turn-eviction config for local SFT diagnostics."""
+
+    enabled: bool = False
+    max_turns: Annotated[int, Field(ge=1)] = 1
+    eviction_turn_stride: Annotated[int, Field(ge=1)] = 1
+    protected_prefix_tokens: Annotated[int, Field(ge=-1)] = -1
+    block_size: Annotated[int, Field(ge=1)] = 16
+    masked_forward_dispatch: Literal["off", "flex_attention", "flex_debug"] = "off"
+    log_full_context: bool = False
+    log_base_model: bool = False
+    base_model_name: str | None = None
+    base_model_dtype: Literal["float32", "bfloat16"] = "bfloat16"
+
+    @model_validator(mode="after")
+    def normalize(self):
+        if self.masked_forward_dispatch == "flex_debug":
+            self.masked_forward_dispatch = "flex_attention"
+        if self.eviction_turn_stride > self.max_turns:
+            raise ValueError(
+                "compaction.eviction_turn_stride must be <= compaction.max_turns"
+            )
+        return self
+
+
 class BaseDeploymentConfig(BaseModel):
     """Base deployment config for SFT."""
 
@@ -183,6 +208,9 @@ class SFTConfig(BaseConfig):
     # The checkpoint configuration
     ckpt: CheckpointConfig | None = None
 
+    # Synthetic compaction training for local SFT diagnostics.
+    compaction: SFTCompactionConfig = SFTCompactionConfig()
+
     # The logging configuration
     log: TrainerLogConfig = TrainerLogConfig()
 
@@ -241,6 +269,23 @@ class SFTConfig(BaseConfig):
             "'quack_fused' uses quack-kernels for chunked linear + CE with CuTe DSL CUDA kernels."
         ),
     ] = "torch"
+
+    @model_validator(mode="after")
+    def validate_compaction(self):
+        if self.compaction.enabled:
+            if self.model.impl != "hf":
+                raise ValueError("SFT compaction requires model.impl='hf'")
+            if self.compaction.masked_forward_dispatch == "flex_attention":
+                if self.model.attn != "flex_attention":
+                    raise ValueError(
+                        "SFT compaction with flex_attention requires "
+                        "model.attn='flex_attention'"
+                    )
+                if self.loss_impl in ("liger_fused", "quack_fused"):
+                    raise ValueError(
+                        "SFT compaction does not support fused SFT loss_impl"
+                    )
+        return self
 
     heartbeat: Annotated[
         HeartbeatConfig | None, Field(description="The heartbeat config for monitoring training progress.")

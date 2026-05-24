@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -242,6 +242,76 @@ DeploymentConfig: TypeAlias = Annotated[
 ]
 
 
+_MISSING = object()
+
+_KV_EVICTION_DEFAULT_WINDOW_SIZE = 4096
+_KV_EVICTION_DEFAULT_STRIDE = 512
+_KV_EVICTION_DEFAULT_BLOCK_SIZE = 16
+_KV_EVICTION_DEFAULT_FILLER_TOKEN_ID = 151643
+
+
+def _cfg_get(container: Any, key: str, default: Any = None) -> Any:
+    if container is None:
+        return default
+    if isinstance(container, dict):
+        return container.get(key, default)
+    return getattr(container, key, default)
+
+
+def _cfg_set(container: Any, key: str, value: Any) -> None:
+    if isinstance(container, dict):
+        container[key] = value
+    else:
+        setattr(container, key, value)
+
+
+def _cfg_fields_set(container: Any) -> set[str]:
+    fields = getattr(container, "model_fields_set", None)
+    if fields is None:
+        return set()
+    return set(fields)
+
+
+def _cfg_was_set(container: Any, key: str) -> bool:
+    if container is None:
+        return False
+    if isinstance(container, dict):
+        return key in container
+    return key in _cfg_fields_set(container)
+
+
+def _cfg_child(container: Any, key: str) -> Any:
+    child = _cfg_get(container, key)
+    if child is None:
+        child = {}
+        _cfg_set(container, key, child)
+    return child
+
+
+def _cfg_set_missing(container: Any, key: str, value: Any) -> None:
+    if container is None:
+        return
+    if isinstance(container, dict):
+        container.setdefault(key, value)
+        return
+    if not _cfg_was_set(container, key) or getattr(container, key, None) is None:
+        setattr(container, key, value)
+
+
+def _cfg_explicit(container: Any, key: str) -> Any:
+    if _cfg_was_set(container, key):
+        return _cfg_get(container, key)
+    return _MISSING
+
+
+def _first_explicit_int(default: int, *candidates: tuple[Any, str]) -> int:
+    for container, key in candidates:
+        value = _cfg_explicit(container, key)
+        if value is not _MISSING and value is not None:
+            return int(value)
+    return default
+
+
 class RLConfig(BaseConfig):
     """Configures an RL training run."""
 
@@ -353,6 +423,112 @@ class RLConfig(BaseConfig):
     dry_run: Annotated[bool, Field(description="Only validate and dump resolved configs and exit early.")] = False
 
     ### Validate configs (e.g. raise for unsupported (combinations of) configs)
+
+    @model_validator(mode="before")
+    @classmethod
+    def auto_setup_markovian_kv_eviction(cls, data: Any):
+        """Expand orchestrator.markovian_thinker.kv_eviction into the coupled
+        trainer/orchestrator/vLLM flags before nested config validation.
+
+        This keeps the user-facing TOML small while preserving the existing
+        validators as the safety net for contradictory explicit overrides.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        orchestrator = _cfg_get(data, "orchestrator")
+        if orchestrator is None:
+            return data
+
+        mt = _cfg_get(orchestrator, "markovian_thinker")
+        if mt is None or not bool(_cfg_get(mt, "kv_eviction", False)):
+            return data
+
+        trainer = _cfg_get(data, "trainer")
+        inference = _cfg_get(data, "inference")
+        if trainer is None:
+            return data
+        if inference is None:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true requires "
+                "an [inference] config so RLConfig can set the matching "
+                "vLLM compaction arguments."
+            )
+
+        _cfg_set_missing(mt, "enabled", True)
+        _cfg_set_missing(orchestrator, "use_token_client", False)
+
+        padding = _cfg_child(orchestrator, "compaction_padding")
+        trainer_compaction = _cfg_child(trainer, "compaction")
+        trainer_model = _cfg_child(trainer, "model")
+        vllm_extra = _cfg_child(inference, "vllm_extra")
+
+        block_size = _first_explicit_int(
+            _KV_EVICTION_DEFAULT_BLOCK_SIZE,
+            (vllm_extra, "block_size"),
+            (trainer_compaction, "block_size"),
+            (padding, "block_size"),
+        )
+        window_size = _first_explicit_int(
+            _KV_EVICTION_DEFAULT_WINDOW_SIZE,
+            (vllm_extra, "compaction_window_size"),
+            (trainer_compaction, "window_size"),
+        )
+        stride = _first_explicit_int(
+            _KV_EVICTION_DEFAULT_STRIDE,
+            (vllm_extra, "compaction_stride"),
+            (trainer_compaction, "stride"),
+        )
+        protected_prefix = _first_explicit_int(
+            -1,
+            (vllm_extra, "compaction_protected_prefix_tokens"),
+            (trainer_compaction, "protected_prefix_tokens"),
+        )
+        filler_token_id = _first_explicit_int(
+            _KV_EVICTION_DEFAULT_FILLER_TOKEN_ID,
+            (vllm_extra, "compaction_filler_token_id"),
+            (padding, "filler_token_id"),
+        )
+
+        max_turns = int(_cfg_get(mt, "max_turns", 0) or 0)
+        eviction_turn_stride = int(_cfg_get(mt, "stride", None) or 1)
+
+        _cfg_set_missing(trainer_model, "impl", "hf")
+        _cfg_set_missing(trainer_model, "attn", "flash_attention_2")
+
+        _cfg_set_missing(trainer_compaction, "window_size", window_size)
+        _cfg_set_missing(trainer_compaction, "stride", stride)
+        _cfg_set_missing(trainer_compaction, "block_size", block_size)
+        _cfg_set_missing(
+            trainer_compaction, "protected_prefix_tokens", protected_prefix
+        )
+        _cfg_set_missing(trainer_compaction, "per_call_dispatch", True)
+
+        _cfg_set_missing(padding, "enabled", True)
+        _cfg_set_missing(padding, "block_size", block_size)
+        _cfg_set_missing(padding, "phase4_enabled", True)
+
+        _cfg_set_missing(inference, "enable_prefix_caching", True)
+        _cfg_set_missing(vllm_extra, "async_scheduling", False)
+        _cfg_set_missing(vllm_extra, "compaction_window_size", window_size)
+        _cfg_set_missing(vllm_extra, "compaction_stride", stride)
+        _cfg_set_missing(vllm_extra, "block_size", block_size)
+        _cfg_set_missing(
+            vllm_extra, "compaction_protected_prefix_tokens", protected_prefix
+        )
+        _cfg_set_missing(vllm_extra, "compaction_max_turns", max_turns)
+        _cfg_set_missing(
+            vllm_extra, "compaction_eviction_turn_stride", eviction_turn_stride
+        )
+        _cfg_set_missing(
+            vllm_extra, "compaction_assume_aligned_turn_boundaries", True
+        )
+        _cfg_set_missing(vllm_extra, "compaction_block_aligned_finish", True)
+        _cfg_set_missing(
+            vllm_extra, "compaction_filler_token_id", filler_token_id
+        )
+
+        return data
 
     @model_validator(mode="after")
     def validate_deployment(self):
@@ -474,10 +650,14 @@ class RLConfig(BaseConfig):
         inf_window = int(vllm_extra.get("compaction_window_size", 0) or 0)
         inf_stride = int(vllm_extra.get("compaction_stride", 0) or 0)
         inf_block_size = int(vllm_extra.get("block_size", 16) or 16)
+        inf_protected_prefix = int(
+            vllm_extra.get("compaction_protected_prefix_tokens", 0) or 0
+        )
 
         tr_window = self.trainer.compaction.window_size
         tr_stride = self.trainer.compaction.stride
         tr_block_size = self.trainer.compaction.block_size
+        tr_protected_prefix = self.trainer.compaction.protected_prefix_tokens
 
         compaction_in_use = tr_window > 0 or inf_window > 0
         if not compaction_in_use:
@@ -497,6 +677,13 @@ class RLConfig(BaseConfig):
                 f"block_size: trainer={tr_block_size}, inference.vllm_extra.block_size={inf_block_size} "
                 "(vLLM default is 16)"
             )
+        if tr_protected_prefix != inf_protected_prefix:
+            mismatches.append(
+                "protected_prefix_tokens: "
+                f"trainer={tr_protected_prefix}, "
+                "inference.vllm_extra.compaction_protected_prefix_tokens="
+                f"{inf_protected_prefix}"
+            )
 
         if mismatches:
             joined = "\n  - ".join(mismatches)
@@ -515,7 +702,8 @@ class RLConfig(BaseConfig):
     def validate_markovian_thinker(self):
         """Markovian Thinker assumes no KV compaction anywhere in the stack.
 
-        When ``orchestrator.markovian_thinker.enabled=True``, the
+        When ``orchestrator.markovian_thinker.enabled=True`` and
+        ``kv_eviction=False``, the
         orchestrator truncates ``messages`` client-side before each chat
         completion. vLLM then runs a normal full-context request with no
         compaction events. Enabling any other compaction / padding /
@@ -542,11 +730,20 @@ class RLConfig(BaseConfig):
         # relaxed for that one configuration. `validate_markovian_summary`
         # below enforces the positive invariants (at least one vLLM-side
         # compaction knob ON, max_len_summary fits, etc.).
-        summary_eviction_mode = (
-            mt.summary.enabled and mt.summary.mode == "eviction"
-        )
+        summary_eviction_mode = mt.summary.enabled and mt.summary.mode == "eviction"
+        kv_eviction_mode = mt.kv_eviction
+        eviction_mode = summary_eviction_mode or kv_eviction_mode
 
-        if self.inference is not None and not summary_eviction_mode:
+        if mt.summary.enabled and kv_eviction_mode:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true is "
+                "incompatible with markovian_thinker.summary.enabled=true. "
+                "The summary path rides on the Markovian truncation "
+                "interceptor, while kv_eviction uses block-aligned Phase4 "
+                "padding instead."
+            )
+
+        if self.inference is not None and not eviction_mode:
             vllm_extra = self.inference.vllm_extra or {}
             for k in ("compaction_window_size", "compaction_max_turns"):
                 v = int(vllm_extra.get(k, 0) or 0)
@@ -558,7 +755,7 @@ class RLConfig(BaseConfig):
                         "vLLM-side compaction must be disabled."
                     )
 
-        if self.trainer.compaction.window_size > 0 and not summary_eviction_mode:
+        if self.trainer.compaction.window_size > 0 and not eviction_mode:
             raise ValueError(
                 "orchestrator.markovian_thinker.enabled=true is incompatible "
                 "with trainer.compaction.window_size > 0. Markovian samples "
@@ -566,7 +763,7 @@ class RLConfig(BaseConfig):
                 "full-context forward."
             )
 
-        if self.orchestrator.compaction_padding.enabled and not summary_eviction_mode:
+        if self.orchestrator.compaction_padding.enabled and not eviction_mode:
             raise ValueError(
                 "orchestrator.markovian_thinker.enabled=true is incompatible "
                 "with orchestrator.compaction_padding.enabled=true. "
@@ -758,6 +955,98 @@ class RLConfig(BaseConfig):
                     "cache. Either flip enable_prefix_caching=true or "
                     "disable phase4_enabled."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_markovian_kv_eviction(self):
+        mt = self.orchestrator.markovian_thinker
+        if not mt.kv_eviction:
+            return self
+
+        if not mt.enabled:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true requires "
+                "orchestrator.markovian_thinker.enabled=true."
+            )
+        if self.inference is None:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true requires "
+                "an inference config."
+            )
+        if self.orchestrator.use_token_client:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true requires "
+                "orchestrator.use_token_client=false."
+            )
+
+        padding = self.orchestrator.compaction_padding
+        if not padding.enabled:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true requires "
+                "orchestrator.compaction_padding.enabled=true."
+            )
+        if not padding.phase4_enabled:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true requires "
+                "orchestrator.compaction_padding.phase4_enabled=true."
+            )
+        if self.inference.enable_prefix_caching is not True:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true requires "
+                "inference.enable_prefix_caching=true."
+            )
+
+        vllm_extra = self.inference.vllm_extra or {}
+        required_true = (
+            "compaction_assume_aligned_turn_boundaries",
+            "compaction_block_aligned_finish",
+        )
+        for key in required_true:
+            if vllm_extra.get(key) is not True:
+                raise ValueError(
+                    "orchestrator.markovian_thinker.kv_eviction=true "
+                    f"requires inference.vllm_extra.{key}=true."
+                )
+        if vllm_extra.get("async_scheduling") is not False:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true requires "
+                "inference.vllm_extra.async_scheduling=false."
+            )
+
+        max_turns = int(vllm_extra.get("compaction_max_turns", 0) or 0)
+        if max_turns != mt.max_turns:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true maps "
+                "markovian_thinker.max_turns to "
+                "inference.vllm_extra.compaction_max_turns. Got "
+                f"{mt.max_turns=} vs compaction_max_turns={max_turns}."
+            )
+        eviction_turn_stride = int(
+            vllm_extra.get("compaction_eviction_turn_stride", 0) or 0
+        )
+        expected_turn_stride = int(mt.stride or 1)
+        if eviction_turn_stride != expected_turn_stride:
+            raise ValueError(
+                "orchestrator.markovian_thinker.kv_eviction=true maps "
+                "markovian_thinker.stride to "
+                "inference.vllm_extra.compaction_eviction_turn_stride. Got "
+                f"stride={mt.stride} vs "
+                f"compaction_eviction_turn_stride={eviction_turn_stride}."
+            )
+
+        filler_id = vllm_extra.get("compaction_filler_token_id")
+        padding_filler_id = padding.filler_token_id
+        if padding_filler_id is not None and int(filler_id) != int(padding_filler_id):
+            raise ValueError(
+                "orchestrator.compaction_padding.filler_token_id must match "
+                "inference.vllm_extra.compaction_filler_token_id when "
+                "kv_eviction=true."
+            )
+
+        # Parent-level guard for callers that pass already-constructed nested
+        # TrainerConfig objects. The before-validator mutates those objects
+        # after their own model validators have already run.
+        self.trainer.compaction_requires_hf_flash_attn()
         return self
 
     ### Auto-setup and validate shared configs

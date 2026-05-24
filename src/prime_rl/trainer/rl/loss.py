@@ -153,6 +153,12 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
         "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),  # all trainable tokens
         "masked_mismatch_kl": _safe_mean(mismatch_kl, loss_mask & is_masked),  # all trainable, masked tokens
         "unmasked_mismatch_kl": _safe_mean(mismatch_kl, keep_mask),  # all trainable, unmasked tokens
+        "trainer_infer_logprob_delta": _safe_mean(log_importance_ratio, loss_mask),
+        "masked_trainer_infer_logprob_delta": _safe_mean(log_importance_ratio, loss_mask & is_masked),
+        "unmasked_trainer_infer_logprob_delta": _safe_mean(log_importance_ratio, keep_mask),
+        "trainer_infer_prob_delta": _safe_mean(probs_diff, loss_mask),
+        "masked_trainer_infer_prob_delta": _safe_mean(probs_diff, loss_mask & is_masked),
+        "unmasked_trainer_infer_prob_delta": _safe_mean(probs_diff, keep_mask),
         "is_masked": _safe_mean(is_masked, loss_mask),
         "is_masked_low": _safe_mean(is_masked_low, loss_mask),
         "is_masked_high": _safe_mean(is_masked_high, loss_mask),

@@ -184,9 +184,11 @@ async def orchestrate(config: OrchestratorConfig):
             f"phase4_enabled={config.compaction_padding.phase4_enabled})"
         )
 
-    # Install Markovian Thinker client-side message truncation
-    # (kv-eviction). No-op when markovian_thinker.enabled is False.
-    if config.markovian_thinker.enabled:
+    # Install Markovian Thinker client-side message truncation. In
+    # markovian_thinker.kv_eviction mode this section is only the high-level
+    # turn-eviction policy; the actual request interceptor is the
+    # block-aligned padding / Phase4 path above, not client-side truncation.
+    if config.markovian_thinker.enabled and not config.markovian_thinker.kv_eviction:
         from kv_eviction.env import configure_markovian_thinker
 
         configure_markovian_thinker(
@@ -798,7 +800,7 @@ async def orchestrate(config: OrchestratorConfig):
         # metrics. Keys are absent when the feature is disabled (pop
         # returns zero counters, but we only emit when enabled to keep
         # the metric surface clean).
-        if config.markovian_thinker.enabled:
+        if config.markovian_thinker.enabled and not config.markovian_thinker.kv_eviction:
             from kv_eviction.env import pop_markovian_stats
 
             mt_stats = pop_markovian_stats()

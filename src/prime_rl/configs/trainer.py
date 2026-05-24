@@ -697,6 +697,7 @@ class AdamWConfig(BaseOptimizerConfig):
 
     betas1: Annotated[float, Field(ge=0)] = 0.9
     betas2: Annotated[float, Field(ge=0)] = 0.999
+    foreach: bool | None = None
 
 
 class MuonConfig(BaseOptimizerConfig):

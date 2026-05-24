@@ -1735,12 +1735,26 @@ def train(config: TrainerConfig):
                                 .detach()
                                 .to("cpu", dtype=torch.float32)
                             )
+                            accumulated_loss_tensors.setdefault(
+                                "trainer_infer_logprob_delta_token_weighted", []
+                            ).append(
+                                seg_log_ratio[seg_loss_mask_1d]
+                                .detach()
+                                .to("cpu", dtype=torch.float32)
+                            )
+                            seg_prob_delta = torch.exp(seg_trainer_lp_1d) - torch.exp(
+                                seg_inf_lp_1d
+                            )
+                            accumulated_loss_tensors.setdefault(
+                                "trainer_infer_prob_delta_token_weighted", []
+                            ).append(
+                                seg_prob_delta[seg_loss_mask_1d]
+                                .detach()
+                                .to("cpu", dtype=torch.float32)
+                            )
 
                             if isinstance(config.loss, DefaultLossConfig):
-                                seg_prob_diff = (
-                                    torch.exp(seg_trainer_lp_1d)
-                                    - torch.exp(seg_inf_lp_1d)
-                                )
+                                seg_prob_diff = seg_prob_delta
                                 seg_dppo_high = (
                                     seg_prob_diff > config.loss.dppo_mask_high
                                 )
@@ -1763,12 +1777,44 @@ def train(config: TrainerConfig):
                                         .detach()
                                         .to("cpu", dtype=torch.float32)
                                     )
+                                    accumulated_loss_tensors.setdefault(
+                                        "unmasked_trainer_infer_logprob_delta_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_log_ratio[seg_keep_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                    accumulated_loss_tensors.setdefault(
+                                        "unmasked_trainer_infer_prob_delta_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_prob_delta[seg_keep_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
                                 if seg_masked_mask.any():
                                     accumulated_loss_tensors.setdefault(
                                         "masked_mismatch_kl_token_weighted",
                                         [],
                                     ).append(
                                         seg_token_kl[seg_masked_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                    accumulated_loss_tensors.setdefault(
+                                        "masked_trainer_infer_logprob_delta_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_log_ratio[seg_masked_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                    accumulated_loss_tensors.setdefault(
+                                        "masked_trainer_infer_prob_delta_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_prob_delta[seg_masked_mask]
                                         .detach()
                                         .to("cpu", dtype=torch.float32)
                                     )
@@ -2210,6 +2256,13 @@ def train(config: TrainerConfig):
             step_message += f" | Unmasked KL: {tensor_stats['unmasked_mismatch_kl/mean']:.4f}"
         if "masked_mismatch_kl/mean" in tensor_stats:
             step_message += f" | Masked KL: {tensor_stats['masked_mismatch_kl/mean']:.4f}"
+        if "is_masked/mean" in tensor_stats:
+            step_message += f" | Masked Frac: {tensor_stats['is_masked/mean']:.3f}"
+        if "unmasked_trainer_infer_logprob_delta/mean" in tensor_stats:
+            step_message += (
+                " | Unmasked dLP: "
+                f"{tensor_stats['unmasked_trainer_infer_logprob_delta/mean']:.4f}"
+            )
         if "mismatch_kl_token_weighted/mean" in tensor_stats:
             step_message += f" | Token KL: {tensor_stats['mismatch_kl_token_weighted/mean']:.4f}"
         if "unmasked_mismatch_kl_token_weighted/mean" in tensor_stats:
@@ -2221,6 +2274,16 @@ def train(config: TrainerConfig):
             step_message += (
                 " | Token Masked KL: "
                 f"{tensor_stats['masked_mismatch_kl_token_weighted/mean']:.4f}"
+            )
+        if "unmasked_trainer_infer_logprob_delta_token_weighted/mean" in tensor_stats:
+            step_message += (
+                " | Token Unmasked dLP: "
+                f"{tensor_stats['unmasked_trainer_infer_logprob_delta_token_weighted/mean']:.4f}"
+            )
+        if "masked_trainer_infer_logprob_delta_token_weighted/mean" in tensor_stats:
+            step_message += (
+                " | Token Masked dLP: "
+                f"{tensor_stats['masked_trainer_infer_logprob_delta_token_weighted/mean']:.4f}"
             )
         if "distill/student_teacher_kl/mean" in tensor_stats:
             step_message += (

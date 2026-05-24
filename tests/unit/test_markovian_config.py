@@ -47,6 +47,110 @@ def test_markovian_on_valid_config_accepted():
     RLConfig(**_base_rl_config())
 
 
+def test_markovian_kv_eviction_expands_coupled_flags():
+    """kv_eviction=true is the single high-level switch for the full
+    trainer/orchestrator/vLLM eviction stack."""
+    inference = InferenceConfig()
+    orch = OrchestratorConfig(
+        markovian_thinker=MarkovianThinkerConfig(
+            enabled=True,
+            kv_eviction=True,
+            max_turns=2,
+            stride=1,
+        ),
+    )
+    config = RLConfig(
+        trainer=TrainerConfig(),
+        orchestrator=orch,
+        inference=inference,
+    )
+
+    assert config.orchestrator.use_token_client is False
+    assert config.orchestrator.compaction_padding.enabled is True
+    assert config.orchestrator.compaction_padding.phase4_enabled is True
+
+    assert config.trainer.model.impl == "hf"
+    assert config.trainer.model.attn == "flash_attention_2"
+    assert config.trainer.compaction.window_size == 4096
+    assert config.trainer.compaction.stride == 512
+    assert config.trainer.compaction.block_size == 16
+    assert config.trainer.compaction.protected_prefix_tokens == -1
+    assert config.trainer.compaction.per_call_dispatch is True
+
+    assert config.inference is not None
+    assert config.inference.enable_prefix_caching is True
+    assert config.inference.vllm_extra["async_scheduling"] is False
+    assert config.inference.vllm_extra["compaction_window_size"] == 4096
+    assert config.inference.vllm_extra["compaction_stride"] == 512
+    assert config.inference.vllm_extra["block_size"] == 16
+    assert config.inference.vllm_extra["compaction_protected_prefix_tokens"] == -1
+    assert config.inference.vllm_extra["compaction_max_turns"] == 2
+    assert config.inference.vllm_extra["compaction_eviction_turn_stride"] == 1
+    assert (
+        config.inference.vllm_extra["compaction_assume_aligned_turn_boundaries"]
+        is True
+    )
+    assert config.inference.vllm_extra["compaction_block_aligned_finish"] is True
+    assert config.inference.vllm_extra["compaction_filler_token_id"] == 151643
+
+
+def test_markovian_kv_eviction_respects_window_override():
+    inference = InferenceConfig()
+    inference.vllm_extra = {"compaction_window_size": 8192}
+    orch = OrchestratorConfig(
+        markovian_thinker=MarkovianThinkerConfig(
+            enabled=True,
+            kv_eviction=True,
+            max_turns=2,
+        ),
+    )
+    config = RLConfig(
+        trainer=TrainerConfig(),
+        orchestrator=orch,
+        inference=inference,
+    )
+
+    assert config.trainer.compaction.window_size == 8192
+    assert config.inference is not None
+    assert config.inference.vllm_extra["compaction_window_size"] == 8192
+
+
+def test_markovian_kv_eviction_rejects_explicit_tito():
+    inference = InferenceConfig()
+    orch = OrchestratorConfig(
+        markovian_thinker=MarkovianThinkerConfig(
+            enabled=True,
+            kv_eviction=True,
+            max_turns=2,
+        ),
+        use_token_client=True,
+    )
+    with pytest.raises(ValidationError, match="use_token_client=false"):
+        RLConfig(
+            trainer=TrainerConfig(),
+            orchestrator=orch,
+            inference=inference,
+        )
+
+
+def test_markovian_kv_eviction_rejects_async_scheduling():
+    inference = InferenceConfig()
+    inference.vllm_extra = {"async_scheduling": True}
+    orch = OrchestratorConfig(
+        markovian_thinker=MarkovianThinkerConfig(
+            enabled=True,
+            kv_eviction=True,
+            max_turns=2,
+        ),
+    )
+    with pytest.raises(ValidationError, match="async_scheduling=false"):
+        RLConfig(
+            trainer=TrainerConfig(),
+            orchestrator=orch,
+            inference=inference,
+        )
+
+
 def test_markovian_rejects_vllm_compaction_window_size():
     inference = InferenceConfig()
     inference.vllm_extra = {"compaction_window_size": 1024}

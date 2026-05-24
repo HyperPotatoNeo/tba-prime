@@ -1028,21 +1028,28 @@ class MarkovianSummaryConfig(BaseConfig):
 
 
 class MarkovianThinkerConfig(BaseConfig):
-    """Client-side message truncation baseline for multi-turn RL.
+    """Turn-count policy for multi-turn RL context management.
 
-    When enabled, the orchestrator truncates the ``messages`` list to the
-    most recent ``max_turns`` complete conversation turn groups BEFORE
-    sending each chat completion request to vLLM. vLLM sees normal
+    In the default mode (``kv_eviction=False``), enabling this config uses the
+    Markovian Thinker baseline: the orchestrator truncates the ``messages``
+    list to the most recent ``max_turns`` complete conversation turn groups
+    BEFORE sending each chat completion request to vLLM. vLLM sees normal
     full-context completions with no compaction, no eviction, no
     ``CompactionEvent``s. Training uses the standard full-context forward
     (no ``segmented_forward``).
+
+    In KV-eviction mode (``kv_eviction=True``), this section instead becomes
+    the single high-level switch for turn-based vLLM KV eviction. ``max_turns``
+    maps to vLLM's ``compaction_max_turns`` and ``stride`` maps to
+    ``compaction_eviction_turn_stride``. RLConfig expands the remaining
+    coupled trainer/orchestrator/vLLM knobs automatically.
 
     A "turn group" is the atomic unit ending at each assistant message
     without ``tool_calls``. The system prefix (leading non-user messages)
     and in-flight tail (messages after the last terminal assistant) are
     always preserved — see ``plans/markovian_thinker_baseline.md``.
 
-    Incompatible with:
+    In baseline mode (``kv_eviction=False``), incompatible with:
     - ``inference.vllm_extra.compaction_window_size > 0``
     - ``trainer.compaction.window_size > 0``
     - ``orchestrator.compaction_padding.enabled = true``
@@ -1055,7 +1062,26 @@ class MarkovianThinkerConfig(BaseConfig):
 
     enabled: Annotated[
         bool,
-        Field(description="Master switch for Markovian Thinker truncation."),
+        Field(
+            description=(
+                "Master switch for this turn-count policy. With "
+                "kv_eviction=false this enables Markovian truncation; with "
+                "kv_eviction=true this enables turn-based KV eviction setup."
+            )
+        ),
+    ] = False
+
+    kv_eviction: Annotated[
+        bool,
+        Field(
+            description=(
+                "When true, use this section as the high-level policy for "
+                "turn-based vLLM KV eviction instead of client-side "
+                "Markovian truncation. RLConfig expands the required "
+                "trainer.compaction, orchestrator.compaction_padding, and "
+                "inference.vllm_extra fields from max_turns/stride."
+            ),
+        ),
     ] = False
 
     max_turns: Annotated[
@@ -1089,7 +1115,9 @@ class MarkovianThinkerConfig(BaseConfig):
                 "last `stride` real turn groups are preserved in front of "
                 "the tail, producing `sys + last_N_body + tail + [I, S] + "
                 "[U_resume]`. With stride=None (default), N=0 — i.e. a "
-                "strict full reset to `sys + tail + [I, S] + [U_resume]`."
+                "strict full reset to `sys + tail + [I, S] + [U_resume]`. "
+                "In kv_eviction mode, this maps to vLLM's "
+                "compaction_eviction_turn_stride; None means 1."
             ),
         ),
     ] = None

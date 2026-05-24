@@ -55,6 +55,11 @@ from prime_rl.trainer.models.layers.lm_head import FUSED_CE_IGNORE_INDEX
 
 from torchtitan.distributed.utils import clip_grad_norm_
 
+try:
+    from kv_eviction.segmented_forward import flex_mask_segmented_forward
+except ImportError:  # pragma: no cover - optional experiment dependency
+    flex_mask_segmented_forward = None
+
 
 @clean_exit
 def train(config: SFTConfig):
@@ -155,8 +160,17 @@ def train(config: SFTConfig):
 
     # Set up the dataset and dataloader
     logger.info(f"Initializing data ({config.data})")
-    dataset = setup_dataset(tokenizer, config.data, config.model.cp)
-    dataloader = setup_dataloader(dataset, config.data)
+    dataset = setup_dataset(
+        tokenizer,
+        config.data,
+        config.model.cp,
+        compaction_config=config.compaction if config.compaction.enabled else None,
+    )
+    dataloader = setup_dataloader(
+        dataset,
+        config.data,
+        config.compaction if config.compaction.enabled else None,
+    )
     dataiter = iter(dataloader)
 
     val_raw_dataset = None
@@ -219,7 +233,50 @@ def train(config: SFTConfig):
         token_count = loss_mask.sum(dtype=torch.int64)
 
         with maybe_activation_offloading(config.model.ac_offloading):
-            if config.loss_impl in ("liger_fused", "quack_fused"):
+            if (
+                config.compaction.enabled
+                and config.compaction.masked_forward_dispatch == "flex_attention"
+            ):
+                if flex_mask_segmented_forward is None:
+                    raise RuntimeError(
+                        "SFT compaction requires kv_eviction.flex_mask_segmented_forward"
+                    )
+                calls = micro_batch.get("calls")
+                if calls is None:
+                    raise RuntimeError("SFT compaction batch is missing CallWire data")
+
+                def _sft_compaction_loss(
+                    seg_logits: torch.Tensor,
+                    full_logit_start: int,
+                    full_logit_end: int,
+                ) -> torch.Tensor:
+                    effective_end = min(int(full_logit_end), target_ids.shape[1])
+                    if effective_end <= int(full_logit_start):
+                        return seg_logits.sum() * 0.0
+                    width = effective_end - int(full_logit_start)
+                    seg_logits = seg_logits[:, :width, :]
+                    seg_targets = target_ids[:, full_logit_start:effective_end]
+                    seg_mask = loss_mask[:, full_logit_start:effective_end]
+                    if not bool(seg_mask.any().item()):
+                        return seg_logits.sum() * 0.0
+                    B, L, V = seg_logits.shape
+                    token_loss = ce_loss(
+                        seg_logits.reshape(B * L, V),
+                        seg_targets.reshape(B * L),
+                    ).view(B, L)
+                    return token_loss[seg_mask].sum()
+
+                out = flex_mask_segmented_forward(
+                    model=model,
+                    calls=calls,
+                    merged_input_ids=input_ids,
+                    merged_position_ids=position_ids,
+                    loss_fn=_sft_compaction_loss,
+                    device=input_ids.device,
+                    backward=False,
+                )
+                loss_sum = out["loss"]
+            elif config.loss_impl in ("liger_fused", "quack_fused"):
                 masked_target_ids = target_ids.clone()
                 masked_target_ids[~loss_mask] = FUSED_CE_IGNORE_INDEX
                 out = forward(model, input_ids, position_ids, labels=masked_target_ids)
@@ -261,9 +318,18 @@ def train(config: SFTConfig):
 
     def run_validation(step: int) -> None:
         val_dataset = setup_dataset(
-            tokenizer, config.val.data, config.model.cp, max_epochs=1, raw_dataset=val_raw_dataset
+            tokenizer,
+            config.val.data,
+            config.model.cp,
+            max_epochs=1,
+            raw_dataset=val_raw_dataset,
+            compaction_config=config.compaction if config.compaction.enabled else None,
         )
-        val_dataloader = setup_dataloader(val_dataset, config.val.data)
+        val_dataloader = setup_dataloader(
+            val_dataset,
+            config.val.data,
+            config.compaction if config.compaction.enabled else None,
+        )
 
         # No train/eval switch: no dropout in these models, and toggling would trigger torch.compile recompilation
         mean_loss, nan_count = run_eval_loop(val_dataloader)
