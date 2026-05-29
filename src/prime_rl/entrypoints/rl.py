@@ -564,6 +564,12 @@ def rl(config: RLConfig):
         if resume_step is not None:
             get_logger().info(f"Resuming from step {resume_step}, cleaning future rollouts and broadcasts")
             clean_future_steps(config.output_dir, resume_step)
+        else:
+            get_logger().warning(
+                "Resume was requested but no trainer checkpoint was found; "
+                "cleaning stale rollout and broadcast step directories before starting from scratch"
+            )
+            clean_future_steps(config.output_dir, -1)
 
     if config.slurm is not None:
         rl_slurm(config)

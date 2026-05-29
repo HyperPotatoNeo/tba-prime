@@ -9,7 +9,7 @@ from pydantic_config import ConfigFileError
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
-from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.sft import SFTCompactionConfig, SFTConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli
@@ -156,9 +156,32 @@ def test_removed_fused_lm_head_chunk_size_field_is_rejected():
         TrainerModelConfig.model_validate({"fused_lm_head_chunk_size": "auto"})
 
 
+def test_trainer_model_defaults_to_flex_attention():
+    config = TrainerModelConfig.model_validate({})
+
+    assert config.attn == "flex_attention"
+
+
 def test_selective_activation_checkpointing_requires_custom_impl():
     with pytest.raises(ValidationError, match="Selective activation checkpointing requires model.impl='custom'"):
         TrainerModelConfig.model_validate({"impl": "hf", "ac": {"mode": "selective"}})
+
+
+def test_compaction_with_flex_attention_defaults_to_masked_dispatch():
+    config = TrainerConfig.model_validate(
+        {
+            "model": {"impl": "hf"},
+            "compaction": {
+                "window_size": 1024,
+                "stride": 16,
+                "block_size": 16,
+            },
+        }
+    )
+
+    assert config.model.attn == "flex_attention"
+    assert config.compaction.masked_forward_dispatch == "flex_attention"
+    assert config.compaction.bptt_segments == -1
 
 
 def test_flex_attention_masked_dispatch_forces_full_bptt():
@@ -194,6 +217,46 @@ def test_flex_debug_is_legacy_alias_for_flex_attention_dispatch():
 
     assert config.compaction.masked_forward_dispatch == "flex_attention"
     assert config.compaction.bptt_segments == -1
+
+
+def test_sft_compaction_accepts_mixed_eviction_policies():
+    config = SFTConfig.model_validate(
+        {
+            "model": {"impl": "hf", "attn": "flex_attention"},
+            "compaction": {
+                "enabled": True,
+                "masked_forward_dispatch": "flex_attention",
+                "policy_sampling": "uniform_per_access",
+                "policy_seed": 42,
+                "policies": [
+                    {"name": "t2_s2", "max_turns": 2, "eviction_turn_stride": 2},
+                    {"name": "t10_s5", "max_turns": 10, "eviction_turn_stride": 5},
+                ],
+            },
+        }
+    )
+
+    assert config.compaction.policy_sampling == "uniform_per_access"
+    assert [policy.name for policy in config.compaction.policies or []] == [
+        "t2_s2",
+        "t10_s5",
+    ]
+
+
+def test_sft_compaction_rejects_invalid_mixed_policy_stride():
+    with pytest.raises(ValidationError, match="eviction_turn_stride"):
+        SFTCompactionConfig.model_validate(
+            {
+                "policies": [
+                    {"name": "bad", "max_turns": 2, "eviction_turn_stride": 3},
+                ],
+            }
+        )
+
+
+def test_sft_compaction_sampling_requires_policies():
+    with pytest.raises(ValidationError, match="policy_sampling"):
+        SFTCompactionConfig.model_validate({"policy_sampling": "uniform_per_access"})
 
 
 def test_flex_attention_masked_dispatch_requires_eviction():

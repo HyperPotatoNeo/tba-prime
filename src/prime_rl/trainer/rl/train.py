@@ -22,7 +22,14 @@ def _mem_snap(tag: str) -> str:
     alloc = _t.cuda.memory_allocated() / 1e9
     peak = _t.cuda.max_memory_allocated() / 1e9
     reserved = _t.cuda.memory_reserved() / 1e9
-    return f"[MEM] {tag} alloc={alloc:.3f}GB peak={peak:.3f}GB reserved={reserved:.3f}GB"
+    try:
+        import psutil as _psutil
+
+        rss = _psutil.Process(os.getpid()).memory_info().rss / 1e9
+        rss_part = f" rss={rss:.3f}GB"
+    except Exception:
+        rss_part = ""
+    return f"[MEM] {tag} alloc={alloc:.3f}GB peak={peak:.3f}GB reserved={reserved:.3f}GB{rss_part}"
 from datetime import timedelta
 
 # Import environment before any other imports

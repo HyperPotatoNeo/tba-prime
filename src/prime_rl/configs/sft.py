@@ -14,6 +14,7 @@ from prime_rl.configs.trainer import (
     AdamWConfig,
     BenchConfig,
     CheckpointConfig,
+    CompactionDistillationConfig,
     ConstantSchedulerConfig,
     GCConfig,
     ModelConfig,
@@ -117,6 +118,22 @@ class SFTValConfig(BaseConfig):
 DataConfig: TypeAlias = Annotated[FakeDataConfig | SFTDataConfig, Field(discriminator="type")]
 
 
+class SFTCompactionPolicyConfig(BaseConfig):
+    """One synthetic turn-eviction policy for mixed-policy SFT."""
+
+    name: Annotated[str, Field(min_length=1)]
+    max_turns: Annotated[int, Field(ge=1)] = 1
+    eviction_turn_stride: Annotated[int, Field(ge=1)] = 1
+
+    @model_validator(mode="after")
+    def validate_stride(self):
+        if self.eviction_turn_stride > self.max_turns:
+            raise ValueError(
+                "compaction policy eviction_turn_stride must be <= max_turns"
+            )
+        return self
+
+
 class SFTCompactionConfig(BaseConfig):
     """Synthetic turn-eviction config for local SFT diagnostics."""
 
@@ -126,10 +143,15 @@ class SFTCompactionConfig(BaseConfig):
     protected_prefix_tokens: Annotated[int, Field(ge=-1)] = -1
     block_size: Annotated[int, Field(ge=1)] = 16
     masked_forward_dispatch: Literal["off", "flex_attention", "flex_debug"] = "off"
+    supervised_loss_coef: Annotated[float, Field(ge=0)] = 1.0
+    distillation: CompactionDistillationConfig = CompactionDistillationConfig()
     log_full_context: bool = False
     log_base_model: bool = False
     base_model_name: str | None = None
     base_model_dtype: Literal["float32", "bfloat16"] = "bfloat16"
+    policies: Annotated[list[SFTCompactionPolicyConfig] | None, Field(min_length=1)] = None
+    policy_sampling: Literal["fixed", "uniform_per_trace", "uniform_per_access"] = "fixed"
+    policy_seed: int = 0
 
     @model_validator(mode="after")
     def normalize(self):
@@ -138,6 +160,10 @@ class SFTCompactionConfig(BaseConfig):
         if self.eviction_turn_stride > self.max_turns:
             raise ValueError(
                 "compaction.eviction_turn_stride must be <= compaction.max_turns"
+            )
+        if self.policies is None and self.policy_sampling != "fixed":
+            raise ValueError(
+                "compaction.policy_sampling requires compaction.policies"
             )
         return self
 

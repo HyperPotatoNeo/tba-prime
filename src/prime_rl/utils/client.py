@@ -223,12 +223,15 @@ NCCL_READY_MARKER = "NCCL_READY"
 
 
 async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
-    """Pause all inference engines, waiting for in-flight requests to drain."""
+    """Abort in-flight requests and pause all inference engines for weight sync."""
     logger = get_logger()
     logger.info("Pausing inference engines for weight update")
 
     async def _pause(client: AsyncClient) -> None:
-        response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
+        response = await client.post(
+            "/pause",
+            params={"mode": "abort", "clear_cache": "false"},
+        )
         response.raise_for_status()
 
     await asyncio.gather(*[_pause(client) for client in admin_clients])
@@ -255,9 +258,10 @@ async def update_weights(
 ) -> None:
     """Update weights on static inference servers.
 
-    Pauses all engines first to drain in-flight requests, then performs the
-    weight update, then resumes. This ensures all DP workers are idle and can
-    participate in the collective weight transfer.
+    Aborts any in-flight server-side requests before performing the weight
+    update, then resumes. This ensures all DP workers are idle and can
+    participate in the collective weight transfer without retaining old KV
+    state.
 
     Note: The server-side /update_weights endpoint automatically resets the prefix cache
     to invalidate any cached KV states computed with the old weights.
@@ -271,10 +275,15 @@ async def update_weights(
     else:
 
         async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
-            response = await admin_client.post("/update_weights", json={"weight_dir": weight_dir})
+            response = await admin_client.post(
+                "/update_weights",
+                json={"weight_dir": weight_dir},
+            )
             response.raise_for_status()
 
-        # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
+        # Abort any server-side stragglers before the collective weight update.
+        # The scheduler requeues tracked rollout slots before this call when
+        # retained KV state would be invalidated by the prefix-cache reset.
         await _pause_engines(admin_clients)
 
         try:

@@ -185,6 +185,9 @@ class ElasticInferencePool:
                         base_url=urls,
                         api_key_var=self.client_config.api_key_var,
                         headers=self.client_config.headers,
+                        extra_headers_from_state=(
+                            self.client_config.extra_headers_from_state
+                        ),
                         dp_rank_count=self.client_config.dp_rank_count,
                     ),
                     client_type=self.client_type,

@@ -70,12 +70,14 @@ def test_markovian_kv_eviction_expands_coupled_flags():
     assert config.orchestrator.compaction_padding.phase4_enabled is True
 
     assert config.trainer.model.impl == "hf"
-    assert config.trainer.model.attn == "flash_attention_2"
+    assert config.trainer.model.attn == "flex_attention"
     assert config.trainer.compaction.window_size == 4096
     assert config.trainer.compaction.stride == 512
     assert config.trainer.compaction.block_size == 16
     assert config.trainer.compaction.protected_prefix_tokens == -1
     assert config.trainer.compaction.per_call_dispatch is True
+    assert config.trainer.compaction.masked_forward_dispatch == "flex_attention"
+    assert config.trainer.compaction.bptt_segments == -1
 
     assert config.inference is not None
     assert config.inference.enable_prefix_caching is True
@@ -92,6 +94,63 @@ def test_markovian_kv_eviction_expands_coupled_flags():
     )
     assert config.inference.vllm_extra["compaction_block_aligned_finish"] is True
     assert config.inference.vllm_extra["compaction_filler_token_id"] == 151643
+
+
+def test_markovian_kv_eviction_eval_concurrency_defaults_and_opt_out():
+    config = RLConfig(
+        trainer=TrainerConfig(),
+        orchestrator={
+            "markovian_thinker": {
+                "enabled": True,
+                "kv_eviction": True,
+                "max_turns": 2,
+            },
+            "eval": {},
+        },
+        inference=InferenceConfig(),
+    )
+
+    assert config.orchestrator.eval is not None
+    assert config.orchestrator.eval.max_concurrent == 32
+    assert config.orchestrator.eval.env[0].max_concurrent == 32
+
+    uncapped = RLConfig(
+        trainer=TrainerConfig(),
+        orchestrator={
+            "markovian_thinker": {
+                "enabled": True,
+                "kv_eviction": True,
+                "max_turns": 2,
+            },
+            "eval": {"max_concurrent": None},
+        },
+        inference=InferenceConfig(),
+    )
+
+    assert uncapped.orchestrator.eval is not None
+    assert uncapped.orchestrator.eval.max_concurrent is None
+    assert uncapped.orchestrator.eval.env[0].max_concurrent is None
+
+
+def test_markovian_kv_eviction_respects_explicit_flash_replay():
+    inference = InferenceConfig()
+    orch = OrchestratorConfig(
+        markovian_thinker=MarkovianThinkerConfig(
+            enabled=True,
+            kv_eviction=True,
+            max_turns=2,
+            stride=1,
+        ),
+    )
+    config = RLConfig(
+        trainer={"model": {"impl": "hf", "attn": "flash_attention_2"}},
+        orchestrator=orch,
+        inference=inference,
+    )
+
+    assert config.trainer.model.attn == "flash_attention_2"
+    assert config.trainer.compaction.masked_forward_dispatch == "off"
+    assert config.trainer.compaction.bptt_segments == 1
 
 
 def test_markovian_kv_eviction_respects_window_override():

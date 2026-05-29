@@ -33,6 +33,7 @@ from prime_rl.trainer.model import (
 from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.sft.data import load_sft_dataset, setup_dataloader, setup_dataset
+from prime_rl.trainer.rl.distillation import compute_reverse_kl_terms
 from prime_rl.trainer.utils import (
     GarbageCollection,
     MemoryProfiler,
@@ -244,6 +245,12 @@ def train(config: SFTConfig):
                 calls = micro_batch.get("calls")
                 if calls is None:
                     raise RuntimeError("SFT compaction batch is missing CallWire data")
+                distill_cfg = config.compaction.distillation
+                distill_enabled = distill_cfg.enabled
+                if distill_enabled and distill_cfg.loss_coef <= 0:
+                    raise RuntimeError(
+                        "SFT compaction distillation requires compaction.distillation.loss_coef > 0"
+                    )
 
                 def _sft_compaction_loss(
                     seg_logits: torch.Tensor,
@@ -264,7 +271,35 @@ def train(config: SFTConfig):
                         seg_logits.reshape(B * L, V),
                         seg_targets.reshape(B * L),
                     ).view(B, L)
-                    return token_loss[seg_mask].sum()
+                    return (
+                        config.compaction.supervised_loss_coef
+                        * token_loss[seg_mask].sum()
+                    )
+
+                def _sft_distillation_loss(
+                    student_logits: torch.Tensor,
+                    teacher_logits: torch.Tensor,
+                    full_logit_start: int,
+                    full_logit_end: int,
+                ) -> torch.Tensor:
+                    effective_end = min(int(full_logit_end), target_ids.shape[1])
+                    if effective_end <= int(full_logit_start):
+                        return student_logits.sum() * 0.0
+                    width = effective_end - int(full_logit_start)
+                    student_logits = student_logits[:, :width, :]
+                    teacher_logits = teacher_logits[:, :width, :]
+                    distill_targets = target_ids[:, full_logit_start:effective_end]
+                    distill_mask = loss_mask[:, full_logit_start:effective_end].bool()
+                    if not bool(distill_mask.any().item()):
+                        return student_logits.sum() * 0.0
+                    terms = compute_reverse_kl_terms(
+                        student_logits=student_logits,
+                        teacher_logits=teacher_logits,
+                        labels=distill_targets,
+                        estimator=distill_cfg.estimator,
+                        top_k=distill_cfg.top_k,
+                    )
+                    return distill_cfg.loss_coef * terms.kl[distill_mask].sum()
 
                 out = flex_mask_segmented_forward(
                     model=model,
@@ -272,6 +307,7 @@ def train(config: SFTConfig):
                     merged_input_ids=input_ids,
                     merged_position_ids=position_ids,
                     loss_fn=_sft_compaction_loss,
+                    distillation_fn=_sft_distillation_loss if distill_enabled else None,
                     device=input_ids.device,
                     backward=False,
                 )

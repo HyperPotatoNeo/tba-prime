@@ -235,10 +235,24 @@ class EvalEnv(Env):
     ) -> None:
         num_examples = len(self.examples)
         rollouts_per_example = self.config.rollouts_per_example
-        get_logger().info(f"Evaluating {self.name} ({num_examples=}, {rollouts_per_example=})")
+        get_logger().info(
+            f"Evaluating {self.name} ({num_examples=}, "
+            f"{rollouts_per_example=}, max_concurrent={self.config.max_concurrent})"
+        )
         total_rollouts = num_examples * rollouts_per_example
         pbar = ProgressTracker(total=total_rollouts, desc=f"Evaluating {self.name}")
         eval_start = time.perf_counter()
+        semaphore = (
+            asyncio.Semaphore(self.config.max_concurrent)
+            if self.config.max_concurrent is not None
+            else None
+        )
+
+        async def run_limited(coro: Awaitable[list[vf.RolloutOutput] | None]):
+            if semaphore is None:
+                return await coro
+            async with semaphore:
+                return await coro
 
         if self.requires_group_scoring:
 
@@ -259,7 +273,10 @@ class EvalEnv(Env):
                     pbar.update(rollouts_per_example)
                     return None
 
-            coros = [run_with_progress(example) for example in self.examples]
+            coros = [
+                run_limited(run_with_progress(example))
+                for example in self.examples
+            ]
 
         else:
 
@@ -275,7 +292,11 @@ class EvalEnv(Env):
                     pbar.update(1)
                     return None
 
-            coros = [run_with_progress(example) for example in self.examples for _ in range(rollouts_per_example)]
+            coros = [
+                run_limited(run_with_progress(example))
+                for example in self.examples
+                for _ in range(rollouts_per_example)
+            ]
 
         try:
             results = await asyncio.gather(*coros)
@@ -309,6 +330,7 @@ class EvalEnv(Env):
         rows = [
             {
                 "example_id": o["example_id"],
+                "task": o.get("task"),
                 "reward": o["reward"],
                 "completion_len": get_completion_len(o),
                 "is_truncated": o["is_truncated"],
@@ -318,6 +340,9 @@ class EvalEnv(Env):
             for o in successful_outputs
         ]
         results_df = pd.DataFrame(rows)
+        is_textworld = self.config.stripped_id == "textworld-env"
+        if is_textworld:
+            results_df["hard_success"] = results_df.reward.fillna(0.0) >= 1.0
 
         unique_rewards = results_df.reward.dropna().unique()
         could_be_binary = set(unique_rewards).issubset({0.0, 1.0})
@@ -334,6 +359,11 @@ class EvalEnv(Env):
         message = (
             f"Evaluated {self.name} in {eval_time:.2f}s (Avg@{rollouts_per_example}={results_df.reward.mean():.4f}"
         )
+        if is_textworld:
+            message += (
+                f", Success: {results_df.reward.mean():.4f}"
+                f", Hard Success: {results_df.hard_success.mean():.4f}"
+            )
         if could_be_binary:
             assert pass_at_k is not None
             for pass_rate, pass_rate_score in pd.Series(pass_at_k.mean()).items():
@@ -357,6 +387,27 @@ class EvalEnv(Env):
             "failed_rollouts": failed_count / total_rollouts,
             "time": eval_time,
         }
+        if is_textworld:
+            eval_metrics.update(
+                {
+                    "success_rate": float(results_df.reward.mean()),
+                    "hard_success_rate": float(results_df.hard_success.mean()),
+                    "hard_success_count": int(results_df.hard_success.sum()),
+                }
+            )
+            task_series = results_df.task.dropna()
+            if not task_series.empty:
+                for task, task_df in results_df[results_df.task.notna()].groupby("task"):
+                    task_key = str(task).replace("/", "_")
+                    eval_metrics.update(
+                        {
+                            f"task/{task_key}/success_rate": float(task_df.reward.mean()),
+                            f"task/{task_key}/hard_success_rate": float(
+                                task_df.hard_success.mean()
+                            ),
+                            f"task/{task_key}/n": int(len(task_df)),
+                        }
+                    )
         if could_be_binary:
             assert pass_at_k is not None
             eval_metrics.update(pd.Series(pass_at_k.mean()).to_dict())

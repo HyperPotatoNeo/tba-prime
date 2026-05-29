@@ -106,11 +106,12 @@ class CompactionConfig(BaseConfig):
     have compaction_events=None and the trainer takes the standard forward
     path; this config is ignored.
 
-    When `window_size > 0`, the TrainerConfig-level validator
-    `compaction_requires_hf_flash_attn` enforces that the model is using
-    `attn="flash_attention_2"` and `impl="hf"` (the numerical match with
-    vLLM's inference kernel and the past_key_values support that
-    segmented_forward requires, respectively).
+    When `window_size > 0`, the TrainerConfig-level validator enforces
+    `impl="hf"`. If the trainer model uses the default
+    `attn="flex_attention"` and the dispatch is not explicitly set, the
+    validator selects the masked FlexAttention path for fair comparison with
+    non-compaction forwards. FlashAttention cache replay remains available
+    when explicitly configured.
     """
 
     window_size: Annotated[
@@ -383,9 +384,9 @@ class ModelConfig(BaseModelConfig):
     attn: Annotated[
         AttnImplementation,
         Field(
-            description="The attention implementation to use. When CP is enabled, ring attention uses the matching kernel family (FA2 for flash_attention_2, FA3 for flash_attention_3).",
+            description="The attention implementation to use. Defaults to flex_attention. When CP is enabled, ring attention uses the matching kernel family (FA2 for flash_attention_2, FA3 for flash_attention_3).",
         ),
-    ] = "flash_attention_2"
+    ] = "flex_attention"
 
     compile: Annotated[
         CompileConfig | None,
@@ -1032,24 +1033,35 @@ class TrainerConfig(BaseConfig):
     ] = 1
 
     @model_validator(mode="after")
-    def compaction_requires_hf_flash_attn(self):
+    def validate_compaction_attention(self):
         """When KV cache compaction is enabled, the trainer must use the HF
-        model path with flash_attention_2. Fails early at config load so the
-        user doesn't burn hours of training only to hit a runtime assertion
-        on the first compaction sample.
+        model path. Fails early at config load so the user doesn't burn hours
+        of training only to hit a runtime assertion on the first compaction
+        sample.
 
         - impl="hf" is required because segmented_forward uses
           past_key_values to feed retained KV into the next segment. The
           custom llama path (impl="custom") asserts past_key_values is None.
           impl="auto" resolves to "custom" for supported architectures (e.g.
           Qwen3-4B), so it is also rejected.
-        - attn="flash_attention_2" is the default cache-replay path because it
-          matches vLLM's decode kernel numerically. attn="flex_attention" is
-          reserved for the masked full-chain dispatch below.
+        - attn="flex_attention" defaults to the masked full-chain dispatch
+          when compaction is enabled. attn="flash_attention_2" remains
+          available for explicitly requested cache replay.
         - compaction.stride must be positive and a multiple of
           compaction.block_size (matches the vLLM-side constraint).
         """
+        if (
+            self.compaction.window_size > 0
+            and self.model.attn == "flex_attention"
+            and "masked_forward_dispatch" not in self.compaction.model_fields_set
+        ):
+            self.compaction.masked_forward_dispatch = "flex_attention"
+            self.compaction.bptt_segments = -1
+
         flex_dispatch = self.compaction.masked_forward_dispatch == "flex_attention"
+        if flex_dispatch:
+            self.compaction.bptt_segments = -1
+
         if flex_dispatch and self.compaction.window_size <= 0:
             raise ValueError(
                 "trainer.compaction.masked_forward_dispatch='flex_attention' "
@@ -1160,6 +1172,10 @@ class TrainerConfig(BaseConfig):
                     "for the masked full-sequence FlexAttention path."
                 )
         return self
+
+    def compaction_requires_hf_flash_attn(self):
+        """Backward-compatible alias for older caller sites."""
+        return self.validate_compaction_attention()
 
     @model_validator(mode="after")
     def deepep_disables_grad_clipping(self):

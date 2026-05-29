@@ -495,28 +495,30 @@ async def orchestrate(config: OrchestratorConfig):
                 logger.info(f"Running evals for checkpoint step {ckpt_step}")
 
             # Pause weight updates and re-scheduling of training rollouts during eval
-            # to avoid evaluating across different checkpoints and avoid congestion
+            # to avoid evaluating across different checkpoints and avoid congestion.
+            if enable_policy_updates:
+                await scheduler.pause_policy_updates()
             scheduler.checkpoint_ready.clear()
+            try:
+                # For heavy eval workloads, it might be necessary additionally cancel in-flight training rollouts
+                if config.eval.cancel_inflight_rollouts_on_eval:
+                    logger.info("Cancelling in-flight training rollouts before starting evals to avoid congestion.")
+                    await scheduler.cancel_inflight_rollouts()
 
-            # For heavy eval workloads, it might be necessary additionally cancel in-flight training rollouts
-            if config.eval.cancel_inflight_rollouts_on_eval:
-                logger.info("Cancelling in-flight training rollouts before starting evals to avoid congestion.")
-                await scheduler.cancel_inflight_rollouts()
-
-            await asyncio.gather(
-                *[
-                    eval_env.evaluate(
-                        model_name=scheduler.model_name,
-                        get_client=inference_pool.get_next_client,
-                        ckpt_step=ckpt_step,
-                        step=progress.step,
-                    )
-                    for eval_env in eval_envs
-                ]
-            )
-
-            # Resume weight updates
-            scheduler.checkpoint_ready.set()
+                await asyncio.gather(
+                    *[
+                        eval_env.evaluate(
+                            model_name=scheduler.model_name,
+                            get_client=inference_pool.get_next_client,
+                            ckpt_step=ckpt_step,
+                            step=progress.step,
+                        )
+                        for eval_env in eval_envs
+                    ]
+                )
+            finally:
+                # Resume weight updates
+                scheduler.checkpoint_ready.set()
 
         # Update prev_ckpt_step for next iteration
         prev_ckpt_step = ckpt_step
@@ -866,17 +868,29 @@ async def orchestrate(config: OrchestratorConfig):
 
     if config.eval and eval_envs is not None:
         logger.info("Running final evals")
-        await asyncio.gather(
-            *[
-                eval_env.evaluate(
-                    model_name=scheduler.model_name,
-                    get_client=inference_pool.get_next_client,
-                    ckpt_step=ckpt_step,
-                    step=progress.step,
+        if enable_policy_updates:
+            await scheduler.pause_policy_updates()
+        scheduler.checkpoint_ready.clear()
+        try:
+            if config.eval.cancel_inflight_rollouts_on_eval:
+                logger.info(
+                    "Cancelling in-flight training rollouts before final evals "
+                    "to avoid congestion."
                 )
-                for eval_env in eval_envs
-            ]
-        )
+                await scheduler.cancel_inflight_rollouts()
+            await asyncio.gather(
+                *[
+                    eval_env.evaluate(
+                        model_name=scheduler.model_name,
+                        get_client=inference_pool.get_next_client,
+                        ckpt_step=ckpt_step,
+                        step=progress.step,
+                    )
+                    for eval_env in eval_envs
+                ]
+            )
+        finally:
+            scheduler.checkpoint_ready.set()
 
     # Log final (immutable) samples and distributions to monitor(s)
     monitor.log_final_samples()

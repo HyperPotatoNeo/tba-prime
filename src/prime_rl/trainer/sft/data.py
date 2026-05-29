@@ -1,3 +1,4 @@
+import hashlib
 import json
 import uuid
 from collections import defaultdict
@@ -51,6 +52,58 @@ class Batch(TypedDict):
 
 
 FILLER_TOKEN_ID = 151643
+
+
+def _stable_hash_index(parts: list[object], modulo: int) -> int:
+    h = hashlib.blake2b(digest_size=8)
+    for part in parts:
+        h.update(str(part).encode("utf-8"))
+        h.update(b"\0")
+    return int.from_bytes(h.digest(), "big") % modulo
+
+
+def _example_compaction_policy_key(example: dict) -> str | None:
+    for key in ("trace_id", "example_id", "base_example_id", "__index"):
+        value = example.get(key)
+        if value is not None:
+            return f"{key}={value}"
+    return None
+
+
+def _select_sft_compaction_config(
+    compaction_config: SFTCompactionConfig,
+    example: dict,
+    *,
+    step: int,
+    epoch: int,
+) -> tuple[SFTCompactionConfig, str | None]:
+    policies = compaction_config.policies
+    if not policies:
+        return compaction_config, None
+
+    if compaction_config.policy_sampling == "fixed":
+        policy_idx = 0
+    else:
+        trace_key = _example_compaction_policy_key(example) or f"step={step}"
+        hash_parts: list[object] = [
+            compaction_config.policy_seed,
+            compaction_config.policy_sampling,
+            trace_key,
+        ]
+        if compaction_config.policy_sampling == "uniform_per_access":
+            hash_parts.extend([step, epoch])
+        policy_idx = _stable_hash_index(hash_parts, len(policies))
+
+    policy = policies[policy_idx]
+    return (
+        compaction_config.model_copy(
+            update={
+                "max_turns": policy.max_turns,
+                "eviction_turn_stride": policy.eviction_turn_stride,
+            }
+        ),
+        policy.name,
+    )
 
 
 def _pad_after_im_end(
@@ -383,6 +436,7 @@ class SFTDataset(StatefulIterableDataset):
         self.max_examples = max_examples
         self.max_epochs = max_epochs
         self.compaction_config = compaction_config
+        self.num_compaction_policy_samples = defaultdict(int)
 
         if self.tokenizer is None:
             self.logger.warning("No tokenizer provided, will not process examples")
@@ -451,13 +505,19 @@ class SFTDataset(StatefulIterableDataset):
                     raise ValueError(f"Invalid message role: {message['role']}")
 
         if self.compaction_config is not None and self.compaction_config.enabled:
+            compaction_config, policy_name = _select_sft_compaction_config(
+                self.compaction_config,
+                example,
+                step=self.step,
+                epoch=self.epoch,
+            )
             input_ids, token_mask, calls = _build_incremental_token_mask_and_calls(
                 self.tokenizer,
                 messages,
                 role_to_mask=should_mask,
                 tools=tools,
                 chat_template_kwargs=example.get("chat_template_kwargs", {}),
-                compaction_config=self.compaction_config,
+                compaction_config=compaction_config,
             )
             if len(input_ids) > self.seq_len:
                 self.logger.warning(
@@ -465,6 +525,8 @@ class SFTDataset(StatefulIterableDataset):
                     f"because it has {len(input_ids)} tokens, exceeding seq_len={self.seq_len}."
                 )
                 return None
+            if policy_name is not None:
+                self.num_compaction_policy_samples[policy_name] += 1
             target_ids = input_ids[1:] + [0]
             loss_mask = token_mask[1:] + [False]
             return {

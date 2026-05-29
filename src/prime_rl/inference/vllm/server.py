@@ -1,6 +1,6 @@
 from argparse import Namespace
 from http import HTTPStatus
-from typing import Any
+from typing import Any, Literal
 
 import uvloop
 from fastapi import APIRouter, Depends, Request
@@ -180,8 +180,12 @@ def chat_with_tokens(request: Request) -> OpenAIServingChatWithTokens | None:
 
 
 @router.post("/pause")
-async def pause(request: Request):
-    await engine_client(request).pause_generation(mode="keep", clear_cache=False)
+async def pause(
+    request: Request,
+    mode: Literal["abort", "wait", "keep"] = "abort",
+    clear_cache: bool = False,
+):
+    await engine_client(request).pause_generation(mode=mode, clear_cache=clear_cache)
     return {"status": "paused"}
 
 

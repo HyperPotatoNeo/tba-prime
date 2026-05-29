@@ -4,7 +4,8 @@ import pytest
 from datasets import Dataset, interleave_datasets
 from transformers import AutoTokenizer
 
-from prime_rl.trainer.sft.data import SFTDataset
+from prime_rl.configs.sft import SFTCompactionConfig
+from prime_rl.trainer.sft.data import SFTDataset, _select_sft_compaction_config
 from prime_rl.trainer.utils import print_sample
 
 
@@ -312,3 +313,48 @@ def test_messages_take_precedence_over_prompt_and_completion():
     )
 
     assert next(iter(messages_dataset)) == next(iter(expected_dataset))
+
+
+def test_sft_compaction_uniform_per_trace_policy_selection_is_stable():
+    config = SFTCompactionConfig.model_validate(
+        {
+            "policy_sampling": "uniform_per_trace",
+            "policy_seed": 7,
+            "policies": [
+                {"name": "t2_s2", "max_turns": 2, "eviction_turn_stride": 2},
+                {"name": "t10_s5", "max_turns": 10, "eviction_turn_stride": 5},
+            ],
+        }
+    )
+    example = {"trace_id": "train:123:r0"}
+
+    selected = [
+        _select_sft_compaction_config(config, example, step=step, epoch=step // 10)
+        for step in range(1, 20)
+    ]
+
+    assert len({policy_name for _, policy_name in selected}) == 1
+    assert len({(cfg.max_turns, cfg.eviction_turn_stride) for cfg, _ in selected}) == 1
+
+
+def test_sft_compaction_uniform_per_access_policy_selection_varies_by_access():
+    config = SFTCompactionConfig.model_validate(
+        {
+            "policy_sampling": "uniform_per_access",
+            "policy_seed": 7,
+            "policies": [
+                {"name": "t2_s2", "max_turns": 2, "eviction_turn_stride": 2},
+                {"name": "t4_s3", "max_turns": 4, "eviction_turn_stride": 3},
+                {"name": "t10_s5", "max_turns": 10, "eviction_turn_stride": 5},
+            ],
+        }
+    )
+    example = {"trace_id": "train:123:r0"}
+
+    selected_names = Counter(
+        _select_sft_compaction_config(config, example, step=step, epoch=step // 10)[1]
+        for step in range(1, 200)
+    )
+
+    assert set(selected_names) == {"t2_s2", "t4_s3", "t10_s5"}
+    assert all(count > 40 for count in selected_names.values())

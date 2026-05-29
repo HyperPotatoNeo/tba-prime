@@ -462,6 +462,7 @@ class RLConfig(BaseConfig):
         trainer_compaction = _cfg_child(trainer, "compaction")
         trainer_model = _cfg_child(trainer, "model")
         vllm_extra = _cfg_child(inference, "vllm_extra")
+        eval_cfg = _cfg_get(orchestrator, "eval")
 
         block_size = _first_explicit_int(
             _KV_EVICTION_DEFAULT_BLOCK_SIZE,
@@ -494,7 +495,8 @@ class RLConfig(BaseConfig):
         eviction_turn_stride = int(_cfg_get(mt, "stride", None) or 1)
 
         _cfg_set_missing(trainer_model, "impl", "hf")
-        _cfg_set_missing(trainer_model, "attn", "flash_attention_2")
+        _cfg_set_missing(trainer_model, "attn", "flex_attention")
+        trainer_attn = _cfg_get(trainer_model, "attn")
 
         _cfg_set_missing(trainer_compaction, "window_size", window_size)
         _cfg_set_missing(trainer_compaction, "stride", stride)
@@ -503,6 +505,10 @@ class RLConfig(BaseConfig):
             trainer_compaction, "protected_prefix_tokens", protected_prefix
         )
         _cfg_set_missing(trainer_compaction, "per_call_dispatch", True)
+        if trainer_attn == "flex_attention":
+            _cfg_set_missing(
+                trainer_compaction, "masked_forward_dispatch", "flex_attention"
+            )
 
         _cfg_set_missing(padding, "enabled", True)
         _cfg_set_missing(padding, "block_size", block_size)
@@ -527,6 +533,14 @@ class RLConfig(BaseConfig):
         _cfg_set_missing(
             vllm_extra, "compaction_filler_token_id", filler_token_id
         )
+        if eval_cfg is not None:
+            _cfg_set_missing(eval_cfg, "cancel_inflight_rollouts_on_eval", True)
+            if not _cfg_was_set(eval_cfg, "max_concurrent"):
+                _cfg_set(eval_cfg, "max_concurrent", 32)
+            eval_max_concurrent = _cfg_get(eval_cfg, "max_concurrent")
+            for env_cfg in _cfg_get(eval_cfg, "env", []) or []:
+                if not _cfg_was_set(env_cfg, "max_concurrent"):
+                    _cfg_set(env_cfg, "max_concurrent", eval_max_concurrent)
 
         return data
 
@@ -1046,7 +1060,7 @@ class RLConfig(BaseConfig):
         # Parent-level guard for callers that pass already-constructed nested
         # TrainerConfig objects. The before-validator mutates those objects
         # after their own model validators have already run.
-        self.trainer.compaction_requires_hf_flash_attn()
+        self.trainer.validate_compaction_attention()
         return self
 
     ### Auto-setup and validate shared configs

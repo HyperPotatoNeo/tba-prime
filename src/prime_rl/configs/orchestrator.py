@@ -382,6 +382,17 @@ class EvalEnvConfig(EnvConfig):
         ),
     ] = 1
 
+    max_concurrent: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Maximum number of concurrent eval coroutine groups for this "
+                "environment. None preserves the historical unbounded gather."
+            ),
+        ),
+    ] = None
+
 
 class TrainConfig(BaseConfig):
     """Configures training environments and their shared sampling settings."""
@@ -445,6 +456,17 @@ class EvalConfig(BaseConfig):
         Field(ge=1, description="Default number of rollouts per example. Can be overridden per env."),
     ] = 1
 
+    max_concurrent: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Default maximum number of concurrent eval coroutine groups. "
+                "None preserves the historical unbounded gather."
+            ),
+        ),
+    ] = None
+
     interval: Annotated[
         int,
         Field(
@@ -474,6 +496,8 @@ class EvalConfig(BaseConfig):
                 env.num_examples = self.num_examples
             if "rollouts_per_example" not in env.model_fields_set:
                 env.rollouts_per_example = self.rollouts_per_example
+            if "max_concurrent" not in env.model_fields_set:
+                env.max_concurrent = self.max_concurrent
             # Resolve num_workers now that num_examples and rollouts_per_example are set
             if env.num_workers == "auto":
                 if env.num_examples == -1:
