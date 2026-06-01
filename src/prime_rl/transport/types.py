@@ -72,6 +72,10 @@ class CompactionEventWire(
     # this event. 0 for block-FIFO mode.
     num_turns_evicted_after: int = 0
 
+    # Managed-context extension: IDs of scheduler-local archived spans created
+    # by this eviction. Empty unless managed context is explicitly enabled.
+    archived_span_ids: list[str] = msgspec.field(default_factory=list)
+
 
 class CallWire(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A single vLLM chat() call within a rollout (Phase B of

@@ -513,6 +513,7 @@ class RLConfig(BaseConfig):
         _cfg_set_missing(padding, "enabled", True)
         _cfg_set_missing(padding, "block_size", block_size)
         _cfg_set_missing(padding, "phase4_enabled", True)
+        _cfg_set_missing(padding, "phase4_weight_sync_strategy", "drain")
 
         _cfg_set_missing(inference, "enable_prefix_caching", True)
         _cfg_set_missing(vllm_extra, "async_scheduling", False)

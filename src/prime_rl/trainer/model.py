@@ -225,6 +225,14 @@ def get_model(
             config.name, attn_implementation=config.attn, trust_remote_code=config.trust_remote_code
         ),
     )
+    pretrained_gen_config: GenerationConfig | None = None
+    try:
+        pretrained_gen_config = GenerationConfig.from_pretrained(
+            config.name,
+            trust_remote_code=config.trust_remote_code,
+        )
+    except Exception:
+        pretrained_gen_config = None
     model_config.use_cache = False
     is_vlm_arch = is_vlm_architecture(model_config)
 
@@ -248,7 +256,7 @@ def get_model(
     # Ensure pad_token_id is set (some models like Qwen3MoE don't have it).
     # In transformers v5, token IDs moved from PretrainedConfig to GenerationConfig.
     if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
-        gen_config = GenerationConfig.from_model_config(model_config)
+        gen_config = pretrained_gen_config or GenerationConfig.from_model_config(model_config)
         # Use `is not None` instead of truthiness: token ID 0 is valid.
         pad_token_id = next(
             (
@@ -264,6 +272,23 @@ def get_model(
         if isinstance(pad_token_id, list):
             pad_token_id = pad_token_id[0]
         model_config.pad_token_id = pad_token_id
+    elif pretrained_gen_config is not None and pretrained_gen_config.pad_token_id is not None:
+        gen_pad_token_id = pretrained_gen_config.pad_token_id
+        if isinstance(gen_pad_token_id, list):
+            gen_pad_token_id = gen_pad_token_id[0] if gen_pad_token_id else None
+        eos_token_id = getattr(model_config, "eos_token_id", None)
+        if isinstance(eos_token_id, list):
+            eos_token_ids = {int(token_id) for token_id in eos_token_id}
+        elif eos_token_id is not None:
+            eos_token_ids = {int(eos_token_id)}
+        else:
+            eos_token_ids = set()
+        if (
+            gen_pad_token_id is not None
+            and int(model_config.pad_token_id) in eos_token_ids
+            and int(gen_pad_token_id) != int(model_config.pad_token_id)
+        ):
+            model_config.pad_token_id = int(gen_pad_token_id)
 
     # Handle list pad_token_id that was already set on the config (not from our
     # fallback above, but directly in the model's config.json).
@@ -341,7 +366,21 @@ def setup_tokenizer(config: TokenizerConfig) -> PreTrainedTokenizer:
     tokenizer = AutoTokenizer.from_pretrained(config.name, trust_remote_code=config.trust_remote_code)
     if config.chat_template is not None:
         tokenizer.chat_template = config.chat_template
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        try:
+            gen_config = GenerationConfig.from_pretrained(
+                config.name,
+                trust_remote_code=config.trust_remote_code,
+            )
+            gen_pad_token_id = gen_config.pad_token_id
+            if isinstance(gen_pad_token_id, list):
+                gen_pad_token_id = gen_pad_token_id[0] if gen_pad_token_id else None
+            if gen_pad_token_id is not None and gen_pad_token_id != tokenizer.eos_token_id:
+                tokenizer.pad_token_id = int(gen_pad_token_id)
+        except Exception:
+            pass
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     return tokenizer
 

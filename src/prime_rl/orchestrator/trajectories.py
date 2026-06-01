@@ -327,6 +327,9 @@ def _build_summary_sample(
                             num_turns_evicted_after=int(
                                 e.get("num_turns_evicted_after", 0)
                             ),
+                            archived_span_ids=[
+                                str(x) for x in (e.get("archived_span_ids") or [])
+                            ],
                         )
                     )
                 except (KeyError, TypeError, ValueError):
@@ -349,6 +352,9 @@ def _build_summary_sample(
                             else [],
                             last_turn_evicted=int(e[8]) if len(e) >= 9 else -1,
                             num_turns_evicted_after=int(e[9]) if len(e) >= 10 else 0,
+                            archived_span_ids=[str(x) for x in e[10]]
+                            if len(e) >= 11 and e[10]
+                            else [],
                         )
                     )
                 except (TypeError, ValueError):
@@ -483,6 +489,7 @@ def interleave_rollout(
                                 "kept_token_ids": list(e.kept_token_ids),
                                 "last_turn_evicted": e.last_turn_evicted,
                                 "num_turns_evicted_after": e.num_turns_evicted_after,
+                                "archived_span_ids": list(e.archived_span_ids),
                             }
                             for e in step_events
                         ]
@@ -617,6 +624,9 @@ def interleave_rollout(
                         num_turns_evicted_after=int(
                             e.get("num_turns_evicted_after", 0)
                         ),
+                        archived_span_ids=[
+                            str(x) for x in (e.get("archived_span_ids") or [])
+                        ],
                     )
                 )
             elif isinstance(e, (list, tuple)) and len(e) >= 3:
@@ -637,6 +647,9 @@ def interleave_rollout(
                         else [],
                         last_turn_evicted=int(e[8]) if len(e) >= 9 else -1,
                         num_turns_evicted_after=int(e[9]) if len(e) >= 10 else 0,
+                        archived_span_ids=[str(x) for x in e[10]]
+                        if len(e) >= 11 and e[10]
+                        else [],
                     )
                 )
         return out or None

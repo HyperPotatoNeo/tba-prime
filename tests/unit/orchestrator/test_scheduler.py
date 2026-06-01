@@ -35,6 +35,8 @@ def make_scheduler() -> Scheduler:
     scheduler.update_policy_task = None
     scheduler.enable_policy_updates = True
     scheduler._checked_initial_broadcast_state = False
+    scheduler.policy_update_draining = False
+    scheduler.policy_update_pending_step = None
     return scheduler
 
 
@@ -141,6 +143,80 @@ def test_restart_inflight_rollouts_for_weight_sync_requeues_active_phase4_tasks(
         assert scheduler.cancelled_rollouts_count == 2
         assert scheduler.weight_sync_restarted_rollouts_count == 2
         assert active_task.cancelled()
+
+    asyncio.run(run())
+
+
+def test_drain_weight_sync_defers_policy_update_until_inflight_rollouts_finish():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.compaction_padding.enabled = True
+        scheduler.config.compaction_padding.phase4_enabled = True
+        scheduler.config.compaction_padding.phase4_weight_sync_strategy = "drain"
+
+        client = SimpleNamespace(api_base_url="http://test", extra_headers={})
+        active_task = asyncio.create_task(asyncio.sleep(60))
+        scheduler.inflight_requests = {
+            active_task: InflightRequest(
+                off_policy_steps=0,
+                client_config=client,
+                env_name="test",
+                group_id=1,
+                rollout_count=2,
+            ),
+        }
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=AsyncMock(),
+            update_model_name=MagicMock(),
+        )
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy()
+
+        assert scheduler.policy_update_draining is True
+        assert scheduler.policy_update_pending_step == 8
+        assert scheduler.checkpoint_ready.is_set()
+        scheduler.inference_pool.update_weights.assert_not_called()
+        assert active_task in scheduler.inflight_requests
+        active_task.cancel()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_drain_weight_sync_updates_once_inflight_rollouts_are_empty():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.compaction_padding.enabled = True
+        scheduler.config.compaction_padding.phase4_enabled = True
+        scheduler.config.compaction_padding.phase4_weight_sync_strategy = "drain"
+        scheduler.policy_update_draining = True
+        scheduler.policy_update_pending_step = 8
+        applied_steps: list[int] = []
+
+        async def update_weights(weight_dir, lora_name=None, step=0) -> None:
+            applied_steps.append(step)
+
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=update_weights,
+            update_model_name=MagicMock(),
+        )
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy()
+
+        assert applied_steps == [8]
+        assert scheduler.ckpt_step == 8
+        assert scheduler.policy_update_draining is False
+        assert scheduler.policy_update_pending_step is None
 
     asyncio.run(run())
 

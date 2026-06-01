@@ -149,13 +149,15 @@ async def orchestrate(config: OrchestratorConfig):
             resolve_im_end_token_id,
         )
 
-        filler_id = resolve_filler_token_id(
-            tokenizer, config.compaction_padding.filler_token_id
-        )
         im_end_id = (
             config.compaction_padding.im_end_token_id
             if config.compaction_padding.im_end_token_id is not None
             else resolve_im_end_token_id(tokenizer)
+        )
+        filler_id = resolve_filler_token_id(
+            tokenizer,
+            config.compaction_padding.filler_token_id,
+            forbidden_token_ids=(im_end_id,),
         )
         configure_message_padding(
             enabled=True,

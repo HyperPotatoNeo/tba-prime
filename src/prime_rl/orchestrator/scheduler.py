@@ -112,6 +112,8 @@ class Scheduler:
         self.policy_update_lock = asyncio.Lock()
         self.cancelled_rollouts_count = 0
         self.weight_sync_restarted_rollouts_count = 0
+        self.policy_update_draining = False
+        self.policy_update_pending_step: int | None = None
         self._checked_initial_broadcast_state = False
         self.empty_rollouts_by_env: dict[str, int] = defaultdict(int)
         self.errored_rollouts_by_env: dict[str, int] = defaultdict(int)
@@ -180,9 +182,36 @@ class Scheduler:
         return rollout_count
 
     @property
-    def restarts_inflight_rollouts_on_weight_sync(self) -> bool:
+    def phase4_weight_sync_strategy(self) -> str | None:
         padding = self.config.compaction_padding
-        return bool(padding.enabled and padding.phase4_enabled)
+        if not bool(padding.enabled and padding.phase4_enabled):
+            return None
+        return getattr(padding, "phase4_weight_sync_strategy", "restart")
+
+    @property
+    def restarts_inflight_rollouts_on_weight_sync(self) -> bool:
+        return self.phase4_weight_sync_strategy == "restart"
+
+    @property
+    def drains_inflight_rollouts_on_weight_sync(self) -> bool:
+        return self.phase4_weight_sync_strategy == "drain"
+
+    def _begin_policy_update_drain(self, next_ckpt_step: int) -> None:
+        inflight = self.inflight_rollout_count
+        pending_step = self.policy_update_pending_step
+        self.policy_update_draining = True
+        self.policy_update_pending_step = next_ckpt_step
+        if pending_step != next_ckpt_step:
+            self.logger.info(
+                f"Deferring Phase4 policy update to step {next_ckpt_step} until "
+                f"{inflight} in-flight rollout request(s) finish; no new rollout "
+                "requests will be launched while draining."
+            )
+
+    def _clear_policy_update_drain(self, next_ckpt_step: int) -> None:
+        if self.policy_update_pending_step in (None, next_ckpt_step):
+            self.policy_update_draining = False
+            self.policy_update_pending_step = None
 
     async def restart_inflight_rollouts_for_weight_sync(self, next_ckpt_step: int) -> int:
         """Cancel active Phase4 rollout requests and requeue their slots.
@@ -279,6 +308,9 @@ class Scheduler:
 
     async def _schedule_next_request(self) -> bool:
         if not self.checkpoint_ready.is_set():
+            return False
+
+        if self.policy_update_draining:
             return False
 
         remaining_capacity = self.max_inflight_rollouts - self.inflight_rollout_count
@@ -386,6 +418,7 @@ class Scheduler:
                 self.model_name = self.lora_name
                 self.inference_pool.update_model_name(self.model_name)
         finally:
+            self._clear_policy_update_drain(next_ckpt_step)
             self.checkpoint_ready.set()
 
         await self._update_off_policy()
@@ -419,6 +452,13 @@ class Scheduler:
             next_ckpt_step = self._compute_next_ckpt_step()
             if next_ckpt_step <= self.ckpt_step:
                 return
+
+            if self.drains_inflight_rollouts_on_weight_sync:
+                if self.inflight_requests:
+                    self._begin_policy_update_drain(next_ckpt_step)
+                    return
+                self.policy_update_draining = True
+                self.policy_update_pending_step = next_ckpt_step
 
             task = await self._get_or_start_policy_update_task(next_ckpt_step)
             await asyncio.shield(task)
@@ -481,6 +521,9 @@ class Scheduler:
             await self._fill_inflight_requests()
             inflight_tasks = list(self.inflight_requests.keys())
             if not inflight_tasks:
+                if self.policy_update_draining:
+                    await self.maybe_update_policy()
+                    continue
                 await self.checkpoint_ready.wait()
                 continue
 
@@ -609,6 +652,7 @@ class Scheduler:
             "scheduler/inflight_samples": self.inflight_sample_count,
             "scheduler/cancelled_rollouts": self.cancelled_rollouts_count,
             "scheduler/weight_sync_restarted_rollouts": self.weight_sync_restarted_rollouts_count,
+            "scheduler/weight_sync_draining": float(self.policy_update_draining),
             "empty_rollouts/all": sum(self.empty_rollouts_by_env.values()) / max(total_rollouts, 1),
             "errored_rollouts/all": sum(self.errored_rollouts_by_env.values()) / max(total_rollouts, 1),
             "off_policy_level/all/max": self.max_off_policy_level,

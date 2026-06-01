@@ -856,7 +856,9 @@ class CompactionPaddingConfig(BaseConfig):
             description=(
                 "Token id to insert as filler. None resolves at orchestrator "
                 "startup to tokenizer.pad_token_id (Qwen3: <|endoftext|> = 151643). "
-                "Override with a never-in-data id to avoid mask collisions."
+                "If tokenizer.pad_token_id collides with <|im_end|>, the resolver "
+                "falls back to <|endoftext|>. Override with a never-in-data id to "
+                "avoid mask collisions."
             ),
         ),
     ] = None
@@ -901,6 +903,19 @@ class CompactionPaddingConfig(BaseConfig):
             ),
         ),
     ] = False
+
+    phase4_weight_sync_strategy: Annotated[
+        Literal["restart", "drain"],
+        Field(
+            description=(
+                "How Phase4 handles an RL weight sync while rollouts are "
+                "in flight. 'restart' cancels active Phase4 rollouts and "
+                "requeues them before updating weights. 'drain' stops "
+                "launching new rollouts, waits for active rollouts to finish, "
+                "then updates weights at an idle boundary."
+            ),
+        ),
+    ] = "restart"
 
 
 class MarkovianSummaryConfig(BaseConfig):

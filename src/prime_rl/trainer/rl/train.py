@@ -13,6 +13,7 @@ import time
 # across the compaction -> text transition on step 1 (see D5
 # investigation notes in plans/phase3_training_integration.md).
 _KVE_MEM_TRACE = os.environ.get("KVE_MEM_TRACE") == "1"
+_KVE_STACK_TRACE = os.environ.get("KVE_STACK_TRACE") == "1"
 
 
 def _mem_snap(tag: str) -> str:
@@ -30,6 +31,69 @@ def _mem_snap(tag: str) -> str:
     except Exception:
         rss_part = ""
     return f"[MEM] {tag} alloc={alloc:.3f}GB peak={peak:.3f}GB reserved={reserved:.3f}GB{rss_part}"
+
+
+def _trace_snap(tag: str) -> str:
+    if _KVE_MEM_TRACE:
+        return _mem_snap(tag)
+    return f"[STACK] {tag}"
+
+
+def _pad_ratio(useful_tokens: int, padded_tokens: int) -> float:
+    if useful_tokens <= 0:
+        return 1.0
+    return padded_tokens / useful_tokens
+
+
+def _stack_trace_summary(
+    micro_batch_group,
+    micro_batch,
+    *,
+    flex_compaction_group: bool,
+) -> str:
+    full_lens = [int(mb["input_ids"].shape[1]) for mb in micro_batch_group]
+    batch_rows = int(micro_batch["input_ids"].shape[0])
+    batch_seq_len = int(micro_batch["input_ids"].shape[1])
+    full_useful = sum(full_lens)
+    full_padded = batch_rows * batch_seq_len
+    try:
+        loss_tokens = int(micro_batch["loss_mask"].sum().item())
+    except Exception:
+        loss_tokens = -1
+
+    parts = [
+        f"full_lens={full_lens}",
+        f"full_tokens={full_useful}/{full_padded}",
+        f"full_pad={_pad_ratio(full_useful, full_padded):.3f}x",
+        f"loss_tokens={loss_tokens}",
+    ]
+    if micro_batch.get("flex_stack_mode") is not None:
+        parts.append(f"flex_stack_mode={micro_batch.get('flex_stack_mode')}")
+
+    writer_len_fn = globals().get("compute_flex_mask_writer_len")
+    if flex_compaction_group and writer_len_fn is not None:
+        writer_lens = []
+        for mb in micro_batch_group:
+            calls = mb.get("calls")
+            if calls is None:
+                writer_lens = []
+                break
+            writer_lens.append(int(writer_len_fn(calls)))
+        if writer_lens:
+            writer_useful = sum(writer_lens)
+            if micro_batch.get("flex_stack_mode") == "horizontal":
+                writer_padded = writer_useful
+            else:
+                writer_padded = len(writer_lens) * max(writer_lens)
+            parts.extend(
+                [
+                    f"writer_lens={writer_lens}",
+                    f"writer_tokens={writer_useful}/{writer_padded}",
+                    f"writer_pad={_pad_ratio(writer_useful, writer_padded):.3f}x",
+                ]
+            )
+
+    return " " + " ".join(parts)
 from datetime import timedelta
 
 # Import environment before any other imports
@@ -47,6 +111,15 @@ from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
 from prime_rl.configs.trainer import DefaultLossConfig, TrainerConfig
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
+from prime_rl.trainer.rl.microbatch_stacking import (
+    compaction_metric_events_by_row,
+    is_flex_compaction_stackable_micro_batch,
+    make_micro_batch_groups,
+    pack_horizontal_flex_compaction_micro_batches,
+    split_packed_batch,
+    stack_flex_compaction_micro_batches,
+    stack_standard_micro_batches,
+)
 from prime_rl.utils.cp import (
     gather_for_cp,
     gather_for_cp_wo_grad,
@@ -74,11 +147,17 @@ from prime_rl.trainer.model import (
 try:
     from kv_eviction.segmented_forward import (
         _build_pre_trim_plan,
+        batched_flex_mask_segmented_forward,
+        compute_flex_mask_writer_len,
         compute_num_segments,
         compute_per_call_bptt_window_forward_counts,
         compute_num_per_call_forwards,
         flex_mask_segmented_forward,
         per_call_segmented_forward,
+        packed_flex_mask_segmented_forward,
+        selected_logprob_batched_flex_mask_segmented_forward,
+        selected_logprob_flex_mask_segmented_forward,
+        selected_logprob_packed_flex_mask_segmented_forward,
         segmented_forward,
     )
 except ImportError:
@@ -88,10 +167,16 @@ except ImportError:
     # raise with a clearer error if compaction is actually used.
     segmented_forward = None  # type: ignore[assignment]
     _build_pre_trim_plan = None  # type: ignore[assignment]
+    batched_flex_mask_segmented_forward = None  # type: ignore[assignment]
+    compute_flex_mask_writer_len = None  # type: ignore[assignment]
     compute_num_segments = None  # type: ignore[assignment]
     compute_per_call_bptt_window_forward_counts = None  # type: ignore[assignment]
     flex_mask_segmented_forward = None  # type: ignore[assignment]
     per_call_segmented_forward = None  # type: ignore[assignment]
+    packed_flex_mask_segmented_forward = None  # type: ignore[assignment]
+    selected_logprob_batched_flex_mask_segmented_forward = None  # type: ignore[assignment]
+    selected_logprob_flex_mask_segmented_forward = None  # type: ignore[assignment]
+    selected_logprob_packed_flex_mask_segmented_forward = None  # type: ignore[assignment]
     compute_num_per_call_forwards = None  # type: ignore[assignment]
 from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
@@ -105,7 +190,6 @@ from prime_rl.trainer.utils import (
     get_ckpt_disk_metrics,
     setup_torch_distributed,
     print_benchmark,
-    get_response_lengths,
 )
 from prime_rl.trainer.world import get_world
 from prime_rl.trainer.runs import setup_multi_run_manager, Progress, get_multi_run_manager
@@ -118,6 +202,126 @@ from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
 from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
+
+
+def _get_dp_max_micro_batch_seq_lens(
+    micro_batches,
+    *,
+    dp_group,
+    dp_world_size: int,
+    compaction_enabled: bool = False,
+    flex_compaction_enabled: bool = False,
+    cp_enabled: bool = False,
+    lora_enabled: bool = False,
+    multi_run_enabled: bool = False,
+    flex_compaction_stackable: list[bool] | None = None,
+) -> list[int]:
+    """Return per-index sequence lengths maximized across data-parallel ranks."""
+    seq_lens = []
+    for idx, micro_batch in enumerate(micro_batches):
+        seq_len = int(micro_batch["input_ids"].shape[1])
+        globally_flex_stackable = (
+            True
+            if flex_compaction_stackable is None
+            else bool(flex_compaction_stackable[idx])
+        )
+        if (
+            globally_flex_stackable
+            and compute_flex_mask_writer_len is not None
+            and is_flex_compaction_stackable_micro_batch(
+                micro_batch,
+                compaction_enabled=compaction_enabled,
+                flex_compaction_enabled=flex_compaction_enabled,
+                cp_enabled=cp_enabled,
+                lora_enabled=lora_enabled,
+                multi_run_enabled=multi_run_enabled,
+            )
+        ):
+            seq_len = int(compute_flex_mask_writer_len(micro_batch["calls"]))
+        seq_lens.append(seq_len)
+    if dp_world_size <= 1:
+        return seq_lens
+
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    local_count = torch.tensor([len(seq_lens)], dtype=torch.int64, device=device)
+    min_count = local_count.clone()
+    max_count = local_count.clone()
+    dist.all_reduce(min_count, op=dist.ReduceOp.MIN, group=dp_group)
+    dist.all_reduce(max_count, op=dist.ReduceOp.MAX, group=dp_group)
+    if int(min_count.item()) != int(max_count.item()):
+        raise RuntimeError(
+            "micro-batch stack token budget requires all data-parallel ranks "
+            "to have the same number of local micro-batches, got "
+            f"min={int(min_count.item())} max={int(max_count.item())}"
+        )
+
+    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+    dist.all_reduce(seq_lens_tensor, op=dist.ReduceOp.MAX, group=dp_group)
+    return [int(x) for x in seq_lens_tensor.cpu().tolist()]
+
+
+def _flatten_nested_list(items):
+    flat = []
+    for item in items or []:
+        if isinstance(item, list):
+            flat.extend(item)
+        else:
+            flat.append(item)
+    return flat
+
+
+def _get_dp_flex_compaction_stackable(
+    micro_batches,
+    *,
+    dp_group,
+    dp_world_size: int,
+    compaction_enabled: bool,
+    flex_compaction_enabled: bool,
+    cp_enabled: bool,
+    lora_enabled: bool,
+    multi_run_enabled: bool,
+) -> list[bool]:
+    """Return per-index flex-compaction stackability agreed across DP ranks."""
+    local_flags = [
+        int(
+            is_flex_compaction_stackable_micro_batch(
+                micro_batch,
+                compaction_enabled=compaction_enabled,
+                flex_compaction_enabled=flex_compaction_enabled,
+                cp_enabled=cp_enabled,
+                lora_enabled=lora_enabled,
+                multi_run_enabled=multi_run_enabled,
+            )
+        )
+        for micro_batch in micro_batches
+    ]
+    if dp_world_size <= 1:
+        return [bool(flag) for flag in local_flags]
+
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    local_count = torch.tensor([len(local_flags)], dtype=torch.int64, device=device)
+    min_count = local_count.clone()
+    max_count = local_count.clone()
+    dist.all_reduce(min_count, op=dist.ReduceOp.MIN, group=dp_group)
+    dist.all_reduce(max_count, op=dist.ReduceOp.MAX, group=dp_group)
+    if int(min_count.item()) != int(max_count.item()):
+        raise RuntimeError(
+            "flex compaction stacking requires all data-parallel ranks to "
+            "have the same number of local micro-batches, got "
+            f"min={int(min_count.item())} max={int(max_count.item())}"
+        )
+
+    flags = torch.tensor(local_flags, dtype=torch.int32, device=device)
+    dist.all_reduce(flags, op=dist.ReduceOp.MIN, group=dp_group)
+    return [bool(int(flag)) for flag in flags.cpu().tolist()]
 
 
 def _kve_top_mismatch_n() -> int:
@@ -765,6 +969,65 @@ def train(config: TrainerConfig):
         logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
 
         batch_size = len(micro_batches)
+        flex_stack_mode = config.data.micro_batch_flex_stack_mode
+        stacking_enabled = int(config.data.micro_batch_stack_size) > 1
+        flex_compaction_stack_enabled = False
+        flex_compaction_stackable = None
+        if stacking_enabled:
+            flex_compaction_stack_enabled = (
+                config.compaction.window_size > 0
+                and config.compaction.masked_forward_dispatch == "flex_attention"
+                and (
+                    (
+                        flex_stack_mode == "vertical"
+                        and batched_flex_mask_segmented_forward is not None
+                    )
+                    or (
+                        flex_stack_mode == "horizontal"
+                        and packed_flex_mask_segmented_forward is not None
+                    )
+                )
+            )
+            dp_mesh = parallel_dims.get_mesh("dp")
+            if flex_compaction_stack_enabled:
+                flex_compaction_stackable = _get_dp_flex_compaction_stackable(
+                    micro_batches,
+                    dp_group=dp_mesh.get_group(),
+                    dp_world_size=dp_mesh.size(),
+                    compaction_enabled=config.compaction.window_size > 0,
+                    flex_compaction_enabled=flex_compaction_stack_enabled,
+                    cp_enabled=parallel_dims.cp_enabled,
+                    lora_enabled=config.model.lora is not None,
+                    multi_run_enabled=config.max_concurrent_runs > 1,
+                )
+            stack_seq_lens = None
+            if config.data.micro_batch_stack_token_budget is not None:
+                stack_seq_lens = _get_dp_max_micro_batch_seq_lens(
+                    micro_batches,
+                    dp_group=dp_mesh.get_group(),
+                    dp_world_size=dp_mesh.size(),
+                    compaction_enabled=config.compaction.window_size > 0,
+                    flex_compaction_enabled=flex_compaction_stack_enabled,
+                    cp_enabled=parallel_dims.cp_enabled,
+                    lora_enabled=config.model.lora is not None,
+                    multi_run_enabled=config.max_concurrent_runs > 1,
+                    flex_compaction_stackable=flex_compaction_stackable,
+                )
+            micro_batch_groups = make_micro_batch_groups(
+                micro_batches,
+                stack_size=config.data.micro_batch_stack_size,
+                stack_token_budget=config.data.micro_batch_stack_token_budget,
+                flex_compaction_stack_mode=flex_stack_mode,
+                seq_lens=stack_seq_lens,
+                flex_compaction_enabled=flex_compaction_stack_enabled,
+                flex_compaction_stackable=flex_compaction_stackable,
+                compaction_enabled=config.compaction.window_size > 0,
+                cp_enabled=parallel_dims.cp_enabled,
+                lora_enabled=config.model.lora is not None,
+                multi_run_enabled=config.max_concurrent_runs > 1,
+            )
+        else:
+            micro_batch_groups = [[micro_batch] for micro_batch in micro_batches]
         memory_profiler = None
         if config.memory_profiler_path is not None:
             memory_profiler = MemoryProfiler(progress.step, config.memory_profiler_path)
@@ -783,8 +1046,33 @@ def train(config: TrainerConfig):
         cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
         cp_size = parallel_dims.cp
 
-        for micro_step, micro_batch in enumerate(micro_batches):
-            if _KVE_MEM_TRACE:
+        for micro_step, micro_batch_group in enumerate(micro_batch_groups):
+            flex_compaction_group = all(
+                is_flex_compaction_stackable_micro_batch(
+                    mb,
+                    compaction_enabled=config.compaction.window_size > 0,
+                    flex_compaction_enabled=flex_compaction_stack_enabled,
+                    cp_enabled=parallel_dims.cp_enabled,
+                    lora_enabled=config.model.lora is not None,
+                    multi_run_enabled=config.max_concurrent_runs > 1,
+                )
+                for mb in micro_batch_group
+            )
+            if flex_compaction_group:
+                if flex_stack_mode == "horizontal":
+                    micro_batch = pack_horizontal_flex_compaction_micro_batches(
+                        micro_batch_group
+                    )
+                else:
+                    micro_batch = stack_flex_compaction_micro_batches(
+                        micro_batch_group
+                    )
+            else:
+                micro_batch = stack_standard_micro_batches(micro_batch_group)
+            stacked_micro_batches = len(micro_batch_group)
+            _trace_mb_start_time = None
+            _stack_trace = ""
+            if _KVE_MEM_TRACE or _KVE_STACK_TRACE:
                 # "EVT" = sample has real compaction events (multi-
                 # segment segmented_forward); "NOEVT" = sample is
                 # event-less (single-segment in a compaction run, or
@@ -797,12 +1085,20 @@ def train(config: TrainerConfig):
                         and len(micro_batch.get("compaction_events") or []) > 0
                     ) else "NOEVT"
                 )
-                _seq = micro_batch["input_ids"].shape[1]
-                torch.cuda.reset_peak_memory_stats()
+                _seq = tuple(micro_batch["input_ids"].shape)
+                _stack_trace = _stack_trace_summary(
+                    micro_batch_group,
+                    micro_batch,
+                    flex_compaction_group=flex_compaction_group,
+                )
+                _trace_mb_start_time = time.perf_counter()
+                if _KVE_MEM_TRACE:
+                    torch.cuda.reset_peak_memory_stats()
                 logger.info(
-                    _mem_snap(
-                        f"mb {micro_step}/{len(micro_batches)} "
-                        f"{_compaction_flag} seq={_seq} ENTRY"
+                    _trace_snap(
+                        f"mb {micro_step}/{len(micro_batch_groups)} "
+                        f"{_compaction_flag} stack={stacked_micro_batches} "
+                        f"shape={_seq}{_stack_trace} ENTRY"
                     )
                 )
             input_ids = micro_batch["input_ids"].to("cuda")
@@ -887,6 +1183,18 @@ def train(config: TrainerConfig):
             use_segmented = config.compaction.window_size > 0
             use_per_call = False
             use_flex_mask = False
+            calls_obj = micro_batch.get("calls")
+            horizontal_flex_compaction = (
+                micro_batch.get("flex_stack_mode") == "horizontal"
+            )
+            batched_flex_compaction = (
+                use_segmented
+                and flex_compaction_group
+                and (input_ids.shape[0] > 1 or horizontal_flex_compaction)
+                and isinstance(calls_obj, list)
+                and len(calls_obj) > 0
+                and isinstance(calls_obj[0], list)
+            )
 
             # Defense-in-depth: verify every DP rank made the SAME branch
             # decision at this step index. prepare_batch partitions by
@@ -954,42 +1262,55 @@ def train(config: TrainerConfig):
                     "is True; a missing value points to a wire-format or "
                     "packer regression."
                 )
-                # Compaction samples MUST be batch-1. The packer
-                # (prepare_batch in trainer/batch.py) isolates each
-                # compaction sample into its own micro-batch precisely
-                # so segment-range bookkeeping and per-sample KV
-                # eviction don't have to handle bin-packing. The
-                # _segment_loss_fn closure below uses .squeeze(0) on
-                # [1, seq] slices which would silently misinterpret a
-                # batch-2+ tensor as a single sequence; this assert
-                # catches any packer regression before it corrupts
-                # training.
-                assert input_ids.shape[0] == 1, (
-                    f"Compaction samples must be batch_size=1 (packer "
-                    f"invariant), got input_ids.shape={tuple(input_ids.shape)}. "
-                    f"Check prepare_batch / _is_compaction_sample partitioning."
-                )
-                bs = config.compaction.block_size
-                pp = config.compaction.protected_prefix_tokens
-                if pp == -1:
-                    # Auto-detect: infer from first compaction event's
-                    # position_offset_after and tokens_evicted. The first
-                    # eviction starts at the block-aligned protected prefix,
-                    # so offset_after - evicted gives us the eviction start.
-                    # Under D5 unified dispatch, event-less samples also
-                    # pass through this branch; in that case pp is unused
-                    # downstream (no eviction math needed) — fall back to
-                    # mb_prompt_len so the effective-prompt calc is a no-op.
-                    if compaction_events:
-                        first_evt = compaction_events[0]
-                        pp = first_evt.position_offset_after - first_evt.tokens_evicted
+                # Legacy/per-call cache replay is still singleton. Batched
+                # compaction is only supported by the masked FlexAttention
+                # path, whose BlockMask encodes each row's KV liveness.
+                if not batched_flex_compaction:
+                    assert input_ids.shape[0] == 1, (
+                        f"Compaction samples must be batch_size=1 outside "
+                        f"batched flex replay, got "
+                        f"input_ids.shape={tuple(input_ids.shape)}. Check "
+                        f"prepare_batch / _is_compaction_sample partitioning."
+                    )
+                    bs = config.compaction.block_size
+                    pp = config.compaction.protected_prefix_tokens
+                    if pp == -1:
+                        # Auto-detect: infer from first compaction event's
+                        # position_offset_after and tokens_evicted. The first
+                        # eviction starts at the block-aligned protected prefix,
+                        # so offset_after - evicted gives us the eviction start.
+                        # Under D5 unified dispatch, event-less samples also
+                        # pass through this branch; in that case pp is unused
+                        # downstream (no eviction math needed) — fall back to
+                        # mb_prompt_len so the effective-prompt calc is a no-op.
+                        if compaction_events:
+                            first_evt = compaction_events[0]
+                            pp = (
+                                first_evt.position_offset_after
+                                - first_evt.tokens_evicted
+                            )
+                        else:
+                            pp = mb_prompt_len
+                    effective_prompt_len = (
+                        min(pp, mb_prompt_len) if pp > 0 else mb_prompt_len
+                    )
+                    prompt_aligned_len = (
+                        (effective_prompt_len + bs - 1) // bs
+                    ) * bs
+                    segment_boundaries = [
+                        int(e.num_output_tokens_at_compaction)
+                        for e in compaction_events
+                    ]
+                else:
+                    assert (
+                        config.compaction.masked_forward_dispatch == "flex_attention"
+                    )
+                    if horizontal_flex_compaction:
+                        assert packed_flex_mask_segmented_forward is not None
                     else:
-                        pp = mb_prompt_len
-                effective_prompt_len = min(pp, mb_prompt_len) if pp > 0 else mb_prompt_len
-                prompt_aligned_len = ((effective_prompt_len + bs - 1) // bs) * bs
-                segment_boundaries = [
-                    int(e.num_output_tokens_at_compaction) for e in compaction_events
-                ]
+                        assert batched_flex_mask_segmented_forward is not None
+                    prompt_aligned_len = 0
+                    segment_boundaries = []
                 # Per-rank segment count may diverge across DP ranks if some
                 # samples have more compaction events than others. All-reduce
                 # MAX so every rank runs the same number of forward passes,
@@ -1026,13 +1347,35 @@ def train(config: TrainerConfig):
                 # doesn't duplicate mid-gen handling.
                 use_flex_mask_local = (
                     config.compaction.masked_forward_dispatch == "flex_attention"
-                    and flex_mask_segmented_forward is not None
                     and micro_batch.get("calls") is not None
+                    and (
+                        (
+                            batched_flex_compaction
+                            and (
+                                (
+                                    horizontal_flex_compaction
+                                    and packed_flex_mask_segmented_forward is not None
+                                )
+                                or (
+                                    not horizontal_flex_compaction
+                                    and (
+                                        batched_flex_mask_segmented_forward
+                                        is not None
+                                    )
+                                )
+                            )
+                        )
+                        or (
+                            not batched_flex_compaction
+                            and flex_mask_segmented_forward is not None
+                        )
+                    )
                 )
                 use_per_call_local = (
                     config.compaction.per_call_dispatch
                     and per_call_segmented_forward is not None
                     and micro_batch.get("calls") is not None
+                    and not batched_flex_compaction
                     and not use_flex_mask_local
                 )
                 # Cross-rank agreement on the call-based dispatch BEFORE entering any
@@ -1060,12 +1403,19 @@ def train(config: TrainerConfig):
                     use_per_call = use_per_call_local
 
                 if use_flex_mask or use_per_call:
+                    calls_for_midgen = micro_batch["calls"]
+                    if batched_flex_compaction:
+                        calls_for_midgen = [
+                            call
+                            for row_calls in calls_for_midgen
+                            for call in row_calls
+                        ]
                     has_midgen_local = any(
                         any(
                             int(getattr(e, "num_output_tokens_at_compaction", 0)) > 0
                             for e in (call.compaction_events or [])
                         )
-                        for call in micro_batch["calls"]
+                        for call in calls_for_midgen
                     )
                     # If ANY rank has a mid-gen event, ALL ranks fall back
                     # to legacy (per_call_segmented_forward defers mid-gen
@@ -1210,6 +1560,52 @@ def train(config: TrainerConfig):
                 accumulated_entropy_masked: list[torch.Tensor] = []
 
                 full_seq_len = input_ids.shape[1]
+                full_seq_lens = micro_batch.get("sequence_lengths")
+                if full_seq_lens is None:
+                    full_seq_lens = [full_seq_len] * int(input_ids.shape[0])
+                sequence_offsets = micro_batch.get("sequence_offsets")
+                if sequence_offsets is None:
+                    sequence_offsets = [0] * len(full_seq_lens)
+                singleton_compaction_row = (
+                    not batched_flex_compaction
+                    and not horizontal_flex_compaction
+                    and int(input_ids.shape[0]) == 1
+                )
+
+                def _row_slice(
+                    tensor: torch.Tensor,
+                    batch_idx: int,
+                    start: int,
+                    end: int,
+                ) -> torch.Tensor:
+                    if singleton_compaction_row:
+                        return tensor[:, start:end]
+                    if horizontal_flex_compaction:
+                        offset = int(sequence_offsets[batch_idx])
+                        return tensor[:, offset + start : offset + end]
+                    return tensor[batch_idx : batch_idx + 1, start:end]
+
+                def _row_assign(
+                    tensor: torch.Tensor,
+                    batch_idx: int,
+                    start: int,
+                    end: int,
+                    values: torch.Tensor,
+                ) -> None:
+                    if singleton_compaction_row:
+                        tensor[:, start:end] = values
+                        return
+                    if horizontal_flex_compaction:
+                        offset = int(sequence_offsets[batch_idx])
+                        tensor[:, offset + start : offset + end] = values
+                    else:
+                        tensor[batch_idx : batch_idx + 1, start:end] = values
+
+                def _full_seq_len_for_row(batch_idx: int) -> int:
+                    if singleton_compaction_row:
+                        return full_seq_len
+                    return int(full_seq_lens[batch_idx])
+
                 distill_cfg = config.compaction.distillation
                 distill_enabled = use_flex_mask and distill_cfg.enabled
                 distill_adv_adjustment = (
@@ -1232,6 +1628,7 @@ def train(config: TrainerConfig):
                 if (
                     (kve_top_mismatch_n > 0 or kve_call_mismatch_n > 0)
                     and (use_per_call or use_flex_mask)
+                    and not batched_flex_compaction
                     and _build_pre_trim_plan is not None
                 ):
                     try:
@@ -1251,15 +1648,19 @@ def train(config: TrainerConfig):
                             values[mask].detach().to("cpu", dtype=torch.float32)
                         )
 
-                distill_compact_state: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
+                distill_compact_state: dict[
+                    tuple[int, int, int], dict[str, torch.Tensor]
+                ] = {}
 
                 def _distill_effective_slice(
                     logits: torch.Tensor,
                     full_logit_start: int,
                     full_logit_end: int,
+                    batch_idx: int = 0,
                 ) -> tuple[torch.Tensor, int]:
-                    if full_logit_end >= full_seq_len:
-                        effective_logit_end = full_seq_len - 1
+                    row_full_seq_len = _full_seq_len_for_row(batch_idx)
+                    if full_logit_end >= row_full_seq_len:
+                        effective_logit_end = row_full_seq_len - 1
                         logits = logits[
                             :, : effective_logit_end - full_logit_start, :
                         ]
@@ -1270,17 +1671,29 @@ def train(config: TrainerConfig):
                 def _distill_labels_and_mask(
                     full_logit_start: int,
                     effective_logit_end: int,
+                    batch_idx: int = 0,
                 ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-                    distill_labels = labels[:, full_logit_start:effective_logit_end]
+                    distill_labels = _row_slice(
+                        labels,
+                        batch_idx,
+                        full_logit_start,
+                        effective_logit_end,
+                    )
                     tgt_start = full_logit_start + 1
                     tgt_end = effective_logit_end + 1
-                    distill_mask = loss_mask[:, tgt_start:tgt_end].bool()
+                    distill_mask = _row_slice(
+                        loss_mask,
+                        batch_idx,
+                        tgt_start,
+                        tgt_end,
+                    ).bool()
                     return distill_labels, distill_mask, tgt_start, tgt_end
 
                 def _segment_distillation_prepare_fn(
                     student_logits: torch.Tensor,
                     full_logit_start: int,
                     full_logit_end: int,
+                    batch_idx: int = 0,
                 ) -> None:
                     if distill_cfg.estimator != "rb_topk":
                         return
@@ -1288,18 +1701,22 @@ def train(config: TrainerConfig):
                         student_logits,
                         full_logit_start,
                         full_logit_end,
+                        batch_idx,
                     )
                     if effective_logit_end <= full_logit_start:
                         return
                     _, distill_mask, _, _ = _distill_labels_and_mask(
                         full_logit_start,
                         effective_logit_end,
+                        batch_idx,
                     )
                     if not distill_mask.any():
                         return
                     k = max(1, min(int(distill_cfg.top_k), student_eff.shape[-1]))
                     _, top_idx = torch.topk(student_eff.float(), k=k, dim=-1)
-                    distill_compact_state[(full_logit_start, effective_logit_end)] = {
+                    distill_compact_state[
+                        (batch_idx, full_logit_start, effective_logit_end)
+                    ] = {
                         "top_idx": top_idx.detach().to("cpu"),
                     }
 
@@ -1307,22 +1724,25 @@ def train(config: TrainerConfig):
                     teacher_logits: torch.Tensor,
                     full_logit_start: int,
                     full_logit_end: int,
+                    batch_idx: int = 0,
                 ) -> None:
                     teacher_eff, effective_logit_end = _distill_effective_slice(
                         teacher_logits,
                         full_logit_start,
                         full_logit_end,
+                        batch_idx,
                     )
                     if effective_logit_end <= full_logit_start:
                         return
                     distill_labels, distill_mask, _, _ = _distill_labels_and_mask(
                         full_logit_start,
                         effective_logit_end,
+                        batch_idx,
                     )
                     if not distill_mask.any():
                         return
 
-                    key = (full_logit_start, effective_logit_end)
+                    key = (batch_idx, full_logit_start, effective_logit_end)
                     state = distill_compact_state.setdefault(key, {})
                     teacher_float = teacher_eff.float()
                     teacher_logz = torch.logsumexp(
@@ -1358,15 +1778,17 @@ def train(config: TrainerConfig):
                     student_logits: torch.Tensor,
                     full_logit_start: int,
                     full_logit_end: int,
+                    batch_idx: int = 0,
                 ) -> torch.Tensor:
                     student_eff, effective_logit_end = _distill_effective_slice(
                         student_logits,
                         full_logit_start,
                         full_logit_end,
+                        batch_idx,
                     )
                     if effective_logit_end <= full_logit_start:
                         return student_logits.sum() * 0.0
-                    key = (full_logit_start, effective_logit_end)
+                    key = (batch_idx, full_logit_start, effective_logit_end)
                     state = distill_compact_state.get(key)
                     if state is None:
                         return student_eff.sum() * 0.0
@@ -1374,6 +1796,7 @@ def train(config: TrainerConfig):
                         _distill_labels_and_mask(
                             full_logit_start,
                             effective_logit_end,
+                            batch_idx,
                         )
                     )
                     if not distill_mask.any():
@@ -1437,10 +1860,16 @@ def train(config: TrainerConfig):
                     reward_signal = kl
                     if distill_adv_adjustment is not None and distill_cfg.reward_coef > 0:
                         shaped_reward = -distill_cfg.reward_coef * reward_signal.detach()
-                        distill_adv_adjustment[:, tgt_start:tgt_end] = torch.where(
-                            distill_mask,
-                            shaped_reward,
-                            torch.zeros_like(shaped_reward),
+                        _row_assign(
+                            distill_adv_adjustment,
+                            batch_idx,
+                            tgt_start,
+                            tgt_end,
+                            torch.where(
+                                distill_mask,
+                                shaped_reward,
+                                torch.zeros_like(shaped_reward),
+                            ),
                         )
                         _append_distill_metric(
                             "distill/reward",
@@ -1483,9 +1912,11 @@ def train(config: TrainerConfig):
                     teacher_logits: torch.Tensor,
                     full_logit_start: int,
                     full_logit_end: int,
+                    batch_idx: int = 0,
                 ) -> torch.Tensor:
-                    if full_logit_end >= full_seq_len:
-                        effective_logit_end = full_seq_len - 1
+                    row_full_seq_len = _full_seq_len_for_row(batch_idx)
+                    if full_logit_end >= row_full_seq_len:
+                        effective_logit_end = row_full_seq_len - 1
                         student_eff = student_logits[
                             :, : effective_logit_end - full_logit_start, :
                         ]
@@ -1499,10 +1930,20 @@ def train(config: TrainerConfig):
                     if effective_logit_end <= full_logit_start:
                         return student_logits.sum() * 0.0
 
-                    distill_labels = labels[:, full_logit_start:effective_logit_end]
+                    distill_labels = _row_slice(
+                        labels,
+                        batch_idx,
+                        full_logit_start,
+                        effective_logit_end,
+                    )
                     tgt_start = full_logit_start + 1
                     tgt_end = effective_logit_end + 1
-                    distill_mask = loss_mask[:, tgt_start:tgt_end].bool()
+                    distill_mask = _row_slice(
+                        loss_mask,
+                        batch_idx,
+                        tgt_start,
+                        tgt_end,
+                    ).bool()
                     terms = compute_reverse_kl_terms(
                         student_logits=student_eff,
                         teacher_logits=teacher_eff,
@@ -1514,10 +1955,16 @@ def train(config: TrainerConfig):
                     reward_signal = terms.kl
                     if distill_adv_adjustment is not None and distill_cfg.reward_coef > 0:
                         shaped_reward = -distill_cfg.reward_coef * reward_signal.detach()
-                        distill_adv_adjustment[:, tgt_start:tgt_end] = torch.where(
-                            distill_mask,
-                            shaped_reward,
-                            torch.zeros_like(shaped_reward),
+                        _row_assign(
+                            distill_adv_adjustment,
+                            batch_idx,
+                            tgt_start,
+                            tgt_end,
+                            torch.where(
+                                distill_mask,
+                                shaped_reward,
+                                torch.zeros_like(shaped_reward),
+                            ),
                         )
                         _append_distill_metric(
                             "distill/reward",
@@ -1555,10 +2002,206 @@ def train(config: TrainerConfig):
                         / loss_scale
                     )
 
+                def _segment_selected_logprob_inputs_fn(
+                    full_logit_start: int,
+                    full_logit_end: int,
+                    batch_idx: int = 0,
+                ) -> tuple[torch.Tensor, torch.Tensor, int]:
+                    row_full_seq_len = _full_seq_len_for_row(batch_idx)
+                    effective_logit_end = min(
+                        int(full_logit_end),
+                        row_full_seq_len - 1,
+                    )
+                    if effective_logit_end <= full_logit_start:
+                        return (
+                            _row_slice(
+                                labels,
+                                batch_idx,
+                                full_logit_start,
+                                full_logit_start,
+                            ),
+                            _row_slice(
+                                temperatures,
+                                batch_idx,
+                                full_logit_start,
+                                full_logit_start,
+                            ),
+                            effective_logit_end,
+                        )
+                    return (
+                        _row_slice(
+                            labels,
+                            batch_idx,
+                            full_logit_start,
+                            effective_logit_end,
+                        ),
+                        _row_slice(
+                            temperatures,
+                            batch_idx,
+                            full_logit_start,
+                            effective_logit_end,
+                        ),
+                        effective_logit_end,
+                    )
+
+                def _segment_selected_logprob_loss_fn(
+                    seg_raw_logprobs: torch.Tensor,
+                    seg_entropy: torch.Tensor,
+                    full_logit_start: int,
+                    effective_logit_end: int,
+                    batch_idx: int = 0,
+                ) -> torch.Tensor:
+                    if effective_logit_end <= full_logit_start:
+                        return seg_raw_logprobs.sum() * 0.0
+
+                    tgt_start = full_logit_start + 1
+                    tgt_end = effective_logit_end + 1
+                    seg_adv = _row_slice(advantages, batch_idx, tgt_start, tgt_end)
+                    seg_mask = _row_slice(loss_mask, batch_idx, tgt_start, tgt_end)
+                    seg_inf = _row_slice(
+                        inference_logprobs,
+                        batch_idx,
+                        tgt_start,
+                        tgt_end,
+                    )
+                    seg_teach = (
+                        _row_slice(
+                            teacher_logprobs,
+                            batch_idx,
+                            tgt_start,
+                            tgt_end,
+                        )
+                        if teacher_logprobs is not None
+                        else None
+                    )
+                    seg_loss_val, seg_metrics = compute_loss(
+                        trainer_logprobs=(seg_raw_logprobs.squeeze(0),),
+                        inference_logprobs=(seg_inf.squeeze(0),),
+                        teacher_logprobs=(
+                            (seg_teach.squeeze(0),) if seg_teach is not None else None
+                        ),
+                        advantages=(seg_adv.squeeze(0),),
+                        loss_mask=(seg_mask.squeeze(0),),
+                        loss_fn=loss_fn,
+                        loss_scale=loss_scale,
+                    )
+                    for mk, mv in seg_metrics.items():
+                        accumulated_loss_tensors.setdefault(mk, []).append(
+                            mv.detach()
+                        )
+                    with torch.no_grad():
+                        seg_loss_mask_1d = seg_mask.squeeze(0).bool()
+                        if seg_loss_mask_1d.any():
+                            seg_trainer_lp_1d = seg_raw_logprobs.squeeze(0)
+                            seg_inf_lp_1d = seg_inf.squeeze(0)
+                            seg_adv_1d = seg_adv.squeeze(0)
+                            seg_log_ratio = seg_trainer_lp_1d - seg_inf_lp_1d
+                            seg_token_kl = (
+                                torch.exp(seg_log_ratio) - seg_log_ratio - 1.0
+                            )
+                            accumulated_loss_tensors.setdefault(
+                                "mismatch_kl_token_weighted", []
+                            ).append(
+                                seg_token_kl[seg_loss_mask_1d]
+                                .detach()
+                                .to("cpu", dtype=torch.float32)
+                            )
+                            accumulated_loss_tensors.setdefault(
+                                "trainer_infer_logprob_delta_token_weighted", []
+                            ).append(
+                                seg_log_ratio[seg_loss_mask_1d]
+                                .detach()
+                                .to("cpu", dtype=torch.float32)
+                            )
+                            seg_prob_delta = torch.exp(seg_trainer_lp_1d) - torch.exp(
+                                seg_inf_lp_1d
+                            )
+                            accumulated_loss_tensors.setdefault(
+                                "trainer_infer_prob_delta_token_weighted", []
+                            ).append(
+                                seg_prob_delta[seg_loss_mask_1d]
+                                .detach()
+                                .to("cpu", dtype=torch.float32)
+                            )
+
+                            if isinstance(config.loss, DefaultLossConfig):
+                                seg_prob_diff = seg_prob_delta
+                                seg_dppo_high = (
+                                    seg_prob_diff > config.loss.dppo_mask_high
+                                )
+                                seg_dppo_low = (
+                                    seg_prob_diff < -config.loss.dppo_mask_low
+                                )
+                                seg_dppo_mask = torch.where(
+                                    seg_adv_1d > 0,
+                                    seg_dppo_high,
+                                    seg_dppo_low,
+                                )
+                                seg_keep_mask = seg_loss_mask_1d & ~seg_dppo_mask
+                                seg_masked_mask = seg_loss_mask_1d & seg_dppo_mask
+                                if seg_keep_mask.any():
+                                    accumulated_loss_tensors.setdefault(
+                                        "unmasked_mismatch_kl_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_token_kl[seg_keep_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                    accumulated_loss_tensors.setdefault(
+                                        "unmasked_trainer_infer_logprob_delta_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_log_ratio[seg_keep_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                    accumulated_loss_tensors.setdefault(
+                                        "unmasked_trainer_infer_prob_delta_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_prob_delta[seg_keep_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                if seg_masked_mask.any():
+                                    accumulated_loss_tensors.setdefault(
+                                        "masked_mismatch_kl_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_token_kl[seg_masked_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                    accumulated_loss_tensors.setdefault(
+                                        "masked_trainer_infer_logprob_delta_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_log_ratio[seg_masked_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+                                    accumulated_loss_tensors.setdefault(
+                                        "masked_trainer_infer_prob_delta_token_weighted",
+                                        [],
+                                    ).append(
+                                        seg_prob_delta[seg_masked_mask]
+                                        .detach()
+                                        .to("cpu", dtype=torch.float32)
+                                    )
+
+                    accumulated_entropy_masked.append(
+                        seg_entropy.squeeze(0)[seg_mask.squeeze(0).bool()]
+                        .detach()
+                        .to("cpu")
+                    )
+                    return seg_loss_val
+
                 def _segment_loss_fn(
                     seg_logits: torch.Tensor,  # [1, seg_owned_logits, vocab]
                     full_logit_start: int,
                     full_logit_end: int,
+                    batch_idx: int = 0,
                 ) -> torch.Tensor:
                     # Logit at position P predicts token at P+1, so a
                     # segment's owned logit range [full_logit_start,
@@ -1572,8 +2215,9 @@ def train(config: TrainerConfig):
                     # dropping the final logit and capping tgt_end at
                     # full_seq_len. Matches the loss contribution of
                     # the standard path exactly.
-                    if full_logit_end >= full_seq_len:
-                        effective_logit_end = full_seq_len - 1
+                    row_full_seq_len = _full_seq_len_for_row(batch_idx)
+                    if full_logit_end >= row_full_seq_len:
+                        effective_logit_end = row_full_seq_len - 1
                         seg_logits_effective = seg_logits[
                             :, : effective_logit_end - full_logit_start, :
                         ]
@@ -1601,7 +2245,12 @@ def train(config: TrainerConfig):
                         # tokens.
                         return seg_logits.sum() * 0.0
 
-                    seg_labels = labels[:, full_logit_start:effective_logit_end]
+                    seg_labels = _row_slice(
+                        labels,
+                        batch_idx,
+                        full_logit_start,
+                        effective_logit_end,
+                    )
                     seg_raw_logprobs = selective_log_softmax(
                         seg_logits_effective, seg_labels
                     )
@@ -1610,11 +2259,21 @@ def train(config: TrainerConfig):
                     # which is always within [1, full_seq_len].
                     tgt_start = full_logit_start + 1
                     tgt_end = effective_logit_end + 1
-                    seg_adv = advantages[:, tgt_start:tgt_end]
+                    seg_adv = _row_slice(advantages, batch_idx, tgt_start, tgt_end)
                     if distill_adv_adjustment is not None:
-                        seg_adv = seg_adv + distill_adv_adjustment[:, tgt_start:tgt_end]
-                    seg_mask = loss_mask[:, tgt_start:tgt_end]
-                    seg_inf = inference_logprobs[:, tgt_start:tgt_end]
+                        seg_adv = seg_adv + _row_slice(
+                            distill_adv_adjustment,
+                            batch_idx,
+                            tgt_start,
+                            tgt_end,
+                        )
+                    seg_mask = _row_slice(loss_mask, batch_idx, tgt_start, tgt_end)
+                    seg_inf = _row_slice(
+                        inference_logprobs,
+                        batch_idx,
+                        tgt_start,
+                        tgt_end,
+                    )
 
                     # ── KVE per-token (V_lp, T_lp) dump for KL scatter
                     # analysis. Each call to _segment_loss_fn corresponds
@@ -1695,7 +2354,12 @@ def train(config: TrainerConfig):
                                         f"{int(_keep_cpu[_j].item())}\n"
                                     )
                     seg_teach = (
-                        teacher_logprobs[:, tgt_start:tgt_end]
+                        _row_slice(
+                            teacher_logprobs,
+                            batch_idx,
+                            tgt_start,
+                            tgt_end,
+                        )
                         if teacher_logprobs is not None
                         else None
                     )
@@ -1909,44 +2573,134 @@ def train(config: TrainerConfig):
                     )
                     return seg_loss_val
 
+                selected_logprob_flex = False
+                if (
+                    use_flex_mask
+                    and not distill_enabled
+                    and isinstance(
+                        config.model.fused_lm_head_token_chunk_size,
+                        int,
+                    )
+                    and not os.environ.get("KVE_DUMP_LOGPROB_CSV", "")
+                    and kve_top_mismatch_n <= 0
+                    and kve_call_mismatch_n <= 0
+                ):
+                    if horizontal_flex_compaction:
+                        selected_logprob_flex = (
+                            selected_logprob_packed_flex_mask_segmented_forward
+                            is not None
+                        )
+                    elif batched_flex_compaction:
+                        selected_logprob_flex = (
+                            selected_logprob_batched_flex_mask_segmented_forward
+                            is not None
+                        )
+                    else:
+                        selected_logprob_flex = (
+                            selected_logprob_flex_mask_segmented_forward
+                            is not None
+                        )
+                    if selected_logprob_flex:
+                        # The historical flex path ignored per-token
+                        # temperature. Keep this optimization constrained to
+                        # the production-equivalent TextWorld setting we
+                        # validated, where temperatures are all 1.0.
+                        selected_logprob_flex = bool(
+                            torch.all(temperatures == 1).item()
+                        )
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    selected_t = torch.tensor(
+                        [int(selected_logprob_flex)],
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    dist.all_reduce(selected_t, op=dist.ReduceOp.MIN)
+                    selected_logprob_flex = bool(selected_t.item())
+
                 with (
                     maybe_record_function("forward"),
                     maybe_activation_offloading(config.model.ac_offloading),
                 ):
                     if use_flex_mask:
-                        out = flex_mask_segmented_forward(
-                            model=model,
-                            calls=micro_batch["calls"],
-                            merged_input_ids=input_ids,
-                            merged_position_ids=forward_position_ids,
-                            loss_fn=_segment_loss_fn,
-                            max_forward_passes=max_forwards,
-                            distillation_fn=(
-                                _segment_distillation_fn
-                                if distill_enabled
-                                and distill_cfg.estimator == "rb_full"
-                                else None
-                            ),
-                            distillation_prepare_fn=(
-                                _segment_distillation_prepare_fn
-                                if distill_enabled
-                                and distill_cfg.estimator == "rb_topk"
-                                else None
-                            ),
-                            distillation_teacher_fn=(
-                                _segment_distillation_teacher_fn
-                                if distill_enabled
-                                and distill_cfg.estimator != "rb_full"
-                                else None
-                            ),
-                            distillation_loss_fn=(
-                                _segment_distillation_loss_fn
-                                if distill_enabled
-                                and distill_cfg.estimator != "rb_full"
-                                else None
-                            ),
-                            device=input_ids.device,
-                        )
+                        if selected_logprob_flex:
+                            selected_kwargs = dict(
+                                model=model,
+                                merged_input_ids=input_ids,
+                                merged_position_ids=forward_position_ids,
+                                inputs_fn=_segment_selected_logprob_inputs_fn,
+                                loss_fn=_segment_selected_logprob_loss_fn,
+                                max_forward_passes=max_forwards,
+                                device=input_ids.device,
+                            )
+                            if batched_flex_compaction:
+                                if horizontal_flex_compaction:
+                                    out = (
+                                        selected_logprob_packed_flex_mask_segmented_forward(
+                                            calls_batch=micro_batch["calls"],
+                                            **selected_kwargs,
+                                        )
+                                    )
+                                else:
+                                    out = (
+                                        selected_logprob_batched_flex_mask_segmented_forward(
+                                            calls_batch=micro_batch["calls"],
+                                            **selected_kwargs,
+                                        )
+                                    )
+                            else:
+                                out = selected_logprob_flex_mask_segmented_forward(
+                                    calls=micro_batch["calls"],
+                                    **selected_kwargs,
+                                )
+                        else:
+                            flex_kwargs = dict(
+                                model=model,
+                                merged_input_ids=input_ids,
+                                merged_position_ids=forward_position_ids,
+                                loss_fn=_segment_loss_fn,
+                                max_forward_passes=max_forwards,
+                                distillation_fn=(
+                                    _segment_distillation_fn
+                                    if distill_enabled
+                                    and distill_cfg.estimator == "rb_full"
+                                    else None
+                                ),
+                                distillation_prepare_fn=(
+                                    _segment_distillation_prepare_fn
+                                    if distill_enabled
+                                    and distill_cfg.estimator == "rb_topk"
+                                    else None
+                                ),
+                                distillation_teacher_fn=(
+                                    _segment_distillation_teacher_fn
+                                    if distill_enabled
+                                    and distill_cfg.estimator != "rb_full"
+                                    else None
+                                ),
+                                distillation_loss_fn=(
+                                    _segment_distillation_loss_fn
+                                    if distill_enabled
+                                    and distill_cfg.estimator != "rb_full"
+                                    else None
+                                ),
+                                device=input_ids.device,
+                            )
+                            if batched_flex_compaction:
+                                if horizontal_flex_compaction:
+                                    out = packed_flex_mask_segmented_forward(
+                                        calls_batch=micro_batch["calls"],
+                                        **flex_kwargs,
+                                    )
+                                else:
+                                    out = batched_flex_mask_segmented_forward(
+                                        calls_batch=micro_batch["calls"],
+                                        **flex_kwargs,
+                                    )
+                            else:
+                                out = flex_mask_segmented_forward(
+                                    calls=micro_batch["calls"],
+                                    **flex_kwargs,
+                                )
                     elif use_per_call:
                         out = per_call_segmented_forward(
                             model=model,
@@ -2084,16 +2838,19 @@ def train(config: TrainerConfig):
                     out["entropy"], pad_value=torch.log(torch.tensor(float(vocab_size))).item()
                 )
 
-                # Compute loss
-                response_lengths = get_response_lengths(position_ids)
+                # Compute loss. Standard micro-batch stacking introduces a
+                # real batch dimension, so flatten and split by the existing
+                # packed-position convention instead of using squeeze().
                 loss, loss_tensors = compute_loss(
-                    trainer_logprobs=out["logprobs"].squeeze().split(response_lengths),
-                    inference_logprobs=inference_logprobs.squeeze().split(response_lengths),
-                    teacher_logprobs=teacher_logprobs.squeeze().split(response_lengths)
-                    if teacher_logprobs is not None
-                    else None,
-                    advantages=advantages.squeeze().split(response_lengths),
-                    loss_mask=loss_mask.squeeze().split(response_lengths),
+                    trainer_logprobs=split_packed_batch(out["logprobs"], position_ids),
+                    inference_logprobs=split_packed_batch(inference_logprobs, position_ids),
+                    teacher_logprobs=(
+                        split_packed_batch(teacher_logprobs, position_ids)
+                        if teacher_logprobs is not None
+                        else None
+                    ),
+                    advantages=split_packed_batch(advantages, position_ids),
+                    loss_mask=split_packed_batch(loss_mask, position_ids),
                     loss_fn=loss_fn,
                     loss_scale=loss_scale,
                 )
@@ -2150,23 +2907,23 @@ def train(config: TrainerConfig):
             # call.compaction_events (the outer sample.compaction_events
             # gets emptied by _apply_admission_trim). Aggregate from both
             # sources so the metric reflects all events that fired.
-            metric_events = list(compaction_events or [])
-            if (use_per_call or use_flex_mask) and micro_batch.get("calls"):
-                for call in micro_batch["calls"]:
-                    metric_events.extend(call.compaction_events or [])
-            if metric_events:
-                n_events = len(metric_events)
-                total_evicted = sum(e.tokens_evicted for e in metric_events)
+            metric_event_rows = compaction_metric_events_by_row(
+                compaction_events,
+                micro_batch.get("calls"),
+                include_call_events=(use_per_call or use_flex_mask),
+            )
+            metric_counts = [len(events) for events in metric_event_rows]
+            if any(metric_counts) or use_segmented:
+                evicted_counts = [
+                    sum(getattr(event, "tokens_evicted", 0) for event in events)
+                    for events in metric_event_rows
+                ]
                 tensors["compaction/num_events"].append(
-                    torch.tensor([float(n_events)])
+                    torch.tensor(metric_counts, dtype=torch.float32)
                 )
                 tensors["compaction/tokens_evicted"].append(
-                    torch.tensor([float(total_evicted)])
+                    torch.tensor(evicted_counts, dtype=torch.float32)
                 )
-            elif use_segmented:
-                # Event-less sample in a compaction run — record zeros
-                tensors["compaction/num_events"].append(torch.tensor([0.0]))
-                tensors["compaction/tokens_evicted"].append(torch.tensor([0.0]))
 
             # Debug log with *local, micro step* stats. Entropy is now
             # computed for both the standard path (out["entropy"][loss_mask])
@@ -2178,7 +2935,8 @@ def train(config: TrainerConfig):
             # tokens), the appended tensor is zero-length and .mean()
             # returns NaN — acceptable for a debug log.
             micro_step_message = (
-                f"Micro Step {micro_step}/{len(micro_batches)} | "
+                f"Micro Step {micro_step}/{len(micro_batch_groups)} "
+                f"(stack={stacked_micro_batches}) | "
                 f"Loss: {tensors['loss'][-1].mean().item():.4f}"
             )
             if len(tensors["entropy"]) > 0 and tensors["entropy"][-1].numel() > 0:
@@ -2199,11 +2957,18 @@ def train(config: TrainerConfig):
                 micro_step_message += f" | Max Vio: {tensors['max_vio'][-1].mean().item():.4f}"
             logger.debug(micro_step_message)
 
-            if _KVE_MEM_TRACE:
+            if _KVE_MEM_TRACE or _KVE_STACK_TRACE:
+                _dt_part = (
+                    f" dt={time.perf_counter() - _trace_mb_start_time:.2f}s"
+                    if _trace_mb_start_time is not None
+                    else ""
+                )
                 logger.info(
-                    _mem_snap(
-                        f"mb {micro_step}/{len(micro_batches)} "
-                        f"{_compaction_flag} EXIT"
+                    _trace_snap(
+                        f"mb {micro_step}/{len(micro_batch_groups)} "
+                        f"{_compaction_flag} stack={stacked_micro_batches} "
+                        f"shape={tuple(micro_batch['input_ids'].shape)}"
+                        f"{_stack_trace} EXIT{_dt_part}"
                     )
                 )
 
@@ -2244,7 +3009,7 @@ def train(config: TrainerConfig):
         tensor_stats = tensors.compute_stats()
 
         # Compute step metrics
-        num_local_tokens = seq_len * batch_size
+        num_local_tokens = sum(int(micro_batch["input_ids"].numel()) for micro_batch in micro_batches)
         num_tokens = parallel_dims.get_mesh("dp").size() * num_local_tokens
         progress.total_tokens += num_tokens
         progress.total_samples += batch_size

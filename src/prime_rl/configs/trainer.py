@@ -877,6 +877,48 @@ class DataLoaderConfig(BaseConfig):
     """Configures the data loader used for training."""
 
     fake: Annotated[FakeDataLoaderConfig | None, Field(description="Whether to use a fake data loader.")] = None
+    micro_batch_stack_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of compatible standard text micro-batches to stack "
+                "along the batch dimension into one trainer forward. When "
+                "micro_batch_stack_token_budget is set, this becomes the "
+                "maximum number of rows in one stacked forward. This only "
+                "applies to non-compaction, non-multimodal, non-LoRA, "
+                "single-run batches; other batches remain isolated."
+            ),
+        ),
+    ] = 1
+    micro_batch_stack_token_budget: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Optional cap on padded token slots in one stacked standard "
+                "text forward, computed as rows * max_seq_len_in_stack. If "
+                "unset, stacking uses the fixed micro_batch_stack_size count. "
+                "For example, 65536 caps full-context 16k rows at four rows "
+                "while allowing more underfilled Markovian rows when "
+                "micro_batch_stack_size is set higher."
+            ),
+        ),
+    ] = None
+    micro_batch_flex_stack_mode: Annotated[
+        Literal["vertical", "horizontal"],
+        Field(
+            description=(
+                "How compatible FlexAttention compaction micro-batches are "
+                "combined when micro_batch_stack_size > 1. vertical pads rows "
+                "to the largest writer length; horizontal concatenates logical "
+                "samples into one packed sequence and uses a block mask to "
+                "prevent cross-sample attention. The token budget caps padded "
+                "slots for vertical mode and useful writer tokens for "
+                "horizontal mode."
+            ),
+        ),
+    ] = "vertical"
 
 
 class BaseWeightBroadcastConfig(BaseModel):

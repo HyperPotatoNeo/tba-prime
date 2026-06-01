@@ -68,6 +68,7 @@ def test_markovian_kv_eviction_expands_coupled_flags():
     assert config.orchestrator.use_token_client is False
     assert config.orchestrator.compaction_padding.enabled is True
     assert config.orchestrator.compaction_padding.phase4_enabled is True
+    assert config.orchestrator.compaction_padding.phase4_weight_sync_strategy == "drain"
 
     assert config.trainer.model.impl == "hf"
     assert config.trainer.model.attn == "flex_attention"
