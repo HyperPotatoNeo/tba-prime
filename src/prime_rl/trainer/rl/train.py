@@ -968,6 +968,31 @@ def train(config: TrainerConfig):
         load_data_time = time.perf_counter() - load_data_start_time
         logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
 
+        # Offline-repro dump: serialize the step's raw MicroBatches (calls,
+        # compaction/restore events, inference logprobs) so the flex-mask
+        # replay harnesses can re-run trainer forwards deterministically
+        # off-cluster. One file per (rank, step); msgspec list[MicroBatch],
+        # the format compare_flexmask_per_call.py already decodes.
+        _kve_dump_dir = os.environ.get("KVE_DUMP_MICRO_BATCHES", "")
+        if _kve_dump_dir:
+            try:
+                import msgspec as _msgspec
+
+                _rank = int(os.environ.get("RANK", "0"))
+                os.makedirs(_kve_dump_dir, exist_ok=True)
+                _dump_path = os.path.join(
+                    _kve_dump_dir,
+                    f"micro_batches_rank{_rank}_step{progress.step}.bin",
+                )
+                with open(_dump_path, "wb") as _fh:
+                    _fh.write(_msgspec.msgpack.encode(micro_batches))
+                logger.warning(
+                    f"[KVE-DUMP] wrote {len(micro_batches)} micro-batches "
+                    f"to {_dump_path}"
+                )
+            except Exception:
+                logger.exception("[KVE-DUMP] micro-batch dump failed")
+
         batch_size = len(micro_batches)
         flex_stack_mode = config.data.micro_batch_flex_stack_mode
         stacking_enabled = int(config.data.micro_batch_stack_size) > 1
