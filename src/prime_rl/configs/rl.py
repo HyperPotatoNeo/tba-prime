@@ -678,6 +678,35 @@ class RLConfig(BaseConfig):
         if not compaction_in_use:
             return self
 
+        inf_max_turns = int(vllm_extra.get("compaction_max_turns", 0) or 0)
+        if inf_max_turns > 0:
+            # Turn-mode eviction: the engine forbids window/stride alongside
+            # compaction_max_turns (mutually exclusive modes, arg_utils
+            # assert). trainer.compaction window/stride stay nominal — they
+            # only gate compaction-sample routing and dispatch enablement;
+            # CompactionEvents are authoritative for eviction boundaries.
+            if inf_window > 0 or inf_stride > 0:
+                raise ValueError(
+                    "inference.vllm_extra sets compaction_max_turns="
+                    f"{inf_max_turns} together with compaction_window_size="
+                    f"{inf_window}/compaction_stride={inf_stride}. vLLM "
+                    "rejects both modes at once; remove window/stride from "
+                    "vllm_extra for turn-mode eviction."
+                )
+            if tr_window <= 0:
+                raise ValueError(
+                    "turn-mode eviction (inference.vllm_extra."
+                    "compaction_max_turns > 0) still requires a nominal "
+                    "trainer.compaction.window_size > 0 to enable "
+                    "compaction sample routing/dispatch."
+                )
+            if tr_block_size != inf_block_size:
+                raise ValueError(
+                    f"block_size mismatch in turn-mode eviction: trainer="
+                    f"{tr_block_size}, inference.vllm_extra={inf_block_size}"
+                )
+            return self
+
         mismatches: list[str] = []
         if tr_window != inf_window:
             mismatches.append(
