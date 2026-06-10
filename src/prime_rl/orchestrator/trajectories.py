@@ -330,6 +330,18 @@ def _build_summary_sample(
                             archived_span_ids=[
                                 str(x) for x in (e.get("archived_span_ids") or [])
                             ],
+                            archived_span_bounds=[
+                                int(x)
+                                for x in (e.get("archived_span_bounds") or [])
+                            ],
+                            event_kind=int(e.get("event_kind", 0)),
+                            restored_span_ids=[
+                                str(x)
+                                for x in (e.get("restored_span_ids") or [])
+                            ],
+                            visibility_boundary_computed=int(
+                                e.get("visibility_boundary_computed", -1)
+                            ),
                         )
                     )
                 except (KeyError, TypeError, ValueError):
@@ -355,6 +367,16 @@ def _build_summary_sample(
                             archived_span_ids=[str(x) for x in e[10]]
                             if len(e) >= 11 and e[10]
                             else [],
+                            archived_span_bounds=[int(x) for x in e[11]]
+                            if len(e) >= 12 and e[11]
+                            else [],
+                            event_kind=int(e[12]) if len(e) >= 13 else 0,
+                            restored_span_ids=[str(x) for x in e[13]]
+                            if len(e) >= 14 and e[13]
+                            else [],
+                            visibility_boundary_computed=int(e[14])
+                            if len(e) >= 15
+                            else -1,
                         )
                     )
                 except (TypeError, ValueError):
@@ -627,6 +649,17 @@ def interleave_rollout(
                         archived_span_ids=[
                             str(x) for x in (e.get("archived_span_ids") or [])
                         ],
+                        archived_span_bounds=[
+                            int(x)
+                            for x in (e.get("archived_span_bounds") or [])
+                        ],
+                        event_kind=int(e.get("event_kind", 0)),
+                        restored_span_ids=[
+                            str(x) for x in (e.get("restored_span_ids") or [])
+                        ],
+                        visibility_boundary_computed=int(
+                            e.get("visibility_boundary_computed", -1)
+                        ),
                     )
                 )
             elif isinstance(e, (list, tuple)) and len(e) >= 3:
@@ -650,6 +683,16 @@ def interleave_rollout(
                         archived_span_ids=[str(x) for x in e[10]]
                         if len(e) >= 11 and e[10]
                         else [],
+                        archived_span_bounds=[int(x) for x in e[11]]
+                        if len(e) >= 12 and e[11]
+                        else [],
+                        event_kind=int(e[12]) if len(e) >= 13 else 0,
+                        restored_span_ids=[str(x) for x in e[13]]
+                        if len(e) >= 14 and e[13]
+                        else [],
+                        visibility_boundary_computed=int(e[14])
+                        if len(e) >= 15
+                        else -1,
                     )
                 )
         return out or None

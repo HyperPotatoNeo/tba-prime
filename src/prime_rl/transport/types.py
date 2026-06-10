@@ -76,6 +76,29 @@ class CompactionEventWire(
     # by this eviction. Empty unless managed context is explicitly enabled.
     archived_span_ids: list[str] = msgspec.field(default_factory=list)
 
+    # Managed-context extension: per-span [start, end) bounds for each entry
+    # in archived_span_ids, flattened pairs in the same pre-event frame as
+    # evict_start/kept_indices. Length = 2 * len(archived_span_ids). Maps a
+    # span id (referenced later by restore events) to the exact rows that
+    # died at this event.
+    archived_span_bounds: list[int] = msgspec.field(default_factory=list)
+
+    # Managed-context restore lifecycle. 0 = eviction (default); 1 = hidden
+    # restore ATTACH (restored_span_ids became visible to subsequent
+    # queries); 2 = restore RELEASE (they left visibility). Kind 1/2 events
+    # carry zeros/defaults in the eviction fields; the trainer's interval-
+    # visibility mask consumes them, and the death-index (eviction-only)
+    # paths must hard-error if one appears.
+    event_kind: int = 0
+
+    # Kind 1/2 only: span ids attached/released by this event.
+    restored_span_ids: list[str] = msgspec.field(default_factory=list)
+
+    # Kind 1/2 only: the request's num_computed_tokens (current frame) at
+    # the visibility change. Queries at positions >= this boundary see
+    # (kind 1) / stop seeing (kind 2) the spans. -1 on eviction events.
+    visibility_boundary_computed: int = -1
+
 
 class CallWire(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A single vLLM chat() call within a rollout (Phase B of
