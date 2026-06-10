@@ -288,6 +288,13 @@ class InferenceConfig(BaseConfig):
         ),
     ] = None
 
+    attention_backend: Annotated[
+        str | None,
+        Field(
+            description='Attention backend to use. Passed to vLLM as `--attention-backend`, e.g. "FLEX_ATTENTION".',
+        ),
+    ] = None
+
     gpu_memory_utilization: Annotated[
         float,
         Field(
@@ -492,6 +499,7 @@ class InferenceConfig(BaseConfig):
             "data_parallel_rpc_port": "data_parallel_rpc_port",
             "enable_lora": "enable_lora",
             "enable_prefix_caching": "enable_prefix_caching",
+            "attention_backend": "attention_backend",
             "max_loras": "max_loras",
             "max_cpu_loras": "max_cpu_loras",
             "max_lora_rank": "max_lora_rank",
