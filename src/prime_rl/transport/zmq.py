@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from time import time
 
@@ -281,6 +282,23 @@ class ZMQMicroBatchReceiver(MicroBatchReceiver):
     def receive(self) -> list[MicroBatch]:
         """Receive a micro batch from the trainer."""
         _, payload = self.socket.recv_multipart(copy=False)
+        # Offline-repro dump: write the RAW wire payload (msgspec
+        # list[MicroBatch]) so replay harnesses decode byte-identical
+        # batches. One file per (rank, recv-step).
+        _dump_dir = os.environ.get("KVE_DUMP_MICRO_BATCHES", "")
+        if _dump_dir:
+            try:
+                _rank = int(os.environ.get("RANK", "0"))
+                os.makedirs(_dump_dir, exist_ok=True)
+                _path = os.path.join(
+                    _dump_dir,
+                    f"micro_batches_rank{_rank}_recv{self._current_step}.bin",
+                )
+                with open(_path, "wb") as _fh:
+                    _fh.write(bytes(payload.buffer))
+                self.logger.warning(f"[KVE-DUMP] wrote {_path}")
+            except Exception:
+                self.logger.exception("[KVE-DUMP] payload dump failed")
         micro_batches: list[MicroBatch] = self.decoder.decode(payload)
         self.logger.debug(f"Received {len(micro_batches)} micro batches for step {self._current_step}")
         self._current_step += 1
