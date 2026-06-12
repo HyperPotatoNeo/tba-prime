@@ -200,7 +200,6 @@ from prime_rl.utils.monitor import setup_monitor
 from prime_rl.utils.config import cli
 from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
-from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
 
 
@@ -836,6 +835,10 @@ def train(config: TrainerConfig):
     if parallel_dims.cp_enabled:
         cp_group = parallel_dims.world_mesh["cp"].get_group()
         cp_rank = parallel_dims.world_mesh["cp"].get_local_rank()
+        # Lazy: ring_flash_attn requires flash_attn (cluster images only);
+        # this path only runs at cp>1.
+        from ring_flash_attn import substitute_hf_flash_attn
+
         substitute_hf_flash_attn(cp_group, heads_k_stride=1)
         substitute_ring_attn(cp_group, heads_k_stride=1, attn_impl=config.model.attn)
         from prime_rl.utils.cp import setup_hybrid_cp, setup_sparse_mla_cp

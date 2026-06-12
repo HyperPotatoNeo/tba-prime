@@ -4,7 +4,6 @@ import torch
 import torch.distributed as dist
 import torch.distributed.nn as dist_nn
 import torch.nn as nn
-from ring_flash_attn import update_ring_flash_attn_params
 
 
 def setup_hybrid_cp(model: nn.Module, cp_group: dist.ProcessGroup, cp_rank: int, cp_world_size: int) -> None:
@@ -151,6 +150,11 @@ def setup_cp_params(
     input_ids = shard_for_cp(input_ids, cp_rank=cp_rank, cp_world_size=cp_world_size)
 
     cu_seqlens = _get_cu_seqlens_for_cp(position_ids)
+    # Lazy: ring_flash_attn requires flash_attn, which only exists on
+    # cluster images. This path only runs at cp>1, so plain-FSDP boxes
+    # (flex_attention, cp=1) must not pay the import at module load.
+    from ring_flash_attn import update_ring_flash_attn_params
+
     update_ring_flash_attn_params(cu_seqlens, cp_group)
     position_ids = shard_for_cp(position_ids, cp_rank=cp_rank, cp_world_size=cp_world_size)
     return (
