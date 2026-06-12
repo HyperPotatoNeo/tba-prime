@@ -1261,6 +1261,33 @@ class OrchestratorConfig(BaseConfig):
     # `plans/markovian_thinker_baseline.md`.
     markovian_thinker: MarkovianThinkerConfig = MarkovianThinkerConfig()
 
+    kv_mode: Annotated[
+        Literal["kv-recall", "markovian-recall"] | None,
+        Field(
+            description=(
+                "Recall machinery selector (normally set via RLConfig's "
+                "top-level kv_mode). kv-recall: hidden-KV restore of "
+                "model-picked archived spans. markovian-recall: visible "
+                "re-prefill restore (recompute reference). Requires "
+                "compaction_padding + markovian_thinker.kv_eviction (the "
+                "RLConfig expansion sets both). Turn guidance derives from "
+                "markovian_thinker.max_turns/stride."
+            ),
+        ),
+    ] = None
+
+    kv_recall_max_spans: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Recall span budget per request in the kv-recall/"
+                "markovian-recall modes (per-turn spans: the model picks "
+                "up to this many archived turns)."
+            ),
+        ),
+    ] = 5
+
     output_dir: Annotated[
         Path,
         Field(

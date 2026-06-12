@@ -13,6 +13,17 @@ def setup_vllm_env(config: InferenceConfig):
     if config.enable_lora:
         os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "True"
 
+    # kv-recall / markovian-recall: apply the validated engine-side recall
+    # stack (soft-pin, lazy publish, reload keep-cpu, eager CPU archive).
+    # setdefault so explicit per-var overrides in the launch env win.
+    if config.kv_mode is not None:
+        from kv_eviction.modes import engine_env_for_mode
+
+        for key, value in engine_env_for_mode(
+            config.kv_mode, recall_max_spans=config.kv_recall_max_spans
+        ).items():
+            os.environ.setdefault(key, value)
+
 
 def main():
     config = cli(InferenceConfig)

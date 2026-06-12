@@ -387,6 +387,31 @@ class InferenceConfig(BaseConfig):
         ),
     ] = {}
 
+    kv_mode: Annotated[
+        Literal["kv-recall", "markovian-recall"] | None,
+        Field(
+            description=(
+                "Recall machinery selector (normally set via RLConfig's "
+                "top-level kv_mode). When set, the inference entrypoint "
+                "applies the validated engine-side recall stack env vars "
+                "(soft-pin, lazy publish, reload keep-cpu, eager CPU "
+                "archive) before the engine boots. See kv_eviction.modes."
+            ),
+        ),
+    ] = None
+
+    kv_recall_max_spans: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Engine-side recall span budget; must match "
+                "orchestrator.kv_recall_max_spans (RLConfig keeps them in "
+                "sync when set via the top-level kv_mode)."
+            ),
+        ),
+    ] = 5
+
     # Launcher-only fields
 
     deployment: Annotated[

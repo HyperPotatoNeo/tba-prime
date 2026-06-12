@@ -416,6 +416,23 @@ class RLConfig(BaseConfig):
         ),
     ] = False
 
+    kv_mode: Annotated[
+        Literal["kv-eviction", "markovian", "kv-recall", "markovian-recall"] | None,
+        Field(
+            description=(
+                "Single-flag KV-context mode. Expands into the coupled "
+                "trainer/orchestrator/inference settings (explicit per-field "
+                "overrides win). kv-eviction: engine turn-eviction, spans "
+                "drop, window = last max_turns/stride turns. markovian: "
+                "client-side truncation + re-prefill (reference). kv-recall: "
+                "eviction + hidden-KV recall with the validated stack. "
+                "markovian-recall: eviction + recall via visible re-prefill "
+                "(reference). Turn policy comes from "
+                "orchestrator.markovian_thinker.max_turns/stride."
+            ),
+        ),
+    ] = None
+
     deployment: DeploymentConfig = SingleNodeDeploymentConfig()
 
     slurm: Annotated[SlurmConfig | None, Field(description="SLURM configuration. If None, will run locally.")] = None
@@ -432,11 +449,67 @@ class RLConfig(BaseConfig):
 
         This keeps the user-facing TOML small while preserving the existing
         validators as the safety net for contradictory explicit overrides.
+
+        ``kv_mode`` (the single-flag selector) is expanded first, into:
+        - markovian:        markovian_thinker.enabled (kv_eviction stays off)
+        - kv-eviction:      markovian_thinker.enabled + kv_eviction
+        - kv-recall:        kv-eviction + orchestrator/inference kv_mode
+                            passthrough (hidden-KV recall stack)
+        - markovian-recall: same with visible re-prefill restores
         """
         if not isinstance(data, dict):
             return data
 
         orchestrator = _cfg_get(data, "orchestrator")
+
+        kv_mode = _cfg_get(data, "kv_mode")
+        if kv_mode is not None:
+            from kv_eviction.modes import validate_kv_mode
+
+            validate_kv_mode(kv_mode)
+            if orchestrator is None:
+                raise ValueError(
+                    f"kv_mode={kv_mode!r} requires an [orchestrator] config "
+                    "with markovian_thinker.max_turns/stride."
+                )
+            mt = _cfg_child(orchestrator, "markovian_thinker")
+            _cfg_set_missing(mt, "enabled", True)
+            _cfg_set_missing(orchestrator, "use_token_client", False)
+            if kv_mode != "markovian":
+                _cfg_set_missing(mt, "kv_eviction", True)
+                # Pure turn-mode eviction: token-window FIFO is mutually
+                # exclusive with compaction_max_turns (vLLM rejects both).
+                # The trainer keeps window_size > 0 — there it is the
+                # segmented-forward enable, not eviction geometry (geometry
+                # arrives via the mirrored turn-mode CompactionEvents).
+                inference_for_window = _cfg_get(data, "inference")
+                if inference_for_window is not None:
+                    vllm_extra_pre = _cfg_child(inference_for_window, "vllm_extra")
+                    _cfg_set_missing(vllm_extra_pre, "compaction_window_size", 0)
+                    _cfg_set_missing(vllm_extra_pre, "compaction_stride", 0)
+                trainer_for_window = _cfg_get(data, "trainer")
+                if trainer_for_window is not None:
+                    trainer_compaction_pre = _cfg_child(trainer_for_window, "compaction")
+                    _cfg_set_missing(
+                        trainer_compaction_pre,
+                        "window_size",
+                        _KV_EVICTION_DEFAULT_WINDOW_SIZE,
+                    )
+                    _cfg_set_missing(
+                        trainer_compaction_pre,
+                        "stride",
+                        _KV_EVICTION_DEFAULT_STRIDE,
+                    )
+            if kv_mode in ("kv-recall", "markovian-recall"):
+                _cfg_set_missing(orchestrator, "kv_mode", kv_mode)
+                inference_cfg = _cfg_get(data, "inference")
+                if inference_cfg is None:
+                    raise ValueError(
+                        f"kv_mode={kv_mode!r} requires an [inference] config "
+                        "so the engine-side recall stack can be enabled."
+                    )
+                _cfg_set_missing(inference_cfg, "kv_mode", kv_mode)
+
         if orchestrator is None:
             return data
 

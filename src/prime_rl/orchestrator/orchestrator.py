@@ -159,6 +159,23 @@ async def orchestrate(config: OrchestratorConfig):
             config.compaction_padding.filler_token_id,
             forbidden_token_ids=(im_end_id,),
         )
+        # kv-recall / markovian-recall: extend the padding interceptor with
+        # the recall machinery. Kwargs and the cadence env vars come from
+        # kv_eviction.modes — the single source of truth for the validated
+        # recall stack.
+        managed_kwargs: dict = {}
+        if config.kv_mode is not None:
+            from kv_eviction.modes import client_env_for_mode, padding_kwargs_for_mode
+
+            managed_kwargs = padding_kwargs_for_mode(
+                config.kv_mode,
+                max_turns=config.markovian_thinker.max_turns,
+                stride=config.markovian_thinker.stride or 1,
+                recall_max_spans=config.kv_recall_max_spans,
+            )
+            for key, value in client_env_for_mode(config.kv_mode).items():
+                os.environ.setdefault(key, value)
+
         configure_message_padding(
             enabled=True,
             tokenizer=tokenizer,
@@ -166,6 +183,7 @@ async def orchestrate(config: OrchestratorConfig):
             filler_token_id=filler_id,
             im_end_token_id=im_end_id,
             phase4_enabled=config.compaction_padding.phase4_enabled,
+            **managed_kwargs,
         )
         # Propagate to the verifiers env server subprocess spawned below.
         # That subprocess (mp.spawn) runs a fresh interpreter and would
@@ -179,11 +197,33 @@ async def orchestrate(config: OrchestratorConfig):
         os.environ["KV_EVICTION_PADDING_PHASE4"] = (
             "1" if config.compaction_padding.phase4_enabled else "0"
         )
+        if managed_kwargs:
+            os.environ["KV_EVICTION_MANAGED_CONTEXT"] = "1"
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_RECALL_MAX_SPANS"] = str(
+                managed_kwargs["recall_max_spans"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_INDEX"] = "1"
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_INDEX_MAX_ENTRIES"] = str(
+                managed_kwargs["managed_context_index_max_entries"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_RESTORE_MODE"] = str(
+                managed_kwargs["managed_context_restore_mode"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_RECALL_MODE"] = str(
+                managed_kwargs["managed_context_recall_mode"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_COMPACTION_MAX_TURNS"] = str(
+                managed_kwargs["managed_context_compaction_max_turns"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_TURNS_LAST_KEPT"] = str(
+                managed_kwargs["managed_context_turns_last_kept"]
+            )
         logger.info(
             f"Block-aligned message padding enabled "
             f"(block_size={config.compaction_padding.block_size}, "
             f"filler_token_id={filler_id}, im_end_token_id={im_end_id}, "
-            f"phase4_enabled={config.compaction_padding.phase4_enabled})"
+            f"phase4_enabled={config.compaction_padding.phase4_enabled}, "
+            f"kv_mode={config.kv_mode})"
         )
 
     # Install Markovian Thinker client-side message truncation. In
