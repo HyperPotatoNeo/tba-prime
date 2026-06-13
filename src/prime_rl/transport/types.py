@@ -99,6 +99,13 @@ class CompactionEventWire(
     # (kind 1) / stop seeing (kind 2) the spans. -1 on eviction events.
     visibility_boundary_computed: int = -1
 
+    # Kind 1 recall token-surfacing: the single restored span's token ids and
+    # the absolute RoPE position of its first token (rest contiguous). The
+    # trainer reconstructs a recalled span whose birth turn is not in this
+    # sample by forwarding these at restored_span_pos_start.. positions.
+    restored_span_token_ids: list[int] = msgspec.field(default_factory=list)
+    restored_span_pos_start: int = -1
+
 
 class CallWire(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A single vLLM chat() call within a rollout (Phase B of

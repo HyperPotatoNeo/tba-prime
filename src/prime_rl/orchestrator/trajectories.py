@@ -660,6 +660,13 @@ def interleave_rollout(
                         visibility_boundary_computed=int(
                             e.get("visibility_boundary_computed", -1)
                         ),
+                        restored_span_token_ids=[
+                            int(x)
+                            for x in (e.get("restored_span_token_ids") or [])
+                        ],
+                        restored_span_pos_start=int(
+                            e.get("restored_span_pos_start", -1)
+                        ),
                     )
                 )
             elif isinstance(e, (list, tuple)) and len(e) >= 3:
@@ -692,6 +699,12 @@ def interleave_rollout(
                         else [],
                         visibility_boundary_computed=int(e[14])
                         if len(e) >= 15
+                        else -1,
+                        restored_span_token_ids=[int(x) for x in e[15]]
+                        if len(e) >= 16 and e[15]
+                        else [],
+                        restored_span_pos_start=int(e[16])
+                        if len(e) >= 17
                         else -1,
                     )
                 )
