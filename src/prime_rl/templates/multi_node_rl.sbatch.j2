@@ -1,0 +1,367 @@
+#!/bin/bash
+
+#SBATCH --job-name={{ job_name }}
+#SBATCH --nodes={{ num_train_nodes + num_infer_nodes }}
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:{{ gpus_per_node }}
+#SBATCH --partition={{ partition }}
+{%- if account %}
+#SBATCH --account={{ account }}
+{%- endif %}
+{%- if time %}
+#SBATCH --time={{ time }}
+{%- endif %}
+{%- if nodelist %}
+#SBATCH --nodelist={{ nodelist }}
+{%- endif %}
+{%- if exclude %}
+#SBATCH --exclude={{ exclude }}
+{%- endif %}
+#SBATCH --exclusive
+#SBATCH --output={{ output_dir }}/job_%j.log
+#SBATCH --error={{ output_dir }}/job_%j.log
+
+# Configs
+export NUM_TRAIN_NODES={{ num_train_nodes }}
+export NUM_INFER_NODES={{ num_infer_nodes }}
+export NODES_PER_INFER_REPLICA={{ nodes_per_infer_replica }}
+export NUM_INFER_REPLICAS={{ num_infer_replicas }}
+export GPUS_PER_NODE={{ gpus_per_node }}
+{% if num_infer_nodes > 0 -%}
+export ROUTER_PORT={{ router_port }}
+export INFERENCE_TP={{ inference_tp }}
+export INFERENCE_DP_LOCAL=$((GPUS_PER_NODE / INFERENCE_TP))
+export INFERENCE_DATA_PARALLEL_RPC_PORT={{ inference_data_parallel_rpc_port }}
+{% if is_disaggregated -%}
+export NUM_PREFILL_NODES={{ num_prefill_nodes }}
+export NUM_DECODE_NODES={{ num_decode_nodes }}
+export NUM_PREFILL_REPLICAS={{ num_prefill_replicas }}
+export NUM_DECODE_REPLICAS={{ num_decode_replicas }}
+export NODES_PER_PREFILL_REPLICA=$((NUM_PREFILL_NODES / NUM_PREFILL_REPLICAS))
+export NODES_PER_DECODE_REPLICA=$((NUM_DECODE_NODES / NUM_DECODE_REPLICAS))
+export PREFILL_PORT={{ prefill_port }}
+export DECODE_PORT={{ decode_port }}
+{%- else -%}
+export BACKEND_PORT={{ backend_port }}
+export INFERENCE_ENABLE_EXPERT_PARALLEL={{ "1" if inference_enable_expert_parallel else "0" }}
+
+# Enable distributed EP mode only when expert parallelism spans multiple inference nodes per replica.
+export USE_DISTRIBUTED_EP=0
+if [ "$INFERENCE_ENABLE_EXPERT_PARALLEL" -eq 1 ] && [ "$NODES_PER_INFER_REPLICA" -gt 1 ]; then
+    USE_DISTRIBUTED_EP=1
+fi
+{%- endif %}
+{%- endif %}
+
+# Paths
+export PROJECT_DIR={{ project_dir }}
+export CONFIG_DIR={{ config_dir }}
+export OUTPUT_DIR={{ output_dir }}
+export ORCHESTRATOR_OUTPUT_DIR={{ orchestrator_output_dir }}
+mkdir -p $OUTPUT_DIR/logs/trainer $OUTPUT_DIR/logs/inference
+ln -sfn trainer/node_0.log $OUTPUT_DIR/logs/trainer.log
+ln -sfn inference/node_0.log $OUTPUT_DIR/logs/inference.log
+
+# General
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+
+{% if wandb_shared -%}
+export WANDB_SHARED_MODE=1
+export WANDB_SHARED_RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex)")
+{%- endif %}
+
+# Networking
+HOSTNAMES=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+TRAIN_HOSTS=( ${HOSTNAMES[@]:$NUM_INFER_NODES:$SLURM_JOB_NUM_NODES} )
+export HOSTNAMES_STR="${HOSTNAMES[*]}"
+
+{% if num_infer_nodes > 0 -%}
+INFER_HOSTS=( ${HOSTNAMES[@]:0:$NUM_INFER_NODES} )
+
+# Build per-replica router URLs, admin URLs, and backend args for the router
+INFER_URLS=""
+ADMIN_URLS=""
+ALL_ROUTER_ARGS=""
+{% if is_disaggregated -%}
+for ((r=0; r<NUM_INFER_REPLICAS; r++)); do
+    replica_base=$((r * NODES_PER_INFER_REPLICA))
+    router_host="${INFER_HOSTS[$replica_base]}"
+    INFER_URLS="${INFER_URLS:+$INFER_URLS }http://${router_host}:${ROUTER_PORT}/v1"
+
+    REPLICA_ROUTER_ARGS=""
+    for ((p=0; p<NUM_PREFILL_NODES; p++)); do
+        node_idx=$((replica_base + p))
+        host="${INFER_HOSTS[$node_idx]}"
+        ADMIN_URLS="${ADMIN_URLS:+$ADMIN_URLS }http://${host}:${PREFILL_PORT}/v1"
+        REPLICA_ROUTER_ARGS="$REPLICA_ROUTER_ARGS --prefill http://${host}:${PREFILL_PORT}"
+    done
+    for ((d=0; d<NUM_DECODE_NODES; d++)); do
+        node_idx=$((replica_base + NUM_PREFILL_NODES + d))
+        host="${INFER_HOSTS[$node_idx]}"
+        ADMIN_URLS="${ADMIN_URLS:+$ADMIN_URLS }http://${host}:${DECODE_PORT}/v1"
+        REPLICA_ROUTER_ARGS="$REPLICA_ROUTER_ARGS --decode http://${host}:${DECODE_PORT}"
+    done
+    ALL_ROUTER_ARGS="${ALL_ROUTER_ARGS:+$ALL_ROUTER_ARGS|}$REPLICA_ROUTER_ARGS"
+done
+{%- else -%}
+for ((r=0; r<NUM_INFER_REPLICAS; r++)); do
+    head_idx=$((r * NODES_PER_INFER_REPLICA))
+    router_host="${INFER_HOSTS[$head_idx]}"
+    INFER_URLS="${INFER_URLS:+$INFER_URLS }http://${router_host}:${ROUTER_PORT}/v1"
+
+    REPLICA_ROUTER_ARGS=""
+    for ((n=0; n<NODES_PER_INFER_REPLICA; n++)); do
+        node_idx=$((head_idx + n))
+        host="${INFER_HOSTS[$node_idx]}"
+        ADMIN_URLS="${ADMIN_URLS:+$ADMIN_URLS }http://${host}:${BACKEND_PORT}/v1"
+        REPLICA_ROUTER_ARGS="$REPLICA_ROUTER_ARGS http://${host}:${BACKEND_PORT}"
+    done
+    ALL_ROUTER_ARGS="${ALL_ROUTER_ARGS:+$ALL_ROUTER_ARGS|}$REPLICA_ROUTER_ARGS"
+done
+{%- endif %}
+export INFER_URLS
+export ADMIN_URLS
+export ALL_ROUTER_ARGS
+echo "INFER_HOSTS=${INFER_HOSTS[*]}"
+echo "INFER_URLS=${INFER_URLS}"
+echo "ADMIN_URLS=${ADMIN_URLS}"
+{%- if not is_disaggregated %}
+echo "USE_DISTRIBUTED_EP=${USE_DISTRIBUTED_EP}"
+{%- endif %}
+{%- endif %}
+
+echo "HOSTNAMES=${HOSTNAMES[*]}"
+echo "TRAIN_HOSTS=${TRAIN_HOSTS[*]}"
+
+export MASTER_ADDR="${HOSTNAMES[$NUM_INFER_NODES]}"
+export MASTER_PORT=29500
+echo "MASTER_ADDR=${MASTER_ADDR}"
+echo "MASTER_PORT=${MASTER_PORT}"
+
+# Setup environment
+cd $PROJECT_DIR
+[ -f .env ] && source .env
+source .venv/bin/activate
+uv sync --all-extras
+
+{% if pre_run_command %}
+# Pre-run command
+{{ pre_run_command }}
+{% endif %}
+
+# Run RL
+srun bash -c '
+    # Source environment
+    cd $PROJECT_DIR
+    [ -f .env ] && source .env
+    source .venv/bin/activate
+    # Do not sync to avoid conflicts with lockfile
+
+    # Higher ulimit
+    ulimit -n 65536
+    export GIT_LFS_SKIP_SMUDGE=1
+
+    # Infiniband setup
+    IB_HCA=$(ibv_devinfo | sed -n -e "/hca_id/p" -e "/link_layer:/p" | grep -B1 InfiniBand | grep hca_id | sed -e "s/^hca_id://g" | tr -d "[[:blank:]]" |paste -sd,)
+    export NCCL_IB_HCA=$IB_HCA
+
+{% if num_infer_nodes > 0 -%}
+
+if [ "$SLURM_PROCID" -lt "$NUM_INFER_NODES" ]; then
+    export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
+    INFER_NODE_RANK=$SLURM_PROCID
+    export VLLM_WORKER_MULTIPROC_METHOD=spawn
+    LOCAL_IP=$(hostname -I | awk "{print \$1}")
+
+    REPLICA_IDX=$((INFER_NODE_RANK / NODES_PER_INFER_REPLICA))
+    RANK_IN_REPLICA=$((INFER_NODE_RANK % NODES_PER_INFER_REPLICA))
+
+    echo "INFER_NODE_RANK=$INFER_NODE_RANK REPLICA=$REPLICA_IDX RANK_IN_REPLICA=$RANK_IN_REPLICA LOCAL_IP=$LOCAL_IP" \
+        | tee $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
+
+{% if is_disaggregated -%}
+    # PD disaggregated: NIXL KV transfer + role-based inference
+    read -ra HOSTNAMES <<< "$HOSTNAMES_STR"
+{%- if use_deep_gemm %}
+    export VLLM_USE_DEEP_GEMM=1
+{%- endif %}
+
+    export GLOO_SOCKET_IFNAME=bond0
+    export VLLM_ENGINE_READY_TIMEOUT_S=4200
+    export UCX_TLS=all
+    export UCX_NET_DEVICES=all
+    export LD_LIBRARY_PATH="$PROJECT_DIR/third_party/ucx/lib:$PROJECT_DIR/third_party/ucx/lib/ucx:${LD_LIBRARY_PATH:-}"
+    export VLLM_NIXL_SIDE_CHANNEL_HOST=$LOCAL_IP
+    export VLLM_NIXL_SIDE_CHANNEL_PORT=5600
+
+{%- if kv_offload %}
+    PREFILL_KV_CFG='"'"'{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_connector_extra_config":{"connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}},{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"block_size":{{ kv_offload_block_size }},"cpu_bytes_to_use":{{ kv_offload_cpu_bytes }}}}]}}'"'"'
+{%- else %}
+    PREFILL_KV_CFG='"'"'{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}}'"'"'
+{%- endif %}
+    DECODE_KV_CFG='"'"'{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_connector_extra_config":{"num_threads":1}}'"'"'
+    DECODE_COMPILE_CFG='"'"'{"cudagraph_mode":"FULL_DECODE_ONLY"}'"'"'
+
+    REPLICA_BASE=$((REPLICA_IDX * NODES_PER_INFER_REPLICA))
+
+    if [ "$RANK_IN_REPLICA" -lt "$NUM_PREFILL_NODES" ]; then
+        ROLE="prefill"
+        SUB_REPLICA=$((RANK_IN_REPLICA / NODES_PER_PREFILL_REPLICA))
+        ROLE_RANK=$((RANK_IN_REPLICA % NODES_PER_PREFILL_REPLICA))
+        DP=$((NODES_PER_PREFILL_REPLICA * INFERENCE_DP_LOCAL))
+        PORT=$PREFILL_PORT
+        START_RANK=$((ROLE_RANK * INFERENCE_DP_LOCAL))
+        HEAD_HOST="${HOSTNAMES[$((REPLICA_BASE + SUB_REPLICA * NODES_PER_PREFILL_REPLICA))]}"
+{% for key, value in prefill_env_overrides.items() %}
+        export {{ key }}="{{ value }}"
+{% endfor %}
+        ROLE_EXTRA="\"all2all_backend\": \"deepep_high_throughput\""
+    else
+        export UCX_NET_DEVICES=mlx5_0:1
+        ROLE="decode"
+        RANK_IN_DECODE=$((RANK_IN_REPLICA - NUM_PREFILL_NODES))
+        SUB_REPLICA=$((RANK_IN_DECODE / NODES_PER_DECODE_REPLICA))
+        ROLE_RANK=$((RANK_IN_DECODE % NODES_PER_DECODE_REPLICA))
+        DP=$((NODES_PER_DECODE_REPLICA * INFERENCE_DP_LOCAL))
+        PORT=$DECODE_PORT
+        START_RANK=$((ROLE_RANK * INFERENCE_DP_LOCAL))
+        HEAD_HOST="${HOSTNAMES[$((REPLICA_BASE + NUM_PREFILL_NODES + SUB_REPLICA * NODES_PER_DECODE_REPLICA))]}"
+{% for key, value in decode_env_overrides.items() %}
+        export {{ key }}="{{ value }}"
+{% endfor %}
+        ROLE_EXTRA="\"all2all_backend\": \"deepep_low_latency\", \"compilation_config\": $DECODE_COMPILE_CFG"
+    fi
+
+    echo "ROLE=$ROLE REPLICA=$REPLICA_IDX SUB_REPLICA=$SUB_REPLICA ROLE_RANK=$ROLE_RANK DP=$DP PORT=$PORT" \
+        | tee -a $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
+
+    if [ "$DP" -gt 1 ]; then
+        if [ "$ROLE" = "prefill" ]; then
+            KV_CFG_TO_USE="$PREFILL_KV_CFG"
+        else
+            KV_CFG_TO_USE="$DECODE_KV_CFG"
+        fi
+
+        if [ "$ROLE_RANK" -eq 0 ]; then
+            VLLM_EXTRA="{\"data_parallel_address\": \"$LOCAL_IP\", \"data_parallel_hybrid_lb\": true, \"kv_transfer_config\": $KV_CFG_TO_USE, $ROLE_EXTRA}"
+        else
+            VLLM_EXTRA="{\"data_parallel_address\": \"$HEAD_HOST\", \"data_parallel_start_rank\": $START_RANK, \"data_parallel_hybrid_lb\": true, \"kv_transfer_config\": $KV_CFG_TO_USE, $ROLE_EXTRA}"
+        fi
+    else
+        if [ "$ROLE" = "prefill" ]; then
+            VLLM_EXTRA="{\"kv_transfer_config\": $PREFILL_KV_CFG, $ROLE_EXTRA}"
+        else
+            VLLM_EXTRA="{\"kv_transfer_config\": $DECODE_KV_CFG, $ROLE_EXTRA}"
+        fi
+    fi
+
+    # Start vllm-router on the first node of each replica (PD mode)
+    if [ "$RANK_IN_REPLICA" -eq 0 ]; then
+        ROUTER_LOG="$OUTPUT_DIR/logs/inference/router_${REPLICA_IDX}.log"
+        echo "Starting vllm-router (PD) on $LOCAL_IP:$ROUTER_PORT for replica $REPLICA_IDX" | tee $ROUTER_LOG
+
+        REPLICA_ROUTER_ARGS=$(echo "$ALL_ROUTER_ARGS" | cut -d"|" -f$((REPLICA_IDX + 1)))
+
+        vllm-router \
+            --policy consistent_hash \
+            --vllm-pd-disaggregation \
+            $REPLICA_ROUTER_ARGS \
+            --host 0.0.0.0 \
+            --port $ROUTER_PORT \
+            --intra-node-data-parallel-size 1 \
+            --worker-startup-timeout-secs 1200 \
+            >> $ROUTER_LOG 2>&1 &
+    fi
+
+    uv run inference \
+        @ $CONFIG_DIR/inference.toml \
+        --server.host 0.0.0.0 \
+        --server.port $PORT \
+        --parallel.dp $DP \
+        --data-parallel-rpc-port $INFERENCE_DATA_PARALLEL_RPC_PORT \
+        --vllm-extra "$VLLM_EXTRA" \
+        2>&1 | tee -a $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
+{%- else -%}
+    # Start vllm-router on the first node of each replica
+    if [ "$RANK_IN_REPLICA" -eq 0 ]; then
+        ROUTER_LOG="$OUTPUT_DIR/logs/inference/router_${REPLICA_IDX}.log"
+        echo "Starting vllm-router on $LOCAL_IP:$ROUTER_PORT for replica $REPLICA_IDX" | tee $ROUTER_LOG
+
+        REPLICA_ROUTER_ARGS=$(echo "$ALL_ROUTER_ARGS" | cut -d"|" -f$((REPLICA_IDX + 1)))
+
+        vllm-router \
+            --policy consistent_hash \
+            --worker-urls $REPLICA_ROUTER_ARGS \
+            --host 0.0.0.0 \
+            --port $ROUTER_PORT \
+            --worker-startup-timeout-secs 1200 \
+            >> $ROUTER_LOG 2>&1 &
+    fi
+
+    if [ "$USE_DISTRIBUTED_EP" -eq 1 ]; then
+        read -ra HOSTNAMES <<< "$HOSTNAMES_STR"
+        REPLICA_HEAD_HOST="${HOSTNAMES[$((REPLICA_IDX * NODES_PER_INFER_REPLICA))]}"
+        INFER_DP_START_RANK=$((RANK_IN_REPLICA * INFERENCE_DP_LOCAL))
+
+        if [ "$RANK_IN_REPLICA" -eq 0 ]; then
+            VLLM_EXTRA="{\"data_parallel_address\": \"$LOCAL_IP\"}"
+        else
+            VLLM_EXTRA="{\"data_parallel_address\": \"$REPLICA_HEAD_HOST\", \"data_parallel_start_rank\": $INFER_DP_START_RANK}"
+        fi
+
+        uv run inference \
+            @ $CONFIG_DIR/inference.toml \
+            --server.host 0.0.0.0 \
+            --server.port $BACKEND_PORT \
+            --data-parallel-rpc-port $INFERENCE_DATA_PARALLEL_RPC_PORT \
+            --vllm-extra "$VLLM_EXTRA" \
+            2>&1 | tee -a $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
+    else
+        uv run inference \
+            @ $CONFIG_DIR/inference.toml \
+            --server.host 0.0.0.0 \
+            --server.port $BACKEND_PORT \
+            2>&1 | tee -a $OUTPUT_DIR/logs/inference/node_${INFER_NODE_RANK}.log
+    fi
+{%- endif %}
+
+else
+    TRAIN_NODE_RANK=$((SLURM_PROCID - NUM_INFER_NODES))
+
+    if [ "$TRAIN_NODE_RANK" -eq 0 ]; then
+        ORCHESTRATOR_ARGS="@ $CONFIG_DIR/orchestrator.toml"
+        ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --client.base-url $INFER_URLS"
+        ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --client.admin-base-url $ADMIN_URLS"
+        {% if use_nccl_broadcast %}ORCHESTRATOR_ARGS="$ORCHESTRATOR_ARGS --weight_broadcast.host $MASTER_ADDR"
+        {% endif %}{% if wandb_shared %}WANDB_SHARED_LABEL=orchestrator {% endif %}uv run orchestrator $ORCHESTRATOR_ARGS \
+            2>&1 | tee $OUTPUT_DIR/logs/orchestrator.log &
+    fi
+{%- else %}
+    TRAIN_NODE_RANK=$SLURM_PROCID
+{%- endif %}
+
+    export HF_HUB_OFFLINE=1
+
+    # This is required for compilation to work correctly
+    export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
+    echo $HOSTNAMES_STR | tee $OUTPUT_DIR/logs/trainer/node_${TRAIN_NODE_RANK}.log
+
+    {% if wandb_shared %}WANDB_SHARED_LABEL=trainer {% endif %}uv run torchrun \
+        --role=trainer \
+        --nnodes=$NUM_TRAIN_NODES \
+        --nproc-per-node=$GPUS_PER_NODE \
+        --node-rank=$TRAIN_NODE_RANK \
+        --rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT \
+        --rdzv-id=job_$SLURM_JOB_ID \
+        --log-dir=$OUTPUT_DIR/logs/trainer/torchrun \
+        --tee=3 \
+        --redirects=3 \
+        --local-ranks-filter={{ ranks_filter }} \
+        -m prime_rl.trainer.rl.train \
+        @ $CONFIG_DIR/trainer.toml \
+        2>&1 | sed -u 's/^\[[a-zA-Z]*[0-9]*\]://' | tee -a $OUTPUT_DIR/logs/trainer/node_${TRAIN_NODE_RANK}.log
+{% if num_infer_nodes > 0 %}    fi{% endif %}
+'

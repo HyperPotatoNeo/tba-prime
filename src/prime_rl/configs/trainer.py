@@ -1,0 +1,1336 @@
+import warnings
+from pathlib import Path
+from typing import Annotated, Any, Literal, TypeAlias
+
+from pydantic import BaseModel, Field, model_validator
+
+from prime_rl.configs.shared import (
+    BaseModelConfig,
+    FileSystemTransportConfig,
+    HeartbeatConfig,
+    MetricsServerConfig,
+    TrainerLogConfig,
+    TransportConfig,
+    WandbConfig,
+)
+from prime_rl.utils.config import BaseConfig
+
+# -- Shared trainer configs (used by both SFT and RL trainers) --
+
+AttnImplementation: TypeAlias = Literal[
+    "sdpa", "flash_attention_2", "flash_attention_3", "fa4", "flex_attention"
+]
+EPCommBackend: TypeAlias = Literal["torch", "deepep"]
+
+# User-facing name -> internal name. Users set `flash_attention_4` in configs,
+# which gets rewritten to `fa4` before pydantic validation.
+# We use `fa4` internally because `flash_attention_*` triggers transformers
+# to attempt installing a kernel from hub.
+_ATTN_ALIASES = {"flash_attention_4": "fa4"}
+
+
+class CompactionDistillationConfig(BaseConfig):
+    """Trainer-side self-distillation for masked KV-eviction training."""
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "When true, run a trainer-side full-causal teacher forward "
+                "alongside the masked FlexAttention student forward and "
+                "compute reverse-KL distillation signals."
+            ),
+        ),
+    ] = False
+
+    estimator: Annotated[
+        Literal["rb_full", "rb_topk", "k1_sample"],
+        Field(
+            description=(
+                "Reverse-KL estimator for KL(student || teacher). rb_full "
+                "uses the full student vocabulary distribution, rb_topk "
+                "Rao-Blackwellizes over the top-k student tokens, and "
+                "k1_sample uses the sampled label logprob difference."
+            ),
+        ),
+    ] = "rb_topk"
+
+    top_k: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Top-k student tokens for estimator='rb_topk'.",
+        ),
+    ] = 100
+
+    reward_coef: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Coefficient for trainer-side per-token reward shaping. "
+                "The selected estimator is subtracted from advantages under "
+                "the loss mask."
+            ),
+        ),
+    ] = 0.0
+
+    loss_coef: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "Coefficient for an auxiliary direct reverse-KL loss. Keep "
+                "0.0 to log metrics and/or shape rewards without adding a "
+                "direct KL loss term."
+            ),
+        ),
+    ] = 0.0
+
+
+class CompactionConfig(BaseConfig):
+    """Configures KV cache compaction for the trainer's segmented forward.
+
+    Must exactly match the corresponding vLLM inference config
+    (--compaction-window-size, --compaction-stride, --block-size) or the
+    trainer's replay of KV eviction will not match inference and train-vs-
+    inference KL will explode. Cross-config consistency against the
+    orchestrator's inference engine config is NOT checked automatically
+    (the trainer and orchestrator configs are loaded separately); users
+    must keep them in sync manually. TODO: add a top-level RLConfig
+    validator to assert cross-config equality when orchestrator.inference
+    is also configured in the same TOML.
+
+    Only consulted when a TrainingSample carries compaction_events. When
+    compaction is disabled at inference (window_size == 0), TrainingSamples
+    have compaction_events=None and the trainer takes the standard forward
+    path; this config is ignored.
+
+    When `window_size > 0`, the TrainerConfig-level validator enforces
+    `impl="hf"`. If the trainer model uses the default
+    `attn="flex_attention"` and the dispatch is not explicitly set, the
+    validator selects the masked FlexAttention path for fair comparison with
+    non-compaction forwards. FlashAttention cache replay remains available
+    when explicitly configured.
+    """
+
+    window_size: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Must match vLLM's --compaction-window-size. 0 disables compaction.",
+        ),
+    ] = 0
+
+    stride: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Must match vLLM's --compaction-stride. Tokens evicted per compaction event; multiple of block_size.",
+        ),
+    ] = 0
+
+    block_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="vLLM KV cache block size. Must match the inference engine's block_size. Used to compute prompt_aligned_len = ceil(prompt_len / block_size) * block_size for the drop boundary.",
+        ),
+    ] = 16
+
+    protected_prefix_tokens: Annotated[
+        int,
+        Field(
+            ge=-1,
+            description=(
+                "Must match vLLM's --compaction-protected-prefix-tokens. "
+                "When > 0, eviction always starts at "
+                "ceil(protected_prefix / block_size) * block_size instead "
+                "of the per-sample prompt_aligned_len. This makes the "
+                "eviction boundary constant across all compaction events, "
+                "which is required for multi-turn compaction training. "
+                "-1 = auto-detect from system message (inferred from the "
+                "first compaction event's num_prompt_tokens)."
+            ),
+        ),
+    ] = 0
+
+    bptt_segments: Annotated[
+        int | None,
+        Field(
+            description=(
+                "Truncated BPTT window size in segments for the trainer's "
+                "per-segment backward mode. 1 (default) = M3 semantics, one "
+                "backward per segment, O(1 segment) memory. K > 1 = TBPTT(K), "
+                "gradients flow through retained KV within K consecutive "
+                "segments before detach, O(K segments) memory. -1 or None = "
+                "full trajectory in one BPTT window (M4 semantics, G_distal "
+                "term preserved) — requires enough memory to hold every "
+                "segment's activations simultaneously. Only consulted when "
+                "window_size > 0. Under multi-rank FSDP2, values other than "
+                "1 require per_call_dispatch=True; legacy segmented_forward "
+                "still supports K > 1 only on single-GPU runs."
+            ),
+        ),
+    ] = 1
+
+    per_call_dispatch: Annotated[
+        bool,
+        Field(
+            description=(
+                "When True and TrainingSample.calls is populated, route "
+                "through per_call_segmented_forward (one HF forward per "
+                "vLLM chat() call, with a persistent DynamicCache across "
+                "calls and eviction-aware position_ids for admission "
+                "events). When False, use the legacy segmented_forward "
+                "(block-FIFO per-stride drops in the merged sample) — "
+                "needed for mid-gen compaction. The per-call dispatch "
+                "falls back to legacy automatically if any call has "
+                "mid-gen events. See plans/single_forward_pre_eviction.md "
+                "Phase 5."
+            ),
+        ),
+    ] = False
+
+    masked_forward_dispatch: Annotated[
+        Literal["off", "flex_attention", "flex_debug"],
+        Field(
+            description=(
+                "Compaction trainer dispatch. 'off' keeps the normal "
+                "segmented/per-call cache replay. 'flex_attention' routes "
+                "admission-only KV-eviction call traces through a single "
+                "full-chain flex_attention forward with a KV-liveness "
+                "BlockMask. This forces bptt_segments=-1 because it is "
+                "full-BPTT and requires trainer.model.attn='flex_attention'. "
+                "'flex_debug' is accepted as a legacy alias for "
+                "'flex_attention'."
+            ),
+        ),
+    ] = "off"
+
+    distillation: Annotated[
+        CompactionDistillationConfig,
+        Field(
+            description=(
+                "Optional trainer-side self-distillation for the masked "
+                "FlexAttention KV-eviction path."
+            ),
+        ),
+    ] = CompactionDistillationConfig()
+
+    @model_validator(mode="after")
+    def normalize_flex_attention_dispatch(self):
+        if self.masked_forward_dispatch == "flex_debug":
+            self.masked_forward_dispatch = "flex_attention"
+        if self.masked_forward_dispatch == "flex_attention":
+            self.bptt_segments = -1
+        return self
+
+
+class GCConfig(BaseConfig):
+    """Configures deterministic garbage collection to avoid stragglers in distributed training.
+
+    Disables Python's automatic GC and runs manual collections every `freq` steps so all
+    ranks collect simultaneously, preventing one rank from stalling others.
+    """
+
+    interval: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Run garbage collection every `interval` training steps.",
+        ),
+    ] = 50
+
+
+class ActivationCheckpointConfig(BaseConfig):
+    """Configures activation checkpointing."""
+
+    mode: Annotated[
+        Literal["full", "selective"],
+        Field(
+            description="Whether to checkpoint whole transformer blocks (`full`) or selected subcomponents inside supported custom decoder layers (`selective`).",
+        ),
+    ] = "full"
+
+    freq: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Applies activation checkpointing to every `freq` layers. Defaults to 1.",
+        ),
+    ] = 1
+
+    targets: Annotated[
+        list[str],
+        Field(
+            description="Selective checkpoint targets. `norm` checkpoints every norm module inside selected layers (decoder, attention, MLA, etc.). `attn_proj` checkpoints projection-side attention work outside the kernel, including input/output projections, attention-local norms, RoPE, gating, and model-specific MLA projection helpers where exposed. `mlp` checkpoints the entire dense MLP forward (not applicable to MoE layers). `mla_up_proj` checkpoints MLA Q/KV up-projection work where supported. `routed_experts` checkpoints routed expert compute in MoE layers (including LatentMoE). `linear_attn` checkpoints supported token mixers outside the standard softmax-attention path, including NemotronH Mamba layers, Qwen3.5-MoE GatedDeltaNet layers, and AFMoE sliding-window attention layers.",
+        ),
+    ] = ["norm"]
+
+    @model_validator(mode="after")
+    def validate_selective_targets(self):
+        self.targets = list(dict.fromkeys(self.targets))
+        if self.mode == "selective" and not self.targets:
+            raise ValueError("Selective activation checkpointing requires at least one target.")
+        return self
+
+
+class ActivationOffloadingConfig(BaseConfig):
+    """Configures the activation offloading."""
+
+    pin_memory: Annotated[bool, Field(description="Whether to pin the offloaded activations to CPU memory.")] = True
+
+    max_inflight_activations: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="The maximum number of activations to keep in while offloading further. (More activations means smoother overlap, but more gpu memory usage)",
+        ),
+    ] = 5
+
+
+class CompileConfig(BaseConfig):
+    """Configures model compilation."""
+
+    fullgraph: Annotated[
+        bool,
+        Field(description="Whether to compile the transformer blocks with fullgraph."),
+    ] = False
+
+
+class BenchConfig(BaseConfig):
+    """Configures benchmark mode."""
+
+    output_json: Annotated[
+        Path | None,
+        Field(description="Path to write benchmark results as JSON. If not set, only prints to console."),
+    ] = None
+
+
+class LoRAConfig(BaseConfig):
+    """Configuration for LoRA (Low-Rank Adaptation)."""
+
+    rank: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="Rank of the low-rank decomposition matrices.",
+        ),
+    ] = 16
+
+    alpha: Annotated[
+        float,
+        Field(
+            ge=0,
+            description="LoRA scaling parameter.",
+        ),
+    ] = 32.0
+
+    dropout: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=1,
+            description="LoRA dropout rate.",
+        ),
+    ] = 0.0
+
+    target_modules: Annotated[
+        list[str],
+        Field(
+            description="Module names or regex patterns for modules to apply LoRA to. Simple names (e.g., 'q_proj') match any component in the module path. Regex patterns match anywhere in the name.",
+        ),
+    ] = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "experts",
+    ]
+
+    modules_to_save: Annotated[
+        list[str],
+        Field(
+            description="Module names or regex patterns for modules to keep fully trainable (not freeze). Simple names match any component in the module path. Regex patterns match anywhere in the name.",
+        ),
+    ] = []
+
+
+class DebugModelConfig(BaseConfig):
+    """Debugging feature around model and distributed training."""
+
+    num_layers: Annotated[
+        int | None,
+        Field(description="The number of layers in the model."),
+    ] = None
+
+    random_init: Annotated[
+        bool,
+        Field(
+            description="Whether to random initialize the model.",
+        ),
+    ] = False
+
+
+class ModelConfig(BaseModelConfig):
+    """Configures the model for training."""
+
+    seq_len: Annotated[int, Field(description="The sequence length to use for the model.")] = 2048
+
+    attn: Annotated[
+        AttnImplementation,
+        Field(
+            description="The attention implementation to use. Defaults to flex_attention. When CP is enabled, ring attention uses the matching kernel family (FA2 for flash_attention_2, FA3 for flash_attention_3).",
+        ),
+    ] = "flex_attention"
+
+    compile: Annotated[
+        CompileConfig | None,
+        Field(
+            description="Whether to compile the model using `torch.compile`.",
+        ),
+    ] = None
+
+    ac: Annotated[
+        ActivationCheckpointConfig | None,
+        Field(
+            description="Whether to apply activation checkpointing to the model. If None, will not apply activation checkpointing.",
+        ),
+    ] = None
+
+    ac_offloading: Annotated[
+        ActivationOffloadingConfig | None,
+        Field(
+            description="Whether to apply activation offloading to the model. If None, will not apply activation offloading.",
+        ),
+    ] = None
+
+    fsdp_cpu_offload: Annotated[
+        bool,
+        Field(
+            description="Whether to enable FSDP CPU offloading for parameters, gradients, and optimizer states. When enabled, uses pinned memory for efficient CPU-GPU transfers.",
+        ),
+    ] = False
+
+    optim_cpu_offload: Annotated[
+        bool,
+        Field(
+            description="Whether to enable optimizer state CPU offloading. Unlike fsdp_cpu_offload, this only moves optimizer states (momentum, variance) to CPU, keeping weights on GPU. This avoids the H2D all-gather overhead while still saving GPU memory.",
+        ),
+    ] = False
+
+    reshard_after_forward: Annotated[
+        bool, Field(description="Whether to reshard the model after each forward pass.")
+    ] = True
+
+    dp_replicate: Annotated[
+        int,
+        Field(
+            description="The data parallel dim where model weights are replicated.",
+        ),
+    ] = 1
+
+    ep: Annotated[
+        int,
+        Field(
+            description="The expert parallelism to use if the model has MoE layers. If 1, then no EP will be used.",
+        ),
+    ] = 1
+
+    ep_comm_backend: Annotated[
+        EPCommBackend,
+        Field(
+            description=(
+                "Communication backend for expert parallelism. "
+                "`torch` uses TorchTitan all-to-all collectives and `deepep` uses DeepEP custom kernels."
+            ),
+        ),
+    ] = "torch"
+
+    deepep_num_sms: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of SMs to allocate for DeepEP intranode dispatch/combine kernels. "
+                "Also determines internode RDMA channel count (num_channels = num_sms / 2). "
+                "Lower values leave more SMs for compute; higher values speed up dispatch/combine. "
+                "The optimal value depends on the EP degree and hardware."
+                "Only used when ep_comm_backend='deepep'."
+            ),
+        ),
+    ] = 20
+
+    deepep_token_chunk_size: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Optional token chunk size for DeepEP MoE pipelining. "
+                "When set, DeepEP dispatch for chunk i+1 is launched while experts compute chunk i. "
+                "Only used when ep_comm_backend='deepep'."
+            ),
+        ),
+    ] = None
+
+    cp: Annotated[
+        int,
+        Field(
+            description="The context parallelism size to use. If 1, then no CP will be used.",
+        ),
+    ] = 1
+
+    impl: Annotated[
+        Literal["hf", "custom", "auto"],
+        Field(
+            description=(
+                "Model implementation to use. 'auto' (default) selects 'custom' if supported by the model, "
+                "otherwise 'hf'."
+            ),
+        ),
+    ] = "auto"
+
+    optimization_dtype: Annotated[
+        Literal["bfloat16", "float32"],
+        Field(
+            description="The dtype to use for the model optimization.",
+        ),
+    ] = "float32"
+
+    reduce_dtype: Annotated[
+        Literal["bfloat16", "float32"],
+        Field(
+            description="The dtype to use for the model reduce.",
+        ),
+    ] = "float32"
+
+    moe_use_grouped_mm: Annotated[
+        bool,
+        Field(
+            description="Whether to use grouped mm for the MoE layers. Require compute capability >= 9.0",
+        ),
+    ] = True
+
+    freeze_moe_router: Annotated[
+        bool,
+        Field(
+            description="Whether to freeze the MoE router parameters during training.",
+        ),
+    ] = False
+
+    lora: Annotated[
+        LoRAConfig | None,
+        Field(
+            description="Whether to apply LoRA to the model. If None, will not apply LoRA.",
+        ),
+    ] = None
+
+    debug: Annotated[
+        DebugModelConfig,
+        Field(
+            description="Debugging feature around model and distributed training.",
+        ),
+    ] = DebugModelConfig()
+
+    fused_lm_head_token_chunk_size: Annotated[
+        int | Literal["auto", "disabled"],
+        Field(
+            description=(
+                "The flattened token chunk size to use for the fused LM head. "
+                "Three behaviors: "
+                "(1) int >= 1: explicitly set the number of tokens per LM-head chunk; "
+                "(2) 'auto': auto-enable (RL training auto-sets to 8192); "
+                "(3) 'disabled': explicitly disable fused LM head (use vanilla). "
+                "Explicitly setting an integer value for this feature isn't supported for SFT training."
+            ),
+        ),
+    ] = "disabled"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_attn_alias(cls, data):
+        """Rewrite user-facing `flash_attention_4` to internal `fa4` before validation."""
+        if isinstance(data, dict) and data.get("attn") in _ATTN_ALIASES:
+            data["attn"] = _ATTN_ALIASES[data["attn"]]
+        return data
+
+    @model_validator(mode="after")
+    def trust_remote_code_only_with_hf(self):
+        """Trust remote code only if the model is from HF."""
+        if self.trust_remote_code:
+            if self.impl not in ("hf", "auto"):
+                raise ValueError("Trust remote code is only supported with the HF implementation or auto mode.")
+        return self
+
+    @model_validator(mode="after")
+    def cp_only_with_flash_attn(self):
+        if self.cp > 1 and self.attn not in ["flash_attention_2", "flash_attention_3"]:
+            raise ValueError("CP is only supported with flash attention 2 or flash attention 3")
+        if self.cp > 1 and self.attn == "flash_attention_3" and self.impl != "custom":
+            raise ValueError(
+                "CP with flash_attention_3 requires model.impl='custom' "
+                "(the FA3 ring-attention kernel is only implemented for the custom model path)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def ac_offloading_requires_ac(self):
+        """Automatically enable activation checkpointing when activation offloading is enabled."""
+        if self.ac_offloading is not None and self.ac is None:
+            self.ac = ActivationCheckpointConfig()
+        return self
+
+    @model_validator(mode="after")
+    def selective_ac_only_with_custom_impl(self):
+        if self.ac is not None and self.ac.mode == "selective" and self.impl not in ("custom", "auto"):
+            raise ValueError("Selective activation checkpointing requires model.impl='custom' or 'auto'")
+        return self
+
+    @model_validator(mode="after")
+    def cpu_offload_mutual_exclusion(self):
+        if self.fsdp_cpu_offload and self.optim_cpu_offload:
+            raise ValueError("Cannot enable both fsdp_cpu_offload and optim_cpu_offload. Use one or the other.")
+        return self
+
+    @model_validator(mode="after")
+    def flash_attention_4_only_with_custom_impl(self):
+        if self.attn == "fa4" and self.impl != "custom":
+            raise ValueError("Flash attention 4 is only supported with the custom implementation")
+        return self
+
+    @model_validator(mode="after")
+    def validate_ep_comm_backend(self):
+        if self.ep_comm_backend == "torch":
+            return self
+
+        if self.ep <= 1:
+            raise ValueError(f"model.ep_comm_backend='{self.ep_comm_backend}' requires model.ep > 1.")
+
+        return self
+
+
+class TokenizerConfig(BaseConfig):
+    """Configuration for the tokenizer."""
+
+    name: Annotated[
+        str | None,
+        Field(description="The name or path of the tokenizer to use. If None, will use the model's default tokenizer."),
+    ] = None
+
+    trust_remote_code: Annotated[
+        bool | None,
+        Field(
+            description="Whether to trust remote code for tokenizer initialization. If None, will use the model's default trust remote code setting.",
+        ),
+    ] = None
+
+    chat_template: Annotated[
+        str | None,
+        Field(
+            description="The chat template to use for the tokenizer. If None, will use the tokenizer's default chat template."
+        ),
+    ] = None
+
+
+class ConstantSchedulerConfig(BaseModel):
+    """Configuration for constant learning rate scheduler."""
+
+    type: Literal["constant"] = "constant"
+
+
+class LinearSchedulerConfig(BaseModel):
+    """Configuration for linear learning rate scheduler."""
+
+    type: Literal["linear"] = "linear"
+
+    warmup_steps: Annotated[int, Field(ge=0, description="Number of warmup steps for the learning rate scheduler.")] = (
+        10
+    )
+
+    decay_steps: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Number of steps to decay the learning rate during the final portion of training.",
+        ),
+    ] = 10
+
+    min_lr: Annotated[float, Field(ge=0, description="Minimum learning rate to converge to.")] = 0.0
+
+
+class CosineSchedulerConfig(BaseModel):
+    """Configuration for cosine learning rate scheduler."""
+
+    type: Literal["cosine"] = "cosine"
+
+    warmup_steps: Annotated[int, Field(ge=0, description="Number of warmup steps for the learning rate scheduler.")] = (
+        10
+    )
+
+    min_lr: Annotated[float, Field(ge=0, description="Minimum learning rate to converge to.")] = 0.0
+
+
+SchedulerConfig: TypeAlias = Annotated[
+    ConstantSchedulerConfig | LinearSchedulerConfig | CosineSchedulerConfig, Field(discriminator="type")
+]
+
+
+class BaseOptimizerConfig(BaseModel):
+    lr: Annotated[float, Field(ge=0)] = 1e-6
+    weight_decay: Annotated[float, Field(ge=0)] = 0.01
+    max_norm: Annotated[
+        float | None, Field(ge=0, description="Maximum gradient norm to clip. If None, gradient clipping is disabled.")
+    ] = 1.0
+
+
+class SGDConfig(BaseOptimizerConfig):
+    type: Literal["sgd"] = "sgd"
+    nesterov: bool = True
+    momentum: float = 0.9
+
+
+class AdamWConfig(BaseOptimizerConfig):
+    type: Literal["adamw"] = "adamw"
+
+    betas1: Annotated[float, Field(ge=0)] = 0.9
+    betas2: Annotated[float, Field(ge=0)] = 0.999
+    foreach: bool | None = None
+
+
+class MuonConfig(BaseOptimizerConfig):
+    type: Literal["muon"] = "muon"
+
+    mu: Annotated[float, Field(ge=0, description="Momentum factor for the Muon algorithm.")] = 0.95
+    betas1: Annotated[
+        float, Field(ge=0, description="Beta1 for the AdamW/Lion sub-optimizer used on non-Muon params.")
+    ] = 0.9
+    betas2: Annotated[
+        float, Field(ge=0, description="Beta2 for the AdamW/Lion sub-optimizer used on non-Muon params.")
+    ] = 0.95
+
+
+class SignSGDConfig(BaseOptimizerConfig):
+    type: Literal["sign_sgd"] = "sign_sgd"
+
+
+OptimizerConfig: TypeAlias = Annotated[
+    SGDConfig | AdamWConfig | MuonConfig | SignSGDConfig, Field(discriminator="type")
+]
+
+
+class WeightCheckpointConfig(BaseConfig):
+    """Configures saving HF-compatible weight checkpoints."""
+
+    save_sharded: Annotated[
+        bool,
+        Field(
+            description="Whether to save the weight checkpoint in sharded format.",
+        ),
+    ] = True
+
+    save_format: Annotated[
+        Literal["safetensors", "torch"],
+        Field(
+            description="The format to save the weight checkpoint in.",
+        ),
+    ] = "safetensors"
+
+    save_adapter_separately: Annotated[
+        bool,
+        Field(
+            description="Whether to save LoRA adapters separately before merging into full model weights.",
+        ),
+    ] = False
+
+
+class CheckpointConfig(BaseConfig):
+    """Configures checkpointing the full model, optimizer and training state for resuming training."""
+
+    output_dir: Annotated[
+        Path | None,
+        Field(
+            description="Override directory for checkpoints and weights. When set, checkpoints and weight snapshots are written here instead of under the trainer output_dir. Useful for writing large checkpoints to a separate storage volume.",
+        ),
+    ] = None
+
+    interval: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description="Interval at which to save the training checkpoint. If None, will only checkpoint at the end of training.",
+        ),
+    ] = None
+
+    weights: WeightCheckpointConfig | None = WeightCheckpointConfig()
+
+    skip_gather_master_weights: Annotated[
+        bool,
+        Field(
+            description="When true, skip gathering and saving HF-compatible weight checkpoints. Useful for large models where the gather is expensive and only DCP checkpoints are needed.",
+        ),
+    ] = False
+
+    weights_only: Annotated[
+        bool,
+        Field(
+            description="When true, only save weight checkpoints (no optimizer/scheduler state). Much faster and smaller than full checkpoints, but cannot resume training.",
+        ),
+    ] = False
+
+    resume_step: Annotated[
+        int | None,
+        Field(
+            ge=-1,
+            description="Step to resume training from. If None, will start from scratch. If -1, will restart from latest checkpoint available.",
+        ),
+    ] = None
+
+    keep_last: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description="Keep at most this many recent step checkpoints on disk. If None, never clean old checkpoints based on recency.",
+        ),
+    ] = None
+
+    keep_interval: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description="Keep checkpoints at every N steps permanently (e.g., keep_interval=100 keeps step 100, 200, ...). If None, no interval-based keeping.",
+        ),
+    ] = None
+
+    skip_progress: Annotated[
+        bool,
+        Field(
+            description="Whether to skip loading the progress from checkpoint.",
+        ),
+    ] = False
+
+    skip_scheduler: Annotated[
+        bool,
+        Field(
+            description="Whether to skip loading the scheduler from checkpoint.",
+        ),
+    ] = False
+
+    skip_dataloader: Annotated[
+        bool,
+        Field(
+            description="Whether to skip loading the dataloader from checkpoint.",
+        ),
+    ] = False
+
+    skip_optimizer: Annotated[
+        bool,
+        Field(
+            description="Whether to skip loading the optimizer state from checkpoint.",
+        ),
+    ] = False
+
+
+class DefaultLossConfig(BaseModel):
+    """Config for the default loss."""
+
+    type: Literal["default"] = "default"
+
+    dppo_mask_low: Annotated[float, Field(ge=0, description="The low threshold for masking tokens.")] = 0.2
+    dppo_mask_high: Annotated[float, Field(ge=0, description="The high threshold for masking tokens.")] = 0.2
+    adv_tau: Annotated[float, Field(ge=0, description="The tau for advantages.")] = 1.0
+    teacher_tau: Annotated[float, Field(ge=0, description="The tau for teacher logprobs.")] = 0.0
+    kl_tau: Annotated[float, Field(ge=0, description="The tau for KL divergence.")] = 1e-3
+
+
+class SFTLossConfig(BaseModel):
+    """Config for SFT-style masked negative log-likelihood loss."""
+
+    type: Literal["sft"] = "sft"
+
+
+class CustomLossConfig(BaseModel):
+    """Config for a custom external loss function."""
+
+    type: Literal["custom"] = "custom"
+
+    import_path: Annotated[str, Field(description="Import path to the loss function (e.g., 'my_module.my_loss')")]
+    kwargs: Annotated[dict[str, Any], Field(default_factory=dict, description="Kwargs to pass to the loss function")]
+
+
+LossConfig: TypeAlias = Annotated[DefaultLossConfig | SFTLossConfig | CustomLossConfig, Field(discriminator="type")]
+
+
+class FakeDataLoaderConfig(BaseConfig):
+    """Configures a fake data loader sampling random micro batches for debugging."""
+
+    batch_size: Annotated[int, Field(ge=1)] = 2
+    generate_samples: Annotated[
+        bool, Field(description="Whether to generate separate samples and pack them into a single micro batch.")
+    ] = False
+
+
+class DataLoaderConfig(BaseConfig):
+    """Configures the data loader used for training."""
+
+    fake: Annotated[FakeDataLoaderConfig | None, Field(description="Whether to use a fake data loader.")] = None
+    micro_batch_stack_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of compatible standard text micro-batches to stack "
+                "along the batch dimension into one trainer forward. When "
+                "micro_batch_stack_token_budget is set, this becomes the "
+                "maximum number of rows in one stacked forward. This only "
+                "applies to non-compaction, non-multimodal, non-LoRA, "
+                "single-run batches; other batches remain isolated."
+            ),
+        ),
+    ] = 1
+    micro_batch_stack_token_budget: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Optional cap on padded token slots in one stacked standard "
+                "text forward, computed as rows * max_seq_len_in_stack. If "
+                "unset, stacking uses the fixed micro_batch_stack_size count. "
+                "For example, 65536 caps full-context 16k rows at four rows "
+                "while allowing more underfilled Markovian rows when "
+                "micro_batch_stack_size is set higher."
+            ),
+        ),
+    ] = None
+    micro_batch_flex_stack_mode: Annotated[
+        Literal["vertical", "horizontal"],
+        Field(
+            description=(
+                "How compatible FlexAttention compaction micro-batches are "
+                "combined when micro_batch_stack_size > 1. vertical pads rows "
+                "to the largest writer length; horizontal concatenates logical "
+                "samples into one packed sequence and uses a block mask to "
+                "prevent cross-sample attention. The token budget caps padded "
+                "slots for vertical mode and useful writer tokens for "
+                "horizontal mode."
+            ),
+        ),
+    ] = "vertical"
+
+
+class BaseWeightBroadcastConfig(BaseModel):
+    """Configures the base weight broadcast."""
+
+    pass
+
+
+class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
+    """Configures the weight broadcast."""
+
+    type: Literal["filesystem"] = "filesystem"
+    save_sharded: Annotated[bool, Field(description="Whether to save the weight checkpoint in sharded format.")] = True
+    save_format: Annotated[
+        Literal["safetensors", "torch"], Field(description="The format to save the weight checkpoint in.")
+    ] = "safetensors"
+
+
+class NCCLWeightBroadcastConfig(BaseWeightBroadcastConfig):
+    """Configures the NCCL broadcast."""
+
+    type: Literal["nccl"] = "nccl"
+    host: Annotated[str, Field(description="The host to use for the NCCL broadcast.")] = "localhost"
+    port: Annotated[int, Field(description="The port to use for the NCCL broadcast.")] = 29501
+    timeout: Annotated[int, Field(description="The timeout in seconds to use for the NCCL broadcast.")] = 1200
+    # TODO: Should not be configurable, but auto-inferred
+    inference_world_size: Annotated[int, Field(description="The number of GPUs used for inference.")] = 1
+    quantize_in_weight_transfer: Annotated[
+        bool,
+        Field(
+            description=(
+                "Use kernel-format FP8 quantized NCCL transfer for weight updates. "
+                "When disabled, uses default HF checkpoint-format transfer."
+            ),
+        ),
+    ] = False
+
+
+WeightBroadcastConfig: TypeAlias = Annotated[
+    FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig, Field(discriminator="type")
+]
+
+
+class TrainerConfig(BaseConfig):
+    """Configures the RL trainer"""
+
+    # The model configuration
+    model: ModelConfig = ModelConfig()
+
+    # The tokenizer configuration
+    tokenizer: TokenizerConfig = TokenizerConfig()
+
+    # The data configuration
+    data: DataLoaderConfig = DataLoaderConfig()
+
+    # The loss configuration
+    loss: LossConfig = DefaultLossConfig()
+
+    # The optimizer configuration
+    optim: OptimizerConfig = AdamWConfig()
+
+    # The learning rate scheduler configuration
+    scheduler: SchedulerConfig = ConstantSchedulerConfig()
+
+    # The checkpoint configuration
+    ckpt: CheckpointConfig | None = None
+
+    weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
+
+    rollout_transport: TransportConfig = FileSystemTransportConfig()
+
+    # The logging configuration
+    log: TrainerLogConfig = TrainerLogConfig()
+
+    # The wandb configuration
+    wandb: WandbConfig | None = None
+
+    output_dir: Annotated[
+        Path,
+        Field(
+            description="Directory to write outputs to. Will be populated with checkpoints, weights, rollouts and logs as subdirectories. Should be set to a persistent directory with enough disk space. This value should be distinct across experiments running on a single node. See the README for more details."
+        ),
+    ] = Path("outputs")
+
+    max_steps: Annotated[
+        int | None,
+        Field(
+            description="Maximum number of steps to run training for. If None, will run indefinitely.",
+        ),
+    ] = None
+
+    max_async_level: Annotated[
+        int,
+        Field(
+            ge=0,
+            description="Maximum number of steps that inference can be ahead of training. Determines how 'off-policy' the inference engines can be. Higher values yield better throughput through async execution, but may yield lower performance. If 0, will be fully synchronous.",
+        ),
+    ] = 1
+
+    enable_router_replay: Annotated[
+        bool,
+        Field(
+            description="Whether to enable router replay. If True, will return routed experts in the batch. This is only supported if `enable_return_routed_experts=True` in the inference config or pass `--enable-return-routed-experts` to vLLM server. This is only supported for custom models.",
+        ),
+    ] = False
+
+    memory_profiler_path: Annotated[Path | None, Field(description="Path to write memory profile to.")] = None
+
+    bench: Annotated[
+        BenchConfig | None,
+        Field(
+            description="Whether to run in benchmark mode. It will automatically set the maximum number of steps to run to 4 and use fake data.",
+        ),
+    ] = None
+
+    gc: Annotated[
+        GCConfig | None,
+        Field(
+            description="Garbage collection config. Disables automatic GC and runs deterministic collections every N steps to avoid stragglers. Set to null to use Python's default GC behavior.",
+        ),
+    ] = GCConfig()
+
+    compaction: Annotated[
+        CompactionConfig,
+        Field(
+            description="KV cache compaction config. Must mirror the vLLM inference engine's compaction settings (window_size, stride, block_size). Only consulted when a TrainingSample carries compaction_events; otherwise ignored.",
+        ),
+    ] = CompactionConfig()
+
+    trace_path: Annotated[Path | None, Field(description="Path to write pytorch profiler trace to.")] = None
+
+    dist_timeout_seconds: Annotated[
+        int,
+        Field(
+            description="Timeout in seconds for torch distributed ops. Defaults to 600 seconds.",
+        ),
+    ] = 600
+
+    heartbeat: Annotated[
+        HeartbeatConfig | None, Field(description="The heartbeat config for monitoring training progress.")
+    ] = None
+
+    metrics_server: Annotated[
+        MetricsServerConfig | None,
+        Field(description="Prometheus metrics server config. If set, exposes /metrics endpoint for scraping."),
+    ] = None
+
+    max_concurrent_runs: Annotated[
+        int,
+        Field(
+            ge=1,
+            description="The maximum number of concurrent runs to allow. If 1, then only one run will be allowed at a time.",
+        ),
+    ] = 1
+
+    @model_validator(mode="after")
+    def validate_compaction_attention(self):
+        """When KV cache compaction is enabled, the trainer must use the HF
+        model path. Fails early at config load so the user doesn't burn hours
+        of training only to hit a runtime assertion on the first compaction
+        sample.
+
+        - impl="hf" is required because segmented_forward uses
+          past_key_values to feed retained KV into the next segment. The
+          custom llama path (impl="custom") asserts past_key_values is None.
+          impl="auto" resolves to "custom" for supported architectures (e.g.
+          Qwen3-4B), so it is also rejected.
+        - attn="flex_attention" defaults to the masked full-chain dispatch
+          when compaction is enabled. attn="flash_attention_2" remains
+          available for explicitly requested cache replay.
+        - compaction.stride must be positive and a multiple of
+          compaction.block_size (matches the vLLM-side constraint).
+        """
+        if (
+            self.compaction.window_size > 0
+            and self.model.attn == "flex_attention"
+            and "masked_forward_dispatch" not in self.compaction.model_fields_set
+        ):
+            self.compaction.masked_forward_dispatch = "flex_attention"
+            self.compaction.bptt_segments = -1
+
+        flex_dispatch = self.compaction.masked_forward_dispatch == "flex_attention"
+        if flex_dispatch:
+            self.compaction.bptt_segments = -1
+
+        if flex_dispatch and self.compaction.window_size <= 0:
+            raise ValueError(
+                "trainer.compaction.masked_forward_dispatch='flex_attention' "
+                "is only supported with KV eviction "
+                "(trainer.compaction.window_size > 0)."
+            )
+        if self.compaction.distillation.enabled and not flex_dispatch:
+            raise ValueError(
+                "trainer.compaction.distillation.enabled=true requires "
+                "trainer.compaction.masked_forward_dispatch='flex_attention'."
+            )
+        if self.compaction.window_size > 0:
+            if flex_dispatch and self.model.attn != "flex_attention":
+                raise ValueError(
+                    "trainer.compaction.masked_forward_dispatch='flex_attention' "
+                    "requires trainer.model.attn='flex_attention'."
+                )
+            if self.model.attn not in {"flash_attention_2", "flex_attention"}:
+                raise ValueError(
+                    f"trainer.compaction.window_size > 0 requires "
+                    f"trainer.model.attn='flash_attention_2' for cache replay "
+                    f"or 'flex_attention' for masked FlexAttention. Got "
+                    f"attn={self.model.attn!r}."
+                )
+            if self.model.impl != "hf":
+                raise ValueError(
+                    f"trainer.compaction.window_size > 0 requires "
+                    f"trainer.model.impl='hf' because segmented_forward uses "
+                    f"past_key_values between segments. The custom llama "
+                    f"implementation rejects past_key_values. Got "
+                    f"impl={self.model.impl!r} (note: 'auto' resolves to "
+                    f"'custom' for most supported models and is also rejected)."
+                )
+            if self.model.cp > 1:
+                raise ValueError(
+                    f"trainer.compaction.window_size > 0 is incompatible "
+                    f"with context parallelism (trainer.model.cp > 1). CP "
+                    f"shards input_ids along the sequence dimension, but "
+                    f"segmented_forward needs the full unsharded sequence "
+                    f"to compute segment ranges and re-feed the boundary "
+                    f"token. Got cp={self.model.cp}. Set trainer.model.cp=1."
+                )
+            if self.compaction.stride <= 0:
+                raise ValueError(
+                    "trainer.compaction.stride must be > 0 when "
+                    "compaction.window_size > 0."
+                )
+            if self.compaction.stride % self.compaction.block_size != 0:
+                raise ValueError(
+                    f"trainer.compaction.stride ({self.compaction.stride}) "
+                    f"must be a multiple of compaction.block_size "
+                    f"({self.compaction.block_size})."
+                )
+            if (
+                self.compaction.bptt_segments is not None
+                and self.compaction.bptt_segments != -1
+                and self.compaction.bptt_segments < 1
+            ):
+                raise ValueError(
+                    f"trainer.compaction.bptt_segments must be -1, None, "
+                    f"or >= 1, got {self.compaction.bptt_segments}."
+                )
+            if self.model.ac is not None and not flex_dispatch:
+                # Per-block activation checkpointing + use_cache=True +
+                # DynamicCache is a known broken combination: prime-rl's
+                # apply_ac wraps every decoder layer with torch.utils.
+                # checkpoint (non-reentrant). Under non-reentrant mode,
+                # each layer's forward is re-run during backward to
+                # recompute activations. If that forward calls
+                # DynamicCache.update() (which segmented_forward requires
+                # to thread past_key_values between segments), the
+                # re-run appends K/V to the SAME cache object a SECOND
+                # time, doubling the stored length. torch.utils.checkpoint
+                # then raises CheckpointError: "Recomputed values ...
+                # have different metadata than during the forward pass:
+                # saved [1, N, ...] vs recomputed [1, 2N, ...]".
+                #
+                # Per-segment backward mode does NOT sidestep this
+                # because the double-update happens inside
+                # window_loss.backward() within a single segment, before
+                # any subsequent segment starts. Confirmed by
+                # smoke4_rl_stability_run v3 which hit this exact error
+                # at step 0 of the first compaction-events-flowing run.
+                # probe_ac_cache_mutation.py reproduces it on a 1024-token
+                # single-segment case.
+                #
+                # Fix: remove [trainer.model.ac] from the RL config when
+                # using the cache-replay compaction paths. The FlexAttention
+                # path is intentionally exempt because it uses a single
+                # masked full-sequence forward instead of mutating
+                # DynamicCache across replayed segments.
+                raise ValueError(
+                    "trainer.compaction.window_size > 0 is incompatible "
+                    "with per-block activation checkpointing "
+                    "(trainer.model.ac != None) on cache-replay "
+                    "compaction paths. Prime-rl's per-block "
+                    "checkpoint_wrapper re-runs each decoder layer's "
+                    "forward during backward under non-reentrant mode, "
+                    "and each re-run calls DynamicCache.update() again, "
+                    "producing CheckpointError: 'Recomputed values have "
+                    "different metadata than during the forward pass' "
+                    "(saved cache length N vs recomputed 2N). Per-segment "
+                    "backward does NOT sidestep this — the double-update "
+                    "happens inside backward of a single segment. Set "
+                    "`trainer.model.ac = None`, remove the "
+                    "[trainer.model.ac] section entirely, or use "
+                    "trainer.compaction.masked_forward_dispatch='flex_attention' "
+                    "for the masked full-sequence FlexAttention path."
+                )
+        return self
+
+    def compaction_requires_hf_flash_attn(self):
+        """Backward-compatible alias for older caller sites."""
+        return self.validate_compaction_attention()
+
+    @model_validator(mode="after")
+    def deepep_disables_grad_clipping(self):
+        if self.model.ep_comm_backend == "deepep" and self.optim.max_norm is not None:
+            warnings.warn(
+                "Gradient clipping is not compatible with DeepEP. "
+                "Automatically setting optim.max_norm to None (disabled).",
+                stacklevel=1,
+            )
+            self.optim.max_norm = None
+        return self
+
+    @model_validator(mode="after")
+    def vlms_require_bfloat16(self):
+        if self.model.vlm is not None and (
+            self.model.optimization_dtype != "bfloat16" or self.model.reduce_dtype != "bfloat16"
+        ):
+            raise ValueError(
+                "VLM models must use optimization_dtype='bfloat16' and reduce_dtype='bfloat16' to match vLLM inference."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def vlm_freeze_incompatible_with_lora(self):
+        if self.model.vlm is not None and not self.model.vlm.freeze_vision_encoder and self.model.lora is not None:
+            raise ValueError(
+                "freeze_vision_encoder=false is incompatible with LoRA. "
+                "LoRA freezes all non-adapter parameters including the vision encoder."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_bench(self):
+        if self.bench is not None:
+            self.max_steps = 4  # 1 Warmup + 3 Benchmark
+            if not self.data.fake:
+                self.data.fake = FakeDataLoaderConfig()
+            if self.ckpt:  # Do not checkpoint
+                self.ckpt = None
+        return self
+
+    @model_validator(mode="after")
+    def dont_do_massive_traces(self):
+        if self.trace_path:
+            if self.max_steps is None:
+                raise ValueError("Must specify max_steps when tracing")
+            if self.max_steps >= 10:
+                raise ValueError(
+                    "Tracing more than 10 steps is not recommended as your trace will be massive. Remove this line if you really want to trace more steps."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_lora_adapter_saving(self):
+        if self.ckpt and self.ckpt.weights and self.ckpt.weights.save_adapter_separately:
+            lora_enabled = self.model and self.model.lora
+            if not lora_enabled:
+                raise ValueError(
+                    "save_adapter_separately=True requires LoRA to be enabled. "
+                    "Set model.lora or disable save_adapter_separately."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_weight_broadcast_type(self):
+        if self.weight_broadcast.type == "nccl" and self.max_async_level != 1:
+            raise ValueError("NCCL weight broadcast only works with async level 1")
+        return self
+
+    @model_validator(mode="after")
+    def validate_opt_and_fsdp_offload(self):
+        if self.optim.type == "muon" and self.model.fsdp_cpu_offload:
+            raise ValueError("Muon optimizer does not support FSDP CPU offload")
+        return self
+
+    @model_validator(mode="after")
+    def validate_optim_cpu_offload_single_run(self):
+        if self.model.optim_cpu_offload and self.max_concurrent_runs > 1:
+            raise ValueError("Optimizer CPU offload is not supported with max_concurrent_runs > 1")
+        return self
+
+    @model_validator(mode="after")
+    def validate_lora_broadcast(self):
+        if self.model.lora is not None and self.weight_broadcast.type == "nccl":
+            # TODO: Support this
+            raise ValueError("NCCL weight broadcast does not support LoRA yet.")
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_tokenizer(self):
+        if self.tokenizer.name is None:
+            self.tokenizer.name = self.model.name
+        if self.tokenizer.trust_remote_code is None:
+            self.tokenizer.trust_remote_code = self.model.trust_remote_code
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_fused_lm_head_token_chunk_size(self):
+        if self.model.fused_lm_head_token_chunk_size == "auto":
+            self.model.fused_lm_head_token_chunk_size = 8192
+
+        return self
+
+    @model_validator(mode="after")
+    def ep_only_with_custom_impl(self):
+        if self.model.ep > 1 and self.model.impl not in ("custom", "auto"):
+            raise ValueError("EP is only supported with the custom implementation or auto mode")
+
+        return self
+
+    @model_validator(mode="after")
+    def router_replay_only_with_custom_impl(self):
+        if self.enable_router_replay and self.model.impl not in ("custom", "auto"):
+            raise ValueError("Router replay is only supported with the custom implementation or auto mode")
+
+        return self

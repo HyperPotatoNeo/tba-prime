@@ -1,213 +1,246 @@
-# prime-rl - decentralized RL training at scale
+<p align="center">
+</p>
 
-prime-rl is a codebase for decentralized RL training at scale.
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/40c36e38-c5bd-4c5a-9cb3-f7b902cd155d#gh-light-mode-only" alt="Prime Intellect" width="312">
+  <img src="https://github.com/user-attachments/assets/6414bc9b-126b-41ca-9307-9e982430cde8#gh-dark-mode-only"  alt="Prime Intellect" width="312">
+</p>
+
+---
+
+<h3 align="center">
+PRIME-RL: Async RL Training at Scale
+</h3>
+
+---
+
+</br>
+<p align="center">
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/style.yaml">
+    <img src="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/style.yaml/badge.svg" alt="Style" />
+  </a>
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/cpu_tests.yaml">
+    <img src="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/cpu_tests.yaml/badge.svg" alt="Test" />
+  </a>
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/gpu_tests.yaml">
+    <img src="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/gpu_tests.yaml/badge.svg" alt="Test" />
+  </a>
+</p>
+
+## Overview
+
+PRIME-RL is a framework for large-scale reinforcement learning. It is designed to be easy to use and hackable, yet capable of scaling to 1000+ GPUs. Here is what we think sets it apart:
+
+1. Fully asynchronous RL for high-throughput agentic training at scale.
+2. Performant: built to train 1T+ MoE models on 1000+ GPUs with [FSDP2](https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html) for training and [vLLM](https://github.com/vllm-project/vllm) for inference, with FP8 inference, PD disaggregation, EP and CP parallelism, and more.
+3. Native integration with [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) environments through the [Environments Hub](https://app.primeintellect.ai/dashboard/environments?ex_sort=most_stars), including built-in support for SWE and agentic environments.
+4. End-to-end post-training: SFT, RL training, and evals.
+5. Multi-node deployment with Slurm and Kubernetes support.
+6. Multimodal support for VLMs such as Qwen3-VL.
+7. Hackable, modular, and extensible by design.
 
 
+## Models support
 
-## install
-quick install
+
+The trainer works with both Hugging Face and Prime custom `ModelForCausalLM` out of the box. For selected families (especially large MoE) we also ship highly optimized training code under `src/prime_rl/trainer/models/`, including expert parallelism (EP) for MoE layers and context parallelism (CP) for long sequences (see the table), and additional kernels like [quack-kernels](https://github.com/quack-kernels/quack-kernels).
+
+With `[model] impl = "auto"` (the default), the trainer selects that custom stack when the Hugging Face config type is registered.
+
+| Family | Example IDs | MoE | EP | CP |
+|--------|-------------|-----|----|-----|
+| GLM-5 (`glm_moe_dsa`) | `zai-org/GLM-5`, `zai-org/GLM-5-FP8` | yes | ✅ | ✅ |
+| Qwen3 MoE (`qwen3_moe`) | `Qwen/Qwen3-30B-A3B`, … | yes | ✅ | ✅ |
+| Qwen3.5 MoE (`qwen3_5_moe`) | `Qwen/Qwen3.5-35B-A3B`, … | yes | ✅ | ✅ |
+| Qwen3 / Qwen3.5 VLMs | [multimodal.md](docs/multimodal.md) (`qwen3_vl`, `qwen3_5`, `qwen3_5_moe`) | MoE only on MoE VLMs | MoE only | ✅ |
+| MiniMax M2 (`minimax_m2`) | `MiniMax/MiniMax-M2` | yes | ✅ | ✅ |
+| Nemotron H (`nemotron_h`) | `nvidia/Nemotron-3-Nano-30B-A3B`, `nvidia/Nemotron-3-Super-120B-A12B`, … | yes | ✅ | ❌ |
+| Trinity (`afmoe`) | `arcee-ai/Trinity-Mini`, … | yes | ✅ | ✅ |
+| GLM-4 · GLM-4.5 MoE · INTELLECT-3 (`glm4_moe`) | `THUDM/GLM-4-9B-0414`, `zai-org/GLM-4.5-Air`, `zai-org/GLM-4.5`, `PrimeIntellect/INTELLECT-3`, … | yes | ✅ | ✅ |
+| GPT-OSS (HF, MoE) | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` | yes | ❌ | ✅ |
+| Other HF causal LMs | Qwen3 dense, Mistral, … (`impl = "hf"`) | varies | ❌ | ✅ |
+
+
+## Setup
+
+> *We develop and test on NVIDIA RTX 3090/4090/5090, A100, H100, H200, and B200. If your setup fails, please create an [issue](https://github.com/PrimeIntellect-ai/prime-rl/issues).*
+
+### Prerequisites
+
+Currently, you **need at least one NVIDIA GPU to use PRIME-RL**. If you don't already have access to one, we recommend our [compute platform](https://app.primeintellect.ai) for everything from renting on-demand single GPUs for developing, debugging and small ablations, to [reserving 1000+ GPU clusters](https://app.primeintellect.ai/dashboard/quotes) for production-scale training.
+
+### Quick Setup
+
+Set up PRIME-RL in a single command.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-rl/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-rl/main/scripts/install.sh | bash
 ```
 
+<details>
+<summary>
+Manual Setup
+</summary>
+<br>
 
-## Dev
-
-
-1. Clone: 
+1. Clone the repository
 
 ```bash
-git clone git@github.com:PrimeIntellect-ai/prime-rl.git
+git clone https://github.com/PrimeIntellect-ai/prime-rl.git
 cd prime-rl
 ```
 
-2. Install `uv`:
+2. Install [uv](https://docs.astral.sh/uv/)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
 ```
 
-3. Set up the environment (will default to Python 3.12)
+3. Install dependencies from the lock file
 
 ```bash
-uv sync && uv sync --extra fa
+uv sync --all-extras
 ```
 
-You can check that `flash_attn` is installed correctly by running `uv run python -c "import flash_attn"` and ensure no error is thrown.
+3.1. Optional: Install Flash Attention 3 (on Hopper GPUs only, for flash_attention_3 attention backend)
 
-4. Precommit install
+> *NOTE*: This step will take a while, as it builds the Flash Attention 3 extension from source, as it has no wheels prebuilt.
+> *NOTE*: After this step, you can't run `uv sync --all-extras` or `uv run` as it will uninstall the package, you can avoid it by running `uv sync --inexact` or `uv run --no-sync`
+
+```bash
+uv pip install "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git@main#subdirectory=hopper" --no-build-isolation
+```
+
+</details>
+
+<details>
+<summary>
+Validate your environment setup
+</summary>
+<br>
+
+1. Check that the environment uses Python 3.12
+
+```bash
+uv run python -V
+```
+
+2. Check that `flash-attn` is installed
+
+```bash
+uv run python -c "import flash_attn"
+```
+
+3. Check that you can run SFT trainer  (*this requires 1 GPU*)
+
+```bash
+uv run sft @ configs/debug/sft/train.toml
+```
+
+4. Check that you can run the RL trainer (*this requires 1 GPU*)
+
+```bash
+uv run trainer @ configs/debug/rl/train.toml
+```
+
+5. Check that you can run the inference server (*this requires 1 GPU*)
+
+```bash
+uv run inference @ configs/debug/infer.toml
+```
+
+*Keep the inference server running in the background for the next steps.*
+
+5.1. Check that you can run the orchestrator against the inference server
+
+```bash
+uv run orchestrator @ configs/debug/orch.toml
+```
+
+5.2. Check that you can run evals against the inference server
+
+```bash
+uv run eval @ configs/debug/eval.toml
+```
+
+</details>
+
+### Additional Setup
+
+1. If you want to log your runs to [W&B](https://wandb.ai), log in
+
+```bash
+uv run wandb login
+# Or set `export WANDB_API_KEY=...`
+```
+
+2. If you require gated/ private models or datasets from [HuggingFace](https://huggingface.co), log in
+
+```bash
+uv run hf auth login
+# Or set `export HF_TOKEN=...`
+```
+
+## Training Examples
+We provide end-to-end training examples in the [`examples`](examples) directory to highlight features of the framework and guide you through the process of training your own models.
+
+### Basic Training: 1 to 8 GPUs
+
+Follow this guide to learn the basics of Prime-RL. You can train your own models on 1 to 8 GPUs. Ideal for getting started and exploring the capabilities of the framework. These guides cover most use cases -- single-turn, multi-turn, tool calling, etc. -- on toy environments and small models.
+
+1. [**Reverse Text**](examples/reverse_text/README.md): Train `Qwen3-0.6B` to reverse a small chunk of text. Demonstrates tiny-scale single-turn SFT and RL training. Can be trained on a single consumer GPU in a few minutes, and is ideal for getting started.
+2. [**Wordle**](examples/wordle/README.md): Train `Qwen3-1.7B` to play Wordle. A fun example of multi-turn SFT and RL training. Can be trained on a 2-4 H100 GPUs in a few hours. Ideal for exploring the multi-turn training capabilities of the framework.
+3. [**Alphabet Sort**](examples/alphabet_sort/README.md): Train `Qwen3-4B-Instruct-2507` to sort names alphabetically. Demonstrates multi-turn RL training via LoRA without SFT warmup. Can be trained on a single H100 GPU in just over an hour. Ideal for exploring LoRA-based training.
+4. [**Wiki Search**](examples/wiki_search/README.md): Train `Qwen3-4B-Instruct-2507` to answer trivia questions by searching through a Wikipedia. Demonstrates multi-turn with web search tool use.
+5. [**Hendrycks Sanity**](examples/hendrycks_sanity/README.md): Run a sanity check experiment on `DeepSeek-R1-Distill-Qwen-1.5B` using a filtered subset of MATH where the model already partially solves 20-80% of problems. Useful for algorithm ablations.
+
+### Advanced Training: 32 - 2048 GPUs:
+
+Follow this guide to train large models on hard reasoning and agentic / swe environments.
+These guides are designed to be run from a Slurm cluster but can also be adapted to k8s deployments.
+
+1. [**Qwen 3 30B - A3B Math**](examples/qwen30b_math/README.md): Train `Qwen3-30B-A3B` to solve hard math problems.
+2. [**Qwen 3 30B - A3B SWE**](examples/qwen30b_swe/README.md): Train `Qwen3-30B-A3B` to solve hard SWE problems.
+3. [**Intellect-3.1**](examples/Intellect-3.1/README.md): Reproduce our `INTELLECT-3.1` training run.
+4. [**MiniMax-M2.5 SWE**](examples/minimax_m2.5_swe/README.md): Train `MiniMax-M2.5` on agentic SWE tasks.
+5. [**High-throughput GLM-5**](examples/glm5_pd_disag/README.md): Train `GLM-5` with PD disaggregation and FP8 inference on SWE.
+
+## Docs
+
+Check out the [docs](docs) directory for in-depth guides on how to use PRIME-RL.
+
+- [**Entrypoints**](docs/entrypoints.md) - Overview of the main components (orchestrator, trainer, inference) and how to run SFT, RL, and evals
+- [**Configs**](docs/configs.md) - Configuration system using TOML files, CLI arguments, and environment variables
+- [**Environments**](docs/environments.md) - Installing and using verifiers environments from the Environments Hub
+- [**Async Training**](docs/async.md) - Understanding asynchronous off-policy training and step semantics
+- [**Logging**](docs/logging.md) - Logging with loguru, torchrun, and Weights & Biases
+- [**Checkpointing**](docs/checkpointing.md) - Saving and resuming training from checkpoints
+- [**Benchmarking**](docs/benchmarking.md) - Performance benchmarking and throughput measurement
+- [**Deployment**](docs/deployment.md) - Training deployment on single-GPU, multi-GPU, and multi-node clusters
+- [**Memory Usage**](docs/memory_usage.md) - Techniques for reducing memory usage (activation checkpointing, offloading, EP, CP, LoRA, etc.)
+- [**Troubleshooting**](docs/troubleshooting.md) - Common issues and their solutions
+- [**Multimodal**](docs/multimodal.md) - Training VLMs like Qwen3-VL
+
+## Contributing
+
+We warmly welcome community contributions! We use [issues](https://github.com/PrimeIntellect-ai/prime-rl/issues) to track bugs, feature requests, and share our internal roadmap. If you encounter bugs, have pain points during development, or have ideas for new features, please open an issue.
+
+Contributions are welcome via PR. Please follow these guidelines:
+1. Install the [pre-commit hooks](#pre-commit-hooks) to ensure your code is formatted correctly.
+2. Please keep your PR in "Draft" until it is ready for review.
+3. If your PR resolves an issue, please link the issue in the PR description
+4. If you can, try running the [test suite](#tests) locally to ensure your changes are working as expected.
+
+### Pre-Commit Hooks
+
+Please install the [pre-commit](https://pre-commit.com) hooks to ensure your code is formatted correctly.
 
 ```bash
 uv run pre-commit install
 ```
 
-6. debug run 
-
-training
-
-```bash
-uv run torchrun --nproc_per_node=2 src/zeroband/train.py @ configs/training/debug.toml
-```
-
-inference
-```bash
-uv run python src/zeroband/infer.py @ configs/inference/debug.toml
-```
-
-
-## Simple Math Run
-
-This debug run trains `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` on the `justus27/math-hendrycks-genesys-format` dataset using separate inference and training processes.
-Depending on the number of available GPUs, we have to adjust the number of generated samples on the inference workers to match the batch size of the training process.
-
-Training samples per step: `batch_size * step_per_rollout`
-Inference samples per step: `batch_size * dp`
-
-If you have 2 GPUs, run the following commands:
-
-```bash
-# Start inference worker
-export CUDA_VISIBLE_DEVICES=0
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-uv run python src/zeroband/infer.py @ configs/inference/simple_math.toml --parallel.dp 1 --max-batch-size 512
-```
-
-```bash
-# Start trainer
-ulimit -n 65536
-export CUDA_VISIBLE_DEVICES=1
-uv  run torchrun src/zeroband/train.py @ configs/training/simple_math.toml
-```
-
-If you have 4 GPUs, run the following commands:
-
-```bash
-# Start inference workers
-export CUDA_VISIBLE_DEVICES=0,1
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-uv run python src/zeroband/infer.py @ configs/inference/simple_math.toml --parallel.dp 2 --max-batch-size 256
-```
-
-```bash
-# Start trainer
-ulimit -n 65536
-export CUDA_VISIBLE_DEVICES=2
-uv  run torchrun src/zeroband/train.py @ configs/training/simple_math.toml
-```
-
-If you have 8 GPUs, run the following commands:
-
-```bash
-# Start inference workers
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-uv run python src/zeroband/infer.py @ configs/inference/simple_math.toml
-```
-
-```bash
-# Start trainer
-ulimit -n 65536
-export CUDA_VISIBLE_DEVICES=6,7
-uv  run torchrun --nproc_per_node=2 src/zeroband/train.py @ configs/training/simple_math.toml --data.num_workers 2
-```
-
-
-## 2k seq length run
-
-on two different terminal do:
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-uv run python src/zeroband/infer.py @ configs/inference/deepscaler.toml
-```
-
-then start the trainer
-
-```bash
-ulimit -n 65536
-export CUDA_VISIBLE_DEVICES=6,7
-uv  run torchrun --nproc_per_node=2 src/zeroband/train.py @ configs/training/deepscaler.toml
-```
-
-if running on h100 node instead of H200 you should add ` --train.micro_bs 4`
-
-## Distributed inference
-
-Inference supports running in multi-node multi-GPU setups supporting DP, TP and PP, and sensible combinations of these.
-Below are examples of how to run inference for different parallelization strategies.
-
-Single Node (DP=1, TP=1, PP=1, *requires 1 GPU*)
-
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run python src/zeroband/infer.py @ configs/inference/debug.toml
-```
-
-Only TP (TP=2, PP=1, DP=1, *requires 2 GPUs*)
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run python src/zeroband/infer.py @ configs/inference/debug.toml --parallel.tp 2
-```
-
-Only DP (DP=2, TP=1, PP=1, *requires 2 GPUs*)
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 uv run python src/zeroband/infer.py @ configs/inference/debug.toml --parallel.dp 2
-```
-
-Only PP (DP=1, TP=1, PP=2, *requires 2 GPUs*)
-
-```bash
-# Node 1
-CUDA_VISIBLE_DEVICES=0 uv run python src/zeroband/infer.py @ configs/inference/debug.toml \
-	--parallel.pp.rank 0 \
-	--parallel.pp.world-size 2 \
-	--seed 69
-```
-
-```bash
-# Node 2
-CUDA_VISIBLE_DEVICES=1 uv run python src/zeroband/infer.py @ configs/inference/debug.toml \
-	--parallel.pp.rank 1 \
-	--parallel.pp.world-size 2 \
-	--seed 69
-```
-
-*Note: Setting the seed here is important to ensure model shards work on the same data shards.*
-
-DP+TP (DP=2, TP=2, PP=1, *requires 4 GPUs*)
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 uv run python src/zeroband/infer.py @ configs/inference/debug.toml --parallel.dp 2 --parallel.tp auto
-```
-
-PP+TP (DP=1, TP=2, PP=2, *requires 4 GPUs*)
-
-```bash
-# Node 1
-CUDA_VISIBLE_DEVICES=0,1 uv run python src/zeroband/infer.py @ configs/inference/debug.toml \
-	--parallel.tp auto \
-	--parallel.pp.rank 0 \
-	--parallel.pp.world-size 2 \
-	--seed 69
-```
-
-```bash
-# Node 2
-CUDA_VISIBLE_DEVICES=2,3 uv run python src/zeroband/infer.py @ configs/inference/debug.toml \
-	--parallel.tp auto \
-	--parallel.pp.rank 1 \
-	--parallel.pp.world-size 2 \
-	--seed 69
-```
-
-*Note: To check the logs of `prime-iroh` (used for connecting PP nodes), you can add the `RUST_LOG=prime_iroh=info` environment variable.*
-
-We don't support DP+PP and so that configuration will raise an exception.
-
-## Tests
+### Tests
 
 Run the full test suite 
 
@@ -233,71 +266,19 @@ To run CPU-only tests, use the inverse of the `gpu` marker:
 uv run pytest -v -m "not gpu"
 ```
 
-To run fast tests, use the inverse of the `slow` marker:
+## License
 
-```bash
-uv run pytest -v -m "not slow"
-```
-
-## Configs
-
-We use `pydantic-settings` to configure `prime-rl`. To get an overview of the available configurations, run the following command:
-
-```bash
-uv run python src/zeroband/train.py --help
-```
-
-```bash
-uv run python src/zeroband/infer.py --help
-```
-
-### Sources
-
-We support the following sources for configuration, in this order of precedence:
-
-1. **Command-line arguments**: You can pass (nested) arguments as `--key.subkey value` to the script. For example, to set the model name you can run `--model.name`
-
-2. **Config files**: You can pass `.toml` config files (defined in the `configs` directory) using the `@` prefix. For example, to use the `debug.toml` config file, you can run `uv run python src/zeroband/infer.py @ configs/inference/debug.toml`. (*If you leave a space between the `@` and the config file, you will get shell path auto-completions.*)
-
-3. **Environment variables**: You can set environment variables to override the config values. All environment variables must be prefixed with `PRIME_` and use the `__` delimiter to nest the keys. For example, to set the model name you can run `export PRIME_MODEL__NAME=Qwen/Qwen3-0.6B`.
-
-4. **Defaults**: For almost all config arguments, we have a default value which will be used if no other source is provided.
-
-In general we recommend setting configurations via config files to define reproducible experiments and use command-line arguments to override the config values to run variants of the same experiment. Environment variables are usually only used in production settings to communicate with the [Prime Protocol](https://github.com/PrimeIntellect-ai/protocol) worker. In most cases, you should not need to use environment variables.
-
-The precendence order will be important if multiple sources try to configure the same argument. For example, in the following command, all sources will define a model name
-
-```toml
-# qwen8b.toml
-[model]
-name = "Qwen/Qwen3-8B"
-```
-
-```toml
-# qwen14b.toml
-[model]
-name = "Qwen/Qwen-14B"
-```
-
-```bash
-PRIME_MODEL__NAME=Qwen/Qwen3-4B uv run src/zeroband/infer.py @qwen8b.toml @qwen14b.toml --model.name Qwen/Qwen3-32B
-```
-
-In this example, the CLI argument `--model.name Qwen/Qwen3-32B` will take precendence and the script will use `Qwen/Qwen3-32B` as the model name. If the CLI argument wasn't set, then the second config file would take precedence and the script would use `Qwen/Qwen-14B` as the model name. If the second config file wasn't set, then the first config file would take precedence and the script would use `Qwen/Qwen3-8B` as the model name. Finally, if the first config file wasn't set, then the environment variable would take precedence and the script would use `Qwen/Qwen-4B` as the model name. If the environment variable wasn't set, then the default value would be used and the script would use `Qwen/Qwen3-0.6B` as the model name.
-
+This project is licensed under the Apache 2.0 license, as found in the [License](LICENSE) file.
 
 ## Citation
 
-If you find `prime-rl` useful, feel free to cite our work:
+If you find our work useful, feel free to cite it using
 
-```bash
-@misc{primeintellectteam2025intellect2reasoningmodeltrained,
-      title={INTELLECT-2: A Reasoning Model Trained Through Globally Decentralized Reinforcement Learning}, 
-      author={Prime Intellect Team and Sami Jaghouar and Justus Mattern and Jack Min Ong and Jannik Straube and Manveer Basra and Aaron Pazdera and Kushal Thaman and Matthew Di Ferrante and Felix Gabriel and Fares Obeid and Kemal Erdem and Michael Keiblinger and Johannes Hagemann},
-      year={2025},
-      eprint={2505.07291},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2505.07291}, 
+```tex
+@misc{primeintellect2025prime-rl,
+  author = {Prime Intellect},
+  title = {PRIME-RL},
+  url = {https://github.com/PrimeIntellect-ai/prime-rl},
+  year = {2025}
 }
 ```

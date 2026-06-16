@@ -1,0 +1,998 @@
+import asyncio
+import gc
+import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import tomli_w
+
+from prime_rl.orchestrator.advantage import compute_advantages
+from prime_rl.orchestrator.eval_utils import compute_eval_ckpt_step
+from prime_rl.orchestrator.event_loop_lag import EventLoopLagMonitor
+from prime_rl.orchestrator.patches import monkey_patch_chat_completion_logprobs, monkey_patch_oai_iterable_types
+from prime_rl.orchestrator.trajectories import (
+    build_vlm_image_cache,
+    interleave_rollout,
+    offload_images_to_disk,
+    pretokenize_rollout_trajectory,
+)
+from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
+from prime_rl.utils.pathing import get_log_dir
+from prime_rl.utils.usage_reporter import UsageReporter
+
+# This monkey patch is necessary to avoid Pydantic validating fields using typing.Iterable (e.g. in multimodal or tool call messages) lazily which leads to tokenization errors, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1249
+monkey_patch_oai_iterable_types()
+
+
+# This monkey patch is necessary to avoid heavy CPU overhead from constructing the OAI ChatCompletion Pydantic model with logprobs, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1189
+monkey_patch_chat_completion_logprobs()
+
+# Import environment before any other imports
+
+import pandas as pd
+import verifiers as vf
+from transformers import AutoProcessor, AutoTokenizer
+
+from prime_rl.configs.orchestrator import OrchestratorConfig
+from prime_rl.orchestrator.buffer import Buffer
+from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
+from prime_rl.orchestrator.envs import EvalEnvs, TrainEnvs
+from prime_rl.orchestrator.filters import apply_filters, setup_filters
+from prime_rl.orchestrator.scheduler import Scheduler
+from prime_rl.orchestrator.utils import (
+    compute_teacher_logprobs,
+    get_weight_dir,
+    print_benchmark,
+    setup_external_rollout_model,
+)
+from prime_rl.orchestrator.vf_utils import (
+    get_completion_len,
+    get_seq_len,
+    intercept_vf_logging,
+)
+from prime_rl.utils.client import (
+    init_nccl_broadcast,
+    setup_inference_pool,
+)
+from prime_rl.utils.config import cli
+from prime_rl.utils.heartbeat import Heartbeat
+from prime_rl.utils.logger import setup_logger
+from prime_rl.utils.monitor import setup_monitor
+from prime_rl.utils.process import set_proc_title
+from prime_rl.utils.utils import (
+    clean_exit,
+    get_env_ids_to_install,
+    install_env,
+    resolve_latest_ckpt_step,
+    to_col_format,
+)
+
+# Hard wall-clock budget for the orchestrator's post-training cleanup. If the
+# graceful shutdown sequence (scheduler / inference pool / env teardown) is
+# still running after this many seconds, we force-exit the process so the run
+# pod terminates instead of sitting wedged forever. The training checkpoint
+# and artifacts are persisted *before* this point, so a forced exit is safe.
+SHUTDOWN_TIMEOUT_S = 300
+
+
+@clean_exit
+async def orchestrate(config: OrchestratorConfig):
+    # Initialize the logger
+    logger = setup_logger(
+        config.log.level,
+        json_logging=config.log.json_logging,
+    )
+    intercept_vf_logging(logger="verifiers.serve", level="WARN")  # show logs from env clients
+    logger.info("Starting orchestrator")
+
+    event_loop_lag_monitor = EventLoopLagMonitor()
+    event_loop_lag_monitor_task = asyncio.create_task(event_loop_lag_monitor.run())
+
+    # Print warning if running in benchmark mode
+    if config.bench:
+        logger.warning(f"Running in benchmark mode (max_steps={config.max_steps})")
+
+    # Save configs to output directory
+    config_dir = config.output_dir / "control"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    with open(config_dir / "orch.toml", "wb") as f:
+        tomli_w.dump(config.model_dump(exclude_none=True, mode="json"), f)
+
+    # Install environments
+    env_ids_to_install = set()
+    env_ids_to_install.update(get_env_ids_to_install(config.train.env))
+    if config.eval is not None:
+        env_ids_to_install.update(get_env_ids_to_install(config.eval.env))
+
+    for env_id in env_ids_to_install:
+        install_env(env_id)
+
+    # Setup rollout inference pool (handles both static and elastic modes)
+    rollout_client_config, rollout_model_name, enable_policy_updates = setup_external_rollout_model(config, logger)
+
+    client_type = "openai_chat_completions_token" if config.use_token_client else "openai_chat_completions"
+    if config.use_token_client:
+        logger.warning(
+            "Token-in-token-out (TITO) client is enabled. Only use this if your environment has a linear "
+            "history and the chat template has the extension property."
+        )
+    inference_pool = await setup_inference_pool(
+        rollout_client_config, model_name=rollout_model_name, client_type=client_type
+    )
+
+    # Setup teacher inference pool if configured
+    if config.teacher_model:
+        logger.info(
+            f"Initializing teacher inference pool (base_url={', '.join(config.teacher_model.client.base_url)}, "
+            f"model={config.teacher_model.model.name})"
+        )
+        teacher_inference_pool = await setup_inference_pool(
+            config.teacher_model.client, model_name=config.teacher_model.model.name
+        )
+    else:
+        teacher_inference_pool = None
+
+    # Check if this is a vision-language model (used throughout for VLM-specific paths)
+    is_vlm = config.model.vlm is not None
+
+    # Load tokenizer and processor (processor only for VLM models)
+    logger.info(f"Initializing tokenizer for {config.model.name}")
+    tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
+
+    # Install block-aligned message padding interceptor (kv-eviction). No-op
+    # passthrough when compaction_padding.enabled is False.
+    if config.compaction_padding.enabled:
+        from kv_eviction.env import configure_message_padding
+        from kv_eviction.padding import (
+            resolve_filler_token_id,
+            resolve_im_end_token_id,
+        )
+
+        im_end_id = (
+            config.compaction_padding.im_end_token_id
+            if config.compaction_padding.im_end_token_id is not None
+            else resolve_im_end_token_id(tokenizer)
+        )
+        filler_id = resolve_filler_token_id(
+            tokenizer,
+            config.compaction_padding.filler_token_id,
+            forbidden_token_ids=(im_end_id,),
+        )
+        # kv-recall / markovian-recall: extend the padding interceptor with
+        # the recall machinery. Kwargs and the cadence env vars come from
+        # kv_eviction.modes — the single source of truth for the validated
+        # recall stack.
+        managed_kwargs: dict = {}
+        if config.kv_mode is not None:
+            from kv_eviction.modes import client_env_for_mode, padding_kwargs_for_mode
+
+            managed_kwargs = padding_kwargs_for_mode(
+                config.kv_mode,
+                max_turns=config.markovian_thinker.max_turns,
+                stride=config.markovian_thinker.stride or 1,
+                recall_max_spans=config.kv_recall_max_spans,
+            )
+            for key, value in client_env_for_mode(config.kv_mode).items():
+                os.environ.setdefault(key, value)
+
+        configure_message_padding(
+            enabled=True,
+            tokenizer=tokenizer,
+            block_size=config.compaction_padding.block_size,
+            filler_token_id=filler_id,
+            im_end_token_id=im_end_id,
+            phase4_enabled=config.compaction_padding.phase4_enabled,
+            **managed_kwargs,
+        )
+        # Propagate to the verifiers env server subprocess spawned below.
+        # That subprocess (mp.spawn) runs a fresh interpreter and would
+        # otherwise see `_padding_config=None`, making the AsyncCompletions
+        # interceptor a no-op. kv_eviction.env autoconfigures from these
+        # vars at import time.
+        os.environ["KV_EVICTION_PADDING_MODEL"] = config.model.name
+        os.environ["KV_EVICTION_PADDING_BLOCK_SIZE"] = str(config.compaction_padding.block_size)
+        os.environ["KV_EVICTION_PADDING_FILLER_ID"] = str(filler_id)
+        os.environ["KV_EVICTION_PADDING_IM_END_ID"] = str(im_end_id)
+        os.environ["KV_EVICTION_PADDING_PHASE4"] = (
+            "1" if config.compaction_padding.phase4_enabled else "0"
+        )
+        if managed_kwargs:
+            os.environ["KV_EVICTION_MANAGED_CONTEXT"] = "1"
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_RECALL_MAX_SPANS"] = str(
+                managed_kwargs["recall_max_spans"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_INDEX"] = "1"
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_INDEX_MAX_ENTRIES"] = str(
+                managed_kwargs["managed_context_index_max_entries"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_RESTORE_MODE"] = str(
+                managed_kwargs["managed_context_restore_mode"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_RECALL_MODE"] = str(
+                managed_kwargs["managed_context_recall_mode"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_COMPACTION_MAX_TURNS"] = str(
+                managed_kwargs["managed_context_compaction_max_turns"]
+            )
+            os.environ["KV_EVICTION_MANAGED_CONTEXT_TURNS_LAST_KEPT"] = str(
+                managed_kwargs["managed_context_turns_last_kept"]
+            )
+        logger.info(
+            f"Block-aligned message padding enabled "
+            f"(block_size={config.compaction_padding.block_size}, "
+            f"filler_token_id={filler_id}, im_end_token_id={im_end_id}, "
+            f"phase4_enabled={config.compaction_padding.phase4_enabled}, "
+            f"kv_mode={config.kv_mode})"
+        )
+
+    # Install Markovian Thinker client-side message truncation. In
+    # markovian_thinker.kv_eviction mode this section is only the high-level
+    # turn-eviction policy; the actual request interceptor is the
+    # block-aligned padding / Phase4 path above, not client-side truncation.
+    if config.markovian_thinker.enabled and not config.markovian_thinker.kv_eviction:
+        from kv_eviction.env import configure_markovian_thinker
+
+        configure_markovian_thinker(
+            enabled=True,
+            tokenizer=tokenizer,
+            max_turns=config.markovian_thinker.max_turns,
+            log_truncated_messages=config.markovian_thinker.log_truncated_messages,
+            stride=config.markovian_thinker.stride,
+        )
+        # Propagate to the verifiers env server subprocess. That
+        # subprocess (mp.spawn) runs a fresh interpreter and would
+        # otherwise see `_markovian_config=None`, making the
+        # AsyncCompletions interceptor a passthrough. kv_eviction.env
+        # autoconfigures from these vars at import time.
+        os.environ["KV_EVICTION_MARKOVIAN_ENABLED"] = "1"
+        os.environ["KV_EVICTION_MARKOVIAN_MAX_TURNS"] = str(
+            config.markovian_thinker.max_turns
+        )
+        os.environ["KV_EVICTION_MARKOVIAN_MODEL"] = config.model.name
+        if config.markovian_thinker.stride is not None:
+            os.environ["KV_EVICTION_MARKOVIAN_STRIDE"] = str(
+                config.markovian_thinker.stride
+            )
+        if config.markovian_thinker.log_truncated_messages:
+            os.environ["KV_EVICTION_MARKOVIAN_LOG"] = "1"
+        logger.info(
+            f"Markovian Thinker enabled "
+            f"(max_turns={config.markovian_thinker.max_turns}, "
+            f"stride={config.markovian_thinker.stride})"
+        )
+
+        # Install Markovian Summary (summarization-based compaction) on
+        # top of the Markovian Thinker interceptor. No-op when
+        # markovian_thinker.summary.enabled is False.
+        scfg = config.markovian_thinker.summary
+        if scfg.enabled:
+            from kv_eviction.env import configure_markovian_summary
+
+            configure_markovian_summary(
+                enabled=True,
+                mode=scfg.mode,
+                compaction_max_turns=scfg.compaction_max_turns,
+                max_len_summary=scfg.max_len_summary,
+                instruction_text=scfg.instruction_text,
+                resume_text=scfg.resume_text,
+                temperature=scfg.temperature,
+                top_p=scfg.top_p,
+                on_error=scfg.on_error,
+                log_summaries=scfg.log_summaries,
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED"] = "1"
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MODE"] = scfg.mode
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_COMPACTION_MAX_TURNS"] = str(
+                scfg.compaction_max_turns
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MAX_LEN_SUMMARY"] = str(
+                scfg.max_len_summary
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_TEMPERATURE"] = str(
+                scfg.temperature
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_TOP_P"] = str(scfg.top_p)
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR"] = scfg.on_error
+            if scfg.log_summaries:
+                os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_LOG"] = "1"
+            # instruction_text / resume_text may contain arbitrary characters
+            # (newlines, quotes); ship them as JSON to avoid escaping foot-guns.
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_STRINGS_JSON"] = json.dumps(
+                {
+                    "instruction_text": scfg.instruction_text,
+                    "resume_text": scfg.resume_text,
+                }
+            )
+            logger.info(
+                f"Markovian Summary enabled "
+                f"(mode={scfg.mode}, compaction_max_turns={scfg.compaction_max_turns}, "
+                f"max_len_summary={scfg.max_len_summary})"
+            )
+
+    processor = None
+    if is_vlm:
+        logger.info(f"Loading VLM processor for {config.model.name}")
+        processor = AutoProcessor.from_pretrained(
+            config.model.name, trust_remote_code=config.model.trust_remote_code, use_fast=True
+        )
+
+    # Setup monitor (may register the run and set RUN_ID in the environment)
+    logger.info(f"Initializing monitor (wandb={config.wandb}, prime_monitor={config.prime_monitor})")
+    monitor = setup_monitor(
+        wandb_config=config.wandb,
+        prime_config=config.prime_monitor,
+        output_dir=config.output_dir,
+        tokenizer=tokenizer,
+        run_config=config,
+    )
+
+    # Read run_id AFTER setup_monitor so that newly registered runs are captured
+    run_id = os.getenv("RUN_ID", "")
+
+    # Usage reporter requires BOTH the base URL and the API key. Activating
+    # with only one set used to crash every POST inside httpx (None header
+    # value), so we now gate construction on both being present and log a
+    # clear warning when half-configured.
+    usage_base_url = os.environ.get("PI_USAGE_BASE_URL")
+    usage_api_key = os.environ.get("PI_USAGE_API_KEY")
+    if usage_base_url and usage_api_key:
+        usage_reporter = UsageReporter()
+    else:
+        if usage_base_url and not usage_api_key:
+            logger.warning("PI_USAGE_BASE_URL is set but PI_USAGE_API_KEY is missing; usage reporting disabled.")
+        usage_reporter = None
+
+    # Setup heartbeat (only on rank 0, orchestrator is single process)
+    heart = None
+    if config.heartbeat is not None:
+        logger.info("Initializing heartbeat")
+        heart = Heartbeat(config.heartbeat.url)
+
+    # Build rollout filters
+    rollout_filters = setup_filters(config.filters, vocab_size=tokenizer.vocab_size)
+    if rollout_filters:
+        logger.info(f"Initialized {len(rollout_filters)} rollout filter(s): {[f.name for f in rollout_filters]}")
+
+    # Load environments
+    logger.info("Loading training environments")
+    train_envs = TrainEnvs(config.train.env)
+    logger.info(f"Loaded {len(train_envs)} training environment(s) ({', '.join(train_envs.names)})")
+
+    await train_envs.start(
+        log_dir=get_log_dir(config.output_dir.parent) / "envs" / "train",
+        log_level=config.log.vf_level,
+        json_logging=config.log.json_logging,
+    )
+    logger.success("Train environment(s) ready")
+
+    eval_envs: EvalEnvs | None = None
+    if config.eval:
+        logger.info("Loading eval environment(s)")
+        eval_envs = EvalEnvs(config.eval.env)
+        logger.info(f"Loaded {len(eval_envs)} eval environment(s) ({', '.join(eval_envs.names)})")
+
+        await eval_envs.start(
+            log_dir=get_log_dir(config.output_dir.parent) / "envs" / "eval",
+            log_level=config.log.vf_level,
+            json_logging=config.log.json_logging,
+        )
+        logger.success("Eval environment(s) ready")
+
+    # Setup buffer
+    logger.info(f"Setting up buffer ({config.buffer})")
+    buffer = Buffer(train_envs, config.buffer)
+
+    # Get checkpoint manager
+    logger.info(f"Initializing checkpoint manager ({config.ckpt})")
+    ckpt_manager = setup_ckpt_manager(config.output_dir, config.ckpt)
+
+    checkpoint_step = None
+    if config.ckpt and config.ckpt.resume_step is not None and ckpt_manager is not None:
+        if config.ckpt.resume_step == -1:
+            checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
+        else:
+            checkpoint_step = config.ckpt.resume_step
+
+    scheduler = Scheduler(
+        train_envs=train_envs,
+        buffer=buffer,
+        inference_pool=inference_pool,
+        max_inflight_rollouts=config.max_inflight_rollouts,
+        max_async_level=config.max_async_level,
+        max_off_policy_steps=config.max_off_policy_steps,
+        strict_async_level=config.strict_async_level,
+        tasks_per_minute=config.tasks_per_minute,
+        enable_policy_updates=enable_policy_updates,
+        lora_name=config.model.lora.name if config.model.lora else None,
+        config=config,
+    )
+    scheduler.model_name = rollout_model_name
+
+    if checkpoint_step is not None and config.model.lora is not None and enable_policy_updates:
+        assert config.model.lora.name is not None
+        scheduler.model_name = config.model.lora.name
+
+    # Check health of the inference pool
+    logger.info("Waiting for inference pool to be ready")
+    await inference_pool.wait_for_ready(rollout_model_name)
+
+    logger.success("Inference pool ready")
+
+    # Check health of teacher inference server if configured
+    if config.teacher_model and teacher_inference_pool:
+        logger.info("Waiting for teacher inference pool to be ready")
+        await teacher_inference_pool.wait_for_ready(config.teacher_model.model.name)
+        logger.success("Teacher inference pool ready")
+
+    # Set up weight broadcast backend
+    if enable_policy_updates:
+        logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
+        if config.weight_broadcast.type == "nccl":
+            await init_nccl_broadcast(
+                inference_pool.admin_clients,
+                config.weight_broadcast.host,
+                config.weight_broadcast.port,
+                config.weight_broadcast.timeout,
+                inference_world_size=config.weight_broadcast.inference_world_size,
+                quantize_in_weight_transfer=config.weight_broadcast.quantize_in_weight_transfer,
+            )
+    else:
+        logger.info("Skipping weight broadcast initialization (SFT distillation mode)")
+
+    # Setup training batch sender for sending training examples to trainer
+    logger.info(f"Initializing training batch sender ({config.rollout_transport})")
+    training_batch_sender = setup_training_batch_sender(config.output_dir, config.rollout_transport)
+
+    # Track last online eval checkpoint step for this process
+    last_eval_step = -1
+    # Track previous ckpt_step to detect when ckpt_step jumps over eval interval boundaries
+    prev_ckpt_step = -1
+
+    # Reset weights to base model if starting from scratch
+    progress = Progress()
+
+    if checkpoint_step is not None and ckpt_manager is not None:
+        ckpt_manager.load(progress, buffer, step=checkpoint_step)
+        logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
+        scheduler.ckpt_step = progress.step  # Always resume from the latest checkpoint
+        if config.eval and config.eval.skip_eval_on_resume:
+            prev_ckpt_step = scheduler.ckpt_step
+            last_eval_step = scheduler.ckpt_step
+            logger.info(f"Skipping online eval on resume (ckpt_step={scheduler.ckpt_step})")
+        else:
+            # Allow eval at resumed step by setting prev_ckpt_step one behind
+            prev_ckpt_step = scheduler.ckpt_step - 1
+
+        if enable_policy_updates:
+            # In NCCL mode, skip existence check - weights are broadcasted, not stored on disk
+            check_exists = config.weight_broadcast.type != "nccl"
+            wait_timeout = config.ckpt.wait_for_weights_timeout if config.ckpt else None
+            weights_path = get_weight_dir(
+                config.output_dir, scheduler.ckpt_step, check_exists=check_exists, wait_timeout=wait_timeout
+            )
+            lora_name = config.model.lora.name if config.model.lora else None
+            await inference_pool.update_weights(weights_path, lora_name=lora_name, step=scheduler.ckpt_step)
+    else:
+        logger.info("Training from scratch")
+
+    # Iterate over dataset in batches
+    logger.info(f"Starting orchestrator loop (max_steps={config.max_steps or 'infinite'})")
+    is_first_step = True
+
+    # Persistent ThreadPoolExecutor for parallel rollout processing
+    rollout_executor = ThreadPoolExecutor(max_workers=64)
+
+    while True:
+        # Check if this run has been evicted by the trainer
+        evicted_path = config.output_dir / "control" / "evicted.txt"
+        if evicted_path.exists():
+            reason = evicted_path.read_text().strip()
+            raise RuntimeError(f"Run evicted by trainer: {reason}")
+
+        # Capture ckpt_step once for consistency (it's updated inside the scheduler)
+        ckpt_step = scheduler.ckpt_step if enable_policy_updates else progress.step
+        scheduler.ckpt_step = ckpt_step
+
+        # Save checkpoint (if we are at an interval step and not at the first or last step)
+        is_last_step = config.max_steps is not None and progress.step == config.max_steps - 1
+        save_ckpt_time = 0
+        if (
+            ckpt_manager is not None
+            and (config.ckpt and config.ckpt.interval)
+            and not (is_first_step or is_last_step)
+            and progress.step % config.ckpt.interval == 0
+        ):
+            logger.info(f"Saving checkpoint at step {progress.step}")
+            save_ckpt_start_time = time.perf_counter()
+            ckpt_manager.save(progress, buffer, step=progress.step)
+            save_ckpt_time = time.perf_counter() - save_ckpt_start_time
+
+        # Break if we have reached the maximum number of steps
+        if config.max_steps and progress.step >= config.max_steps:
+            break
+
+        logger.info(f"Starting orchestrator step {progress.step}")
+        step_start_time = time.perf_counter()
+
+        # Run evals BEFORE training (blocking). Weight updates are paused via
+        # scheduler.checkpoint_ready during eval to ensure consistent weights.
+        # Use range check to handle ckpt_step jumping over interval boundaries.
+        eval_ckpt_step = None
+        if config.eval:
+            assert eval_envs is not None
+            eval_ckpt_step = compute_eval_ckpt_step(
+                ckpt_step=ckpt_step,
+                prev_ckpt_step=prev_ckpt_step,
+                last_eval_step=last_eval_step,
+                interval=config.eval.interval,
+                eval_base_model=config.eval.eval_base_model,
+            )
+
+        if eval_ckpt_step is not None:
+            last_eval_step = ckpt_step
+            if eval_ckpt_step != ckpt_step:
+                logger.info(f"Running evals for interval step {eval_ckpt_step} (current ckpt_step={ckpt_step})")
+            else:
+                logger.info(f"Running evals for checkpoint step {ckpt_step}")
+
+            # Pause weight updates and re-scheduling of training rollouts during eval
+            # to avoid evaluating across different checkpoints and avoid congestion.
+            if enable_policy_updates:
+                await scheduler.pause_policy_updates()
+            scheduler.checkpoint_ready.clear()
+            try:
+                # For heavy eval workloads, it might be necessary additionally cancel in-flight training rollouts
+                if config.eval.cancel_inflight_rollouts_on_eval:
+                    logger.info("Cancelling in-flight training rollouts before starting evals to avoid congestion.")
+                    await scheduler.cancel_inflight_rollouts()
+
+                await asyncio.gather(
+                    *[
+                        eval_env.evaluate(
+                            model_name=scheduler.model_name,
+                            get_client=inference_pool.get_next_client,
+                            ckpt_step=ckpt_step,
+                            step=progress.step,
+                        )
+                        for eval_env in eval_envs
+                    ]
+                )
+            finally:
+                # Resume weight updates
+                scheduler.checkpoint_ready.set()
+
+        # Update prev_ckpt_step for next iteration
+        prev_ckpt_step = ckpt_step
+
+        # Schedule generating the training batch
+        train_task = asyncio.create_task(scheduler.generate_batch(step=progress.step))
+
+        # Await train rollouts
+        await train_task
+        generate_completions_time = scheduler.last_batch_generation_time
+        train_rollouts = train_task.result()
+
+        # VLM: offload base64 images to disk immediately to free memory
+        if is_vlm:
+            offload_start = time.perf_counter()
+            num_offloaded = offload_images_to_disk(train_rollouts, config.output_dir)
+            if num_offloaded:
+                logger.info(
+                    f"VLM offloaded {num_offloaded} unique images to disk in {time.perf_counter() - offload_start:.2f}s"
+                )
+
+        # Apply rollout filters (zeros reward/mask for degenerate generations)
+        filter_metrics = apply_filters(rollout_filters, train_rollouts)
+
+        # Compute advantages
+        example_ids = [r["example_id"] for r in train_rollouts]
+        num_rollouts = len(train_rollouts)
+        num_unique_examples = len(set(example_ids))
+        rewards = [r["reward"] for r in train_rollouts]
+        completion_lens = [get_completion_len(r) for r in train_rollouts]
+        advantages = compute_advantages(
+            rewards,
+            completion_lens,
+            config.rollouts_per_example,
+            config.advantage,
+        )
+
+        # Convert rollouts to training samples
+        parallel_preprocess_start = time.perf_counter()
+
+        # Pretokenize before VLM image cache build (which strips image data from messages)
+        for rollout in train_rollouts:
+            pretokenize_rollout_trajectory(rollout, tokenizer, processor=processor)
+
+        # VLM: build image cache in a thread so it doesn't block the event loop.
+        # This lets the scheduler continue servicing inflight rollout requests
+        # and — with max_async_level >= 2 — overlap with the next batch's inference.
+        if is_vlm:
+            vlm_cache = await asyncio.get_event_loop().run_in_executor(
+                rollout_executor, build_vlm_image_cache, train_rollouts, processor
+            )
+            logger.info(
+                f"VLM timing: extract={vlm_cache.extract_time:.2f}s, preprocess={vlm_cache.preprocess_time:.2f}s "
+                f"({vlm_cache.num_unique_images} unique images from {vlm_cache.num_unique_examples} examples)"
+            )
+        else:
+            vlm_cache = None
+
+        # Process rollouts in parallel
+        log_evicted_text = (
+            config.compaction_padding.enabled
+            and config.compaction_padding.log_evicted_text
+        )
+
+        def process_rollout(rollout: vf.RolloutOutput, rollout_idx: int) -> list[TrainingSample] | None:
+            return interleave_rollout(
+                rollout,
+                vlm_cache=vlm_cache,
+                cache_key=rollout_idx,
+                tokenizer=tokenizer if log_evicted_text else None,
+                log_evicted_text=log_evicted_text,
+            )
+
+        loop = asyncio.get_event_loop()
+        futures = [
+            loop.run_in_executor(rollout_executor, process_rollout, r, rollout_idx)
+            for rollout_idx, r in enumerate(train_rollouts)
+        ]
+        results = await asyncio.gather(*futures)
+
+        # Collect results and assign advantages
+        train_examples: list[TrainingSample] = []
+        rollout_prefill_lens: list[int] = []
+        rollout_decode_lens: list[int] = []
+        rollout_samples_per_rollout: list[int] = []
+        num_prefill_tokens = 0
+        num_decode_tokens = 0
+        for rollout, advantage, samples in zip(train_rollouts, advantages, results):
+            rollout_prefill_tokens = 0
+            rollout_decode_tokens = 0
+            if samples is not None:
+                rollout_samples_per_rollout.append(len(samples))
+                for sample in samples:
+                    sample.advantage = advantage
+                    sample.reward = rollout["reward"]
+                    sample_decode_tokens = sum(sample.completion_mask)
+                    sample_prefill_tokens = len(sample.prompt_ids) + len(sample.completion_mask) - sample_decode_tokens
+                    rollout_decode_tokens += sample_decode_tokens
+                    rollout_prefill_tokens += sample_prefill_tokens
+                    train_examples.append(sample)
+            else:
+                rollout_samples_per_rollout.append(0)
+            rollout_prefill_lens.append(rollout_prefill_tokens)
+            rollout_decode_lens.append(rollout_decode_tokens)
+            num_prefill_tokens += rollout_prefill_tokens
+            num_decode_tokens += rollout_decode_tokens
+
+        parallel_preprocess_time = time.perf_counter() - parallel_preprocess_start
+        logger.debug(
+            f"Converted {len(train_rollouts)} rollouts ({num_unique_examples} unique examples) "
+            f"to {len(train_examples)} training examples"
+        )
+
+        # Compute teacher logprobs if teacher model is configured
+        teacher_logprobs_time = 0
+        if config.teacher_model and teacher_inference_pool:
+            logger.info(f"Computing teacher logprobs for {len(train_examples)} training examples")
+            teacher_logprobs_start_time = time.perf_counter()
+            teacher_logprobs_list = await compute_teacher_logprobs(
+                clients=teacher_inference_pool.clients,
+                model_name=config.teacher_model.model.name,
+                samples=train_examples,
+            )
+            for train_example, teacher_logprobs in zip(train_examples, teacher_logprobs_list):
+                train_example.teacher_logprobs = teacher_logprobs
+            teacher_logprobs_time = time.perf_counter() - teacher_logprobs_start_time
+            logger.debug(f"Computed teacher logprobs in {teacher_logprobs_time:.2f}s")
+
+        training_batch = TrainingBatch(
+            examples=train_examples,
+            step=progress.step,
+        )
+
+        training_batch_sender.send(training_batch)
+
+        step_time = time.perf_counter() - step_start_time
+
+        # Gather metrics in dataframes
+        results_df = pd.DataFrame(
+            {
+                "example_id": [rollout["example_id"] for rollout in train_rollouts],
+                "env_name": [rollout["env_name"] for rollout in train_rollouts],
+                "reward": [rollout["reward"] for rollout in train_rollouts],
+                "is_truncated": [rollout["is_truncated"] for rollout in train_rollouts],
+                "stop_condition": [rollout.get("stop_condition") for rollout in train_rollouts],
+                "seq_len": [get_seq_len(rollout) for rollout in train_rollouts],
+                "prefill_len": rollout_prefill_lens,
+                "decode_len": rollout_decode_lens,
+                "samples_per_rollout": rollout_samples_per_rollout,
+                "num_turns": [len(rollout["trajectory"]) for rollout in train_rollouts],
+                "generation_ms": [rollout["timing"]["generation_ms"] for rollout in train_rollouts],
+                "scoring_ms": [rollout["timing"]["scoring_ms"] for rollout in train_rollouts],
+            }
+        )
+
+        # Separate DataFrame for env reward function metrics to avoid column name collisions
+        metrics_df = pd.DataFrame([rollout["metrics"] for rollout in train_rollouts])
+
+        # Update progress metrics
+        num_tokens = int(results_df.seq_len.sum())
+        progress.total_tokens += num_tokens
+        progress.total_samples += num_rollouts
+        progress.total_problems += num_unique_examples
+
+        def compute_solve_rates(df):
+            """Compute solve_none, solve_all, effective_batch_size for a set of rollouts."""
+            reward_per_problem = df.groupby("example_id").reward.sum()
+            solve_none = (reward_per_problem == 0).mean()
+            solve_all = (reward_per_problem == config.rollouts_per_example).mean()
+            return solve_none, solve_all, 1 - solve_none - solve_all
+
+        # Group by example_id to average across rollouts within each problem
+        by_example = results_df.groupby("example_id")
+
+        solve_none, solve_all, effective_batch_size = compute_solve_rates(results_df)
+        to_log = {
+            # Progress metrics
+            "progress/tokens": num_tokens,
+            "progress/prefill_tokens": num_prefill_tokens,
+            "progress/decode_tokens": num_decode_tokens,
+            "progress/samples": num_rollouts,
+            "progress/problems": num_unique_examples,
+            "progress/total_tokens": progress.total_tokens,
+            "progress/total_samples": progress.total_samples,
+            "progress/total_problems": progress.total_problems,
+            "progress/ckpt_step": ckpt_step,  # Shared W&B axis
+            # Sequence length metrics
+            "seq_len/all/mean": by_example.seq_len.mean().mean(),
+            "seq_len/all/max": by_example.seq_len.mean().max(),
+            "seq_len/all/min": by_example.seq_len.mean().min(),
+            "prefill_len/all/mean": by_example.prefill_len.mean().mean(),
+            "prefill_len/all/max": by_example.prefill_len.mean().max(),
+            "prefill_len/all/min": by_example.prefill_len.mean().min(),
+            "decode_len/all/mean": by_example.decode_len.mean().mean(),
+            "decode_len/all/max": by_example.decode_len.mean().max(),
+            "decode_len/all/min": by_example.decode_len.mean().min(),
+            "is_truncated/all/mean": by_example.is_truncated.mean().mean(),
+            "is_truncated/all/max": by_example.is_truncated.mean().max(),
+            "stop_condition/all/generation_truncated": (
+                results_df.is_truncated & (results_df.stop_condition != "prompt_too_long")
+            ).mean(),
+            **{
+                f"stop_condition/all/{sc}": rate
+                for sc, rate in results_df.stop_condition.dropna().value_counts(normalize=True).items()
+            },
+            "samples_per_rollout/all/mean": by_example.samples_per_rollout.mean().mean(),
+            "samples_per_rollout/all/max": by_example.samples_per_rollout.mean().max(),
+            "samples_per_rollout/all/min": by_example.samples_per_rollout.mean().min(),
+            "num_turns/all/mean": by_example.num_turns.mean().mean(),
+            "num_turns/all/max": by_example.num_turns.mean().max(),
+            "num_turns/all/min": by_example.num_turns.mean().min(),
+            "generation_ms/all/mean": by_example.generation_ms.mean().mean(),
+            "generation_ms/all/max": by_example.generation_ms.mean().max(),
+            "generation_ms/all/min": by_example.generation_ms.mean().min(),
+            "scoring_ms/all/mean": by_example.scoring_ms.mean().mean(),
+            "scoring_ms/all/max": by_example.scoring_ms.mean().max(),
+            "scoring_ms/all/min": by_example.scoring_ms.mean().min(),
+            # Train reward
+            "reward/all/mean": by_example.reward.mean().mean(),
+            "reward/all/max": by_example.reward.mean().max(),
+            "reward/all/min": by_example.reward.mean().min(),
+            # Solve / batch metrics
+            "solve_none/all": solve_none,
+            "solve_all/all": solve_all,
+            "effective_batch_size/all": effective_batch_size,
+            **{f"batch/{env}": r for env, r in results_df.env_name.value_counts(normalize=True).items()},
+            # Time metrics
+            "time/step": step_time,
+            "time/generate_completions": generate_completions_time,
+            "time/teacher_logprobs": teacher_logprobs_time,
+            "time/save_ckpt": save_ckpt_time,
+            "time/parallel_preprocess": parallel_preprocess_time,
+            # Scheduler metrics
+            **scheduler.get_metrics(),
+            # Buffer metrics
+            **buffer.get_metrics(),
+            # Event loop lag metrics
+            **event_loop_lag_monitor.get_metrics(),
+            # Rollout filter metrics
+            **filter_metrics,
+            # W&B axis
+            "step": progress.step,
+        }
+
+        # Per-env metrics
+        per_env_columns = [
+            "seq_len",
+            "prefill_len",
+            "decode_len",
+            "is_truncated",
+            "samples_per_rollout",
+            "num_turns",
+            "generation_ms",
+            "scoring_ms",
+        ]
+
+        for env, env_df in results_df.groupby("env_name"):
+            env_by_example = env_df.groupby("example_id")
+            for col in per_env_columns:
+                to_log[f"{col}/{env}/mean"] = env_by_example[col].mean().mean()
+                to_log[f"{col}/{env}/max"] = env_by_example[col].mean().max()
+                if col != "is_truncated":
+                    to_log[f"{col}/{env}/min"] = env_by_example[col].mean().min()
+            to_log[f"reward/{env}/mean"] = env_by_example.reward.mean().mean()
+            to_log[f"reward/{env}/max"] = env_by_example.reward.mean().max()
+            to_log[f"reward/{env}/min"] = env_by_example.reward.mean().min()
+            solve_none, solve_all, effective_batch_size = compute_solve_rates(env_df)
+            to_log[f"solve_none/{env}"] = solve_none
+            to_log[f"solve_all/{env}"] = solve_all
+            to_log[f"effective_batch_size/{env}"] = effective_batch_size
+            to_log[f"stop_condition/{env}/generation_truncated"] = (
+                env_df.is_truncated & (env_df.stop_condition != "prompt_too_long")
+            ).mean()
+            for sc, rate in env_df.stop_condition.dropna().value_counts(normalize=True).items():
+                to_log[f"stop_condition/{env}/{sc}"] = rate
+            env_metrics_df = metrics_df.loc[env_df.index]
+            for metric in metrics_df.columns:
+                to_log[f"metrics/{env}/{metric}"] = env_metrics_df.groupby(env_df["example_id"])[metric].mean().mean()
+
+        # Drain Markovian Thinker truncation counters into the step
+        # metrics. Keys are absent when the feature is disabled (pop
+        # returns zero counters, but we only emit when enabled to keep
+        # the metric surface clean).
+        if config.markovian_thinker.enabled and not config.markovian_thinker.kv_eviction:
+            from kv_eviction.env import pop_markovian_stats
+
+            mt_stats = pop_markovian_stats()
+            to_log["markovian/n_truncations_per_step"] = mt_stats["n_truncations"]
+            to_log["markovian/n_messages_dropped_per_step"] = mt_stats[
+                "n_messages_dropped"
+            ]
+            if config.markovian_thinker.summary.enabled:
+                to_log["markovian_summary/n_per_step"] = mt_stats["n_summaries"]
+                to_log["markovian_summary/n_failures_per_step"] = mt_stats[
+                    "n_summary_failures"
+                ]
+                to_log["markovian_summary/prompt_tokens_per_step"] = mt_stats[
+                    "summary_prompt_tokens"
+                ]
+                to_log["markovian_summary/output_tokens_per_step"] = mt_stats[
+                    "summary_output_tokens"
+                ]
+                to_log["markovian_summary/latency_ms_per_step"] = mt_stats[
+                    "summary_latency_ms"
+                ]
+
+        # Log metrics to monitor(s)
+        monitor.log(to_log, step=progress.step)
+
+        # Log samples to monitor(s) if enabled.
+        monitor.log_samples(train_rollouts, step=progress.step)
+
+        # Log distributions (rewards, advantages) if enabled
+        monitor.log_distributions(
+            distributions={
+                "rewards": rewards,
+                "advantages": advantages,
+            },
+            step=progress.step,
+        )
+
+        if usage_reporter and run_id:
+            usage_reporter.report_training_usage(
+                run_id=run_id,
+                step=progress.step,
+                tokens=num_prefill_tokens + num_decode_tokens,
+            )
+
+        reward_mean = by_example.reward.mean().mean()
+        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Reward: {reward_mean:.4f} | Seq. Length: {by_example.seq_len.mean().mean():.1f} tokens/sample | Async Level: {scheduler.async_level} | Max. Off-Policy Level: {scheduler.max_off_policy_level}"
+        logger.success(step_message)
+
+        # Increment step
+        progress.step += 1
+        is_first_step = False
+
+        # Free large per-step objects to prevent memory accumulation
+        del train_rollouts, train_examples, training_batch, vlm_cache
+        del results_df, metrics_df
+        gc.collect()
+
+        event_loop_lag_monitor.reset()
+
+        # Send heartbeat if configured
+        if heart is not None:
+            heart.beat()
+
+    if config.eval and eval_envs is not None:
+        logger.info("Running final evals")
+        if enable_policy_updates:
+            await scheduler.pause_policy_updates()
+        scheduler.checkpoint_ready.clear()
+        try:
+            if config.eval.cancel_inflight_rollouts_on_eval:
+                logger.info(
+                    "Cancelling in-flight training rollouts before final evals "
+                    "to avoid congestion."
+                )
+                await scheduler.cancel_inflight_rollouts()
+            await asyncio.gather(
+                *[
+                    eval_env.evaluate(
+                        model_name=scheduler.model_name,
+                        get_client=inference_pool.get_next_client,
+                        ckpt_step=ckpt_step,
+                        step=progress.step,
+                    )
+                    for eval_env in eval_envs
+                ]
+            )
+        finally:
+            scheduler.checkpoint_ready.set()
+
+    # Log final (immutable) samples and distributions to monitor(s)
+    monitor.log_final_samples()
+    monitor.save_final_summary()
+
+    # Write final checkpoint
+    if ckpt_manager is not None:
+        logger.info("Writing final checkpoint")
+        ckpt_manager.save(progress, buffer, step=progress.step)
+
+    # Bounded best-effort cleanup. Each await below may block on a remote peer
+    # (env-server ZMQ recv, inference admin httpx aclose, etc.). The outer
+    # asyncio.wait gives the whole sequence a single deadline; if anything
+    # wedges past SHUTDOWN_TIMEOUT_S we force-exit the process. Individual
+    # awaits intentionally do NOT have their own timeouts — asyncio.wait_for
+    # would itself hang on an uncancellable await, which is exactly the
+    # failure mode we're guarding against.
+    async def _graceful_shutdown() -> None:
+        training_batch_sender.close()
+        rollout_executor.shutdown(wait=False)
+        await scheduler.stop()
+        await inference_pool.stop()
+        if teacher_inference_pool is not None:
+            await teacher_inference_pool.stop()
+        event_loop_lag_monitor_task.cancel()
+        # Shutdown env processes (also registered as atexit handler for crash safety)
+        train_envs.shutdown()
+        if eval_envs is not None:
+            eval_envs.shutdown()
+
+    shutdown_task = asyncio.create_task(_graceful_shutdown())
+    _, pending = await asyncio.wait({shutdown_task}, timeout=SHUTDOWN_TIMEOUT_S)
+
+    if pending:
+        logger.warning(
+            f"Orchestrator shutdown did not complete within {SHUTDOWN_TIMEOUT_S}s; "
+            "forcing process exit. Training artifacts are already persisted."
+        )
+        os._exit(0)
+
+    # asyncio.wait swallows task exceptions; re-raise so a fast cleanup
+    # failure surfaces the same way as it did when each step was awaited
+    # directly.
+    await shutdown_task
+
+    if usage_reporter:
+        usage_reporter.close()
+
+    logger.success("Orchestrator finished.")
+
+    # Optionally, print benchmark table
+    if config.bench:
+        print_benchmark(to_col_format(monitor.history))
+
+
+def main():
+    """Main entry-point for orchestrator. Run using `uv run orchestrator`"""
+    set_proc_title("Orchestrator")
+    asyncio.run(orchestrate(cli(OrchestratorConfig)))
+
+
+if __name__ == "__main__":
+    main()

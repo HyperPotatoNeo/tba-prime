@@ -1,7 +1,0 @@
-use_tqdm = true
-
-[model]
-enforce_eager = true
-
-[sampling]
-max_tokens = 16
