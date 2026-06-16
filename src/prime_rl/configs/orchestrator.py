@@ -1262,13 +1262,14 @@ class OrchestratorConfig(BaseConfig):
     markovian_thinker: MarkovianThinkerConfig = MarkovianThinkerConfig()
 
     kv_mode: Annotated[
-        Literal["kv-recall", "markovian-recall"] | None,
+        Literal["kv-recall", "kv-selection", "markovian-recall"] | None,
         Field(
             description=(
-                "Recall machinery selector (normally set via RLConfig's "
+                "KV machinery selector (normally set via RLConfig's "
                 "top-level kv_mode). kv-recall: hidden-KV restore of "
-                "model-picked archived spans. markovian-recall: visible "
-                "re-prefill restore (recompute reference). Requires "
+                "model-picked archived spans. kv-selection: selected complete "
+                "turn retention with no recall/offload. markovian-recall: "
+                "visible re-prefill restore (recompute reference). Requires "
                 "compaction_padding + markovian_thinker.kv_eviction (the "
                 "RLConfig expansion sets both). Turn guidance derives from "
                 "markovian_thinker.max_turns/stride."

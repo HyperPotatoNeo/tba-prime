@@ -417,7 +417,14 @@ class RLConfig(BaseConfig):
     ] = False
 
     kv_mode: Annotated[
-        Literal["kv-eviction", "markovian", "kv-recall", "markovian-recall"] | None,
+        Literal[
+            "kv-eviction",
+            "markovian",
+            "kv-recall",
+            "kv-selection",
+            "markovian-recall",
+        ]
+        | None,
         Field(
             description=(
                 "Single-flag KV-context mode. Expands into the coupled "
@@ -426,6 +433,8 @@ class RLConfig(BaseConfig):
                 "drop, window = last max_turns/stride turns. markovian: "
                 "client-side truncation + re-prefill (reference). kv-recall: "
                 "eviction + hidden-KV recall with the validated stack. "
+                "kv-selection: model/client-selected complete turns from "
+                "the would-be evicted band, without recall/offload. "
                 "markovian-recall: eviction + recall via visible re-prefill "
                 "(reference). Turn policy comes from "
                 "orchestrator.markovian_thinker.max_turns/stride."
@@ -455,6 +464,8 @@ class RLConfig(BaseConfig):
         - kv-eviction:      markovian_thinker.enabled + kv_eviction
         - kv-recall:        kv-eviction + orchestrator/inference kv_mode
                             passthrough (hidden-KV recall stack)
+        - kv-selection:     kv-eviction + orchestrator/inference kv_mode
+                            passthrough (selection xargs, no recall stack)
         - markovian-recall: same with visible re-prefill restores
         """
         if not isinstance(data, dict):
@@ -500,13 +511,13 @@ class RLConfig(BaseConfig):
                         "stride",
                         _KV_EVICTION_DEFAULT_STRIDE,
                     )
-            if kv_mode in ("kv-recall", "markovian-recall"):
+            if kv_mode in ("kv-recall", "kv-selection", "markovian-recall"):
                 _cfg_set_missing(orchestrator, "kv_mode", kv_mode)
                 inference_cfg = _cfg_get(data, "inference")
                 if inference_cfg is None:
                     raise ValueError(
                         f"kv_mode={kv_mode!r} requires an [inference] config "
-                        "so the engine-side recall stack can be enabled."
+                        "so the engine-side KV mode can be enabled."
                     )
                 _cfg_set_missing(inference_cfg, "kv_mode", kv_mode)
 

@@ -388,14 +388,14 @@ class InferenceConfig(BaseConfig):
     ] = {}
 
     kv_mode: Annotated[
-        Literal["kv-recall", "markovian-recall"] | None,
+        Literal["kv-recall", "kv-selection", "markovian-recall"] | None,
         Field(
             description=(
-                "Recall machinery selector (normally set via RLConfig's "
+                "KV machinery selector (normally set via RLConfig's "
                 "top-level kv_mode). When set, the inference entrypoint "
-                "applies the validated engine-side recall stack env vars "
-                "(soft-pin, lazy publish, reload keep-cpu, eager CPU "
-                "archive) before the engine boots. See kv_eviction.modes."
+                "applies validated engine-side env vars when that mode needs "
+                "them. kv-selection intentionally applies no recall/offload "
+                "env stack. See kv_eviction.modes."
             ),
         ),
     ] = None
