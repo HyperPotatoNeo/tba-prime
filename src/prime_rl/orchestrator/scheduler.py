@@ -28,6 +28,7 @@ class InflightRequest:
     """Metadata for an in-flight request."""
 
     off_policy_steps: int
+    policy_ckpt_step: int
     client_config: vf.ClientConfig
     env_name: str
     group_id: int | None = None
@@ -219,6 +220,7 @@ class Scheduler:
             )
         self.inflight_requests[task] = InflightRequest(
             off_policy_steps=0,
+            policy_ckpt_step=self.ckpt_step,
             client_config=client_config,
             env_name=env_name,
             group_id=group_id,
@@ -446,6 +448,8 @@ class Scheduler:
                             )
                         else:
                             rollout["env_name"] = env_name
+                            rollout["off_policy_steps"] = rollout_info.off_policy_steps
+                            rollout["policy_ckpt_step"] = rollout_info.policy_ckpt_step
                             valid_rollouts.append(rollout)
 
                     if has_failures and env.requires_group_scoring:

@@ -11,7 +11,7 @@ from prime_rl.trainer.rl.packer import BasePacker, setup_packer
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.world import get_world
 from prime_rl.transport import MicroBatch, MicroBatchReceiver, TransportConfig, setup_micro_batch_receiver
-from prime_rl.transport.types import CompactionEventWire
+from prime_rl.transport.types import CallWire, CompactionEventWire
 
 
 class TensorMicroBatch(TypedDict):
@@ -44,6 +44,8 @@ class TensorMicroBatch(TypedDict):
     compaction_events: list[CompactionEventWire] | None
     # Prompt length for the single sample in a compaction micro batch.
     prompt_len: int | None
+    # Optional per-call replay trace for one un-packed multi-turn sample.
+    calls: list[CallWire] | None
 
 
 class FakeDataLoader:
@@ -118,6 +120,7 @@ class FakeDataLoader:
             "image_grid_thw": None,
             "compaction_events": None,
             "prompt_len": None,
+            "calls": None,
         }
 
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
@@ -145,6 +148,7 @@ class FakeDataLoader:
             "image_grid_thw": None,
             "compaction_events": None,
             "prompt_len": None,
+            "calls": None,
         }
 
 
@@ -229,4 +233,5 @@ class DataLoader:
             # unchanged (list of msgspec structs + scalar int; no tensor form).
             compaction_events=micro_batch.compaction_events,
             prompt_len=micro_batch.prompt_len,
+            calls=micro_batch.calls,
         )

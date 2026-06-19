@@ -59,6 +59,15 @@ class CompactionEventWire(
     attention_matching_hidden_tail_token_ids: list[int] | None = None
 
 
+class CallWire(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+    """One inference call inside an interleaved multi-turn rollout trace."""
+
+    submitted_prompt_ids: list[int]
+    completion_ids: list[int]
+    compaction_events: list[CompactionEventWire] | None = None
+    trailing_pad_ids: list[int] | None = None
+
+
 # Orchestrator -> Packer
 class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A single training example."""
@@ -85,6 +94,11 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # compaction is disabled or no events fired for this sample. The trainer
     # dispatches to segmented_forward when this is non-empty.
     compaction_events: list[CompactionEventWire] | None = None
+
+    # Optional per-call trace for multi-turn replay. When present, the trainer
+    # can preserve the same request boundaries vLLM used at rollout time rather
+    # than scoring the merged episode as one dense full-context forward.
+    calls: list[CallWire] | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -127,3 +141,8 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # prompt_aligned_len = ceil(prompt_len / block_size) * block_size for
     # segmented_forward's drop boundary. None for non-compaction samples.
     prompt_len: int | None = None
+
+    # Optional per-call trace for the single sample in this micro-batch.
+    # Invariant: when non-None, the packer has NOT bin-packed other samples
+    # alongside this one, matching compaction-style micro-batch isolation.
+    calls: list[CallWire] | None = None

@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +22,7 @@ if not hasattr(vf, "RolloutOutput"):
     vf.RolloutOutput = vf.State  # type: ignore[attr-defined]
 
 from prime_rl.transport import TrainingSample
-from prime_rl.transport.types import CompactionEventWire
+from prime_rl.transport.types import CallWire, CompactionEventWire
 from prime_rl.utils.chat_template import (
     common_prefix_len,
     deserialize_tool_calls,
@@ -833,6 +834,7 @@ def _tokenize_step_from_messages(
     tokenizer: PreTrainedTokenizer,
     tools: list[dict[str, Any]] | None = None,
     processor=None,
+    train_reconstructed_tokens: bool = True,
 ) -> dict[str, Any]:
     prompt = _normalize_messages(step.get("prompt"), default_role="user")
     completion = _normalize_messages(step.get("completion"), default_role="assistant")
@@ -870,7 +872,10 @@ def _tokenize_step_from_messages(
 
     prompt_ids = full_ids[:split_idx]
     completion_ids = full_ids[split_idx:]
-    completion_mask = [True] * len(completion_ids)
+    # In SFT-style use, reconstructed completion tokens are labels. In RL
+    # rollout use, they are only context warmup because they have no
+    # vLLM-authoritative old-policy logprobs.
+    completion_mask = [bool(train_reconstructed_tokens)] * len(completion_ids)
     completion_logprobs = [0.0] * len(completion_ids)
 
     return {
@@ -909,10 +914,63 @@ def _convert_tools_to_oai_format(tool_defs: list) -> list[dict[str, Any]] | None
     ]
 
 
+def _message_has_tool_calls(message: Any) -> bool:
+    if isinstance(message, dict):
+        return bool(message.get("tool_calls"))
+    return bool(getattr(message, "tool_calls", None))
+
+
+def _step_has_tool_calls(step: vf.TrajectoryStep) -> bool:
+    completion = step.get("completion") or []
+    if isinstance(completion, (str, bytes)):
+        return False
+    try:
+        return any(_message_has_tool_calls(message) for message in completion)
+    except TypeError:
+        return False
+
+
+def _completion_mask_with_trace_logprobs(
+    completion_mask: list[Any],
+    completion_logprobs: list[Any],
+    *,
+    has_tool_calls: bool,
+    mask_zero_logprob_tokens: bool = False,
+) -> list[bool]:
+    out: list[bool] = []
+    drop_zero_logprobs = has_tool_calls or mask_zero_logprob_tokens
+    for idx, mask in enumerate(completion_mask):
+        keep = bool(mask)
+        if keep:
+            if idx >= len(completion_logprobs):
+                raise ValueError(
+                    "Trainable completion token is missing an inference logprob "
+                    f"at completion offset {idx}."
+                )
+            logprob = float(completion_logprobs[idx])
+            if not math.isfinite(logprob):
+                raise ValueError(
+                    "Trainable completion token has a non-finite inference "
+                    f"logprob at completion offset {idx}: {logprob}."
+                )
+            if logprob <= -9999.0:
+                raise ValueError(
+                    "Trainable completion token has a missing/clamped inference "
+                    "logprob. vLLM uses -9999.0 when the sampled token logprob "
+                    "was not available in the OpenAI logprobs payload. "
+                    f"completion offset {idx}: {logprob}."
+                )
+            if drop_zero_logprobs and logprob == 0.0:
+                keep = False
+        out.append(keep)
+    return out
+
+
 def pretokenize_rollout_trajectory(
     output: vf.RolloutOutput,
     tokenizer: PreTrainedTokenizer,
     processor=None,
+    train_reconstructed_tokens: bool = True,
 ) -> bool:
     """Populate missing step tokens from prompt/completion messages."""
     logger = get_logger()
@@ -922,7 +980,13 @@ def pretokenize_rollout_trajectory(
         if step["tokens"] is not None:
             continue
 
-        reconstructed = _tokenize_step_from_messages(step, tokenizer, tools=tools, processor=processor)
+        reconstructed = _tokenize_step_from_messages(
+            step,
+            tokenizer,
+            tools=tools,
+            processor=processor,
+            train_reconstructed_tokens=train_reconstructed_tokens,
+        )
         if reconstructed["prompt_prefix_len"] < reconstructed["original_prompt_len"]:
             logger.debug(
                 f"Prompt tokenization was non-prefix for example {output['example_id']} step {step_idx}. "
@@ -941,6 +1005,7 @@ def interleave_rollout(
     output: vf.RolloutOutput,
     vlm_cache: "VLMImageCache | None" = None,
     cache_key: int | None = None,
+    mask_zero_logprob_tokens: bool = False,
 ) -> list[TrainingSample] | None:
     """
     Convert vf.RolloutOutput to trainable rollouts by interleaving trajectory steps
@@ -968,6 +1033,9 @@ def interleave_rollout(
     logger = get_logger()
     disable_stateful_am_trace = os.environ.get(
         "KVE_DISABLE_STATEFUL_AM_TRACE", ""
+    ).lower() in {"1", "true", "yes", "on"}
+    enable_per_call_train_trace = os.environ.get(
+        "KVE_ENABLE_PER_CALL_TRAIN_TRACE", ""
     ).lower() in {"1", "true", "yes", "on"}
 
     trajectory = output["trajectory"]
@@ -997,7 +1065,16 @@ def interleave_rollout(
                 "prompt_ids": prompt_ids,
                 "prompt_mask": prompt_mask,
                 "completion_ids": list(tokens["completion_ids"]),
-                "completion_mask": [bool(i) for i in tokens["completion_mask"]],
+                # Some tool-call clients may inject envelope tokens that were
+                # not sampled by the model. Only mask exact-zero tokens when
+                # explicitly requested by the caller; normal RL keeps every
+                # generated token and rejects missing/clamped logprobs above.
+                "completion_mask": _completion_mask_with_trace_logprobs(
+                    list(tokens["completion_mask"]),
+                    list(tokens["completion_logprobs"]),
+                    has_tool_calls=_step_has_tool_calls(step),
+                    mask_zero_logprob_tokens=mask_zero_logprob_tokens,
+                ),
                 "completion_logprobs": list(tokens["completion_logprobs"]),
                 "routed_experts": tokens.get("routed_experts"),
             }
@@ -1028,6 +1105,19 @@ def interleave_rollout(
             return None
         prepared_steps.append(prepared)
         step_compaction_events.append(_compaction_events_from_step(step))
+
+    def make_call(
+        tokens: dict[str, Any],
+        compaction_events: list[CompactionEventWire] | None = None,
+    ) -> CallWire | None:
+        if not enable_per_call_train_trace:
+            return None
+        return CallWire(
+            submitted_prompt_ids=list(tokens["prompt_ids"]),
+            completion_ids=list(tokens["completion_ids"]),
+            compaction_events=compaction_events,
+            trailing_pad_ids=_am_hidden_tail_token_ids(compaction_events) or None,
+        )
 
     def make_sample(
         tokens: dict[str, Any],
@@ -1077,6 +1167,11 @@ def interleave_rollout(
             advantage=None,
             routed_experts=routed_experts,
             compaction_events=expanded_events,
+            calls=(
+                [call]
+                if (call := make_call(tokens, compaction_events)) is not None
+                else None
+            ),
         )
 
     def extend_sample(sample: TrainingSample, prefix_len: int, step_idx: int) -> None:
@@ -1111,6 +1206,12 @@ def interleave_rollout(
             sample.routed_experts.extend(step_routed[prefix_len:])
             expected_len = len(sample.prompt_ids) + len(sample.completion_ids)
             sample.routed_experts = _align_routed_experts(sample.routed_experts, expected_len)
+
+        call = make_call(tokens, step_compaction_events[step_idx])
+        if call is not None:
+            if sample.calls is None:
+                sample.calls = []
+            sample.calls.append(call)
 
     def single_am_prompt_event(
         events: list[CompactionEventWire] | None,
@@ -1276,6 +1377,12 @@ def interleave_rollout(
             sample.routed_experts.extend(step_routed[prefix_len:])
             expected_len = len(sample.prompt_ids) + len(sample.completion_ids)
             sample.routed_experts = _align_routed_experts(sample.routed_experts, expected_len)
+
+        call = make_call(tokens, step_compaction_events[step_idx])
+        if call is not None:
+            if sample.calls is None:
+                sample.calls = []
+            sample.calls.append(call)
 
         completed_replay_steps = _am_completed_request_replay_steps(step_events)
         if completed_replay_steps is None:
@@ -1458,6 +1565,27 @@ def interleave_rollout(
         )
         if summary_sample is not None:
             samples.append(summary_sample)
+
+    if mask_zero_logprob_tokens:
+        for sample_idx, sample in enumerate(samples):
+            trainable_zero_offsets = [
+                idx
+                for idx, (mask, logprob) in enumerate(
+                    zip(sample.completion_mask, sample.completion_logprobs)
+                )
+                if bool(mask) and float(logprob) == 0.0
+            ]
+            if trainable_zero_offsets:
+                raise ValueError(
+                    "Rollout trace contains trainable tokens with exact-zero "
+                    "inference logprobs after masking. This check is only "
+                    "enabled for legacy clients that request exact-zero "
+                    "masking; normal RL should keep finite exact-zero "
+                    "sampled-token logprobs. "
+                    f"example_id={output['example_id']}, sample_idx={sample_idx}, "
+                    f"num_tokens={len(trainable_zero_offsets)}, "
+                    f"first_offsets={trainable_zero_offsets[:8]}."
+                )
 
     return samples
 

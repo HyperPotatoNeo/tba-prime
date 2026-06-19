@@ -507,7 +507,12 @@ async def orchestrate(config: OrchestratorConfig):
 
         # Pretokenize before VLM image cache build (which strips image data from messages)
         for rollout in train_rollouts:
-            pretokenize_rollout_trajectory(rollout, tokenizer, processor=processor)
+            pretokenize_rollout_trajectory(
+                rollout,
+                tokenizer,
+                processor=processor,
+                train_reconstructed_tokens=False,
+            )
 
         # VLM: build image cache in a thread so it doesn't block the event loop.
         # This lets the scheduler continue servicing inflight rollout requests
@@ -525,7 +530,12 @@ async def orchestrate(config: OrchestratorConfig):
 
         # Process rollouts in parallel
         def process_rollout(rollout: vf.RolloutOutput, rollout_idx: int) -> list[TrainingSample] | None:
-            return interleave_rollout(rollout, vlm_cache=vlm_cache, cache_key=rollout_idx)
+            return interleave_rollout(
+                rollout,
+                vlm_cache=vlm_cache,
+                cache_key=rollout_idx,
+                mask_zero_logprob_tokens=False,
+            )
 
         loop = asyncio.get_event_loop()
         futures = [
@@ -603,6 +613,8 @@ async def orchestrate(config: OrchestratorConfig):
                 "prefill_len": rollout_prefill_lens,
                 "decode_len": rollout_decode_lens,
                 "samples_per_rollout": rollout_samples_per_rollout,
+                "off_policy_steps": [rollout.get("off_policy_steps", 0) for rollout in train_rollouts],
+                "policy_ckpt_step": [rollout.get("policy_ckpt_step", ckpt_step) for rollout in train_rollouts],
                 "num_turns": [len(rollout["trajectory"]) for rollout in train_rollouts],
                 "generation_ms": [rollout["timing"]["generation_ms"] for rollout in train_rollouts],
                 "scoring_ms": [rollout["timing"]["scoring_ms"] for rollout in train_rollouts],
@@ -662,6 +674,10 @@ async def orchestrate(config: OrchestratorConfig):
             "samples_per_rollout/all/mean": by_example.samples_per_rollout.mean().mean(),
             "samples_per_rollout/all/max": by_example.samples_per_rollout.mean().max(),
             "samples_per_rollout/all/min": by_example.samples_per_rollout.mean().min(),
+            "accepted_off_policy_steps/all/mean": by_example.off_policy_steps.mean().mean(),
+            "accepted_off_policy_steps/all/max": by_example.off_policy_steps.mean().max(),
+            "accepted_policy_ckpt_step/all/min": by_example.policy_ckpt_step.mean().min(),
+            "accepted_policy_ckpt_step/all/max": by_example.policy_ckpt_step.mean().max(),
             "num_turns/all/mean": by_example.num_turns.mean().mean(),
             "num_turns/all/max": by_example.num_turns.mean().max(),
             "num_turns/all/min": by_example.num_turns.mean().min(),

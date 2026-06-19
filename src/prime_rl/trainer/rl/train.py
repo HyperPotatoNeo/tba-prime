@@ -126,6 +126,8 @@ from prime_rl.trainer.model import (
 try:
     from kv_eviction.segmented_forward import (
         compute_num_segments,
+        compute_num_per_call_forwards,
+        per_call_segmented_forward,
         segmented_forward,
     )
 except ImportError:
@@ -135,6 +137,8 @@ except ImportError:
     # raise with a clearer error if compaction is actually used.
     segmented_forward = None  # type: ignore[assignment]
     compute_num_segments = None  # type: ignore[assignment]
+    per_call_segmented_forward = None  # type: ignore[assignment]
+    compute_num_per_call_forwards = None  # type: ignore[assignment]
 from prime_rl.trainer.parallel_dims import get_parallel_dims
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.utils import (
@@ -559,7 +563,14 @@ def train(config: TrainerConfig):
             # contiguous shapes the packed text forward needed. See
             # plans/phase3_training_integration.md D5 section.
             compaction_events = micro_batch.get("compaction_events") or []
+            calls = micro_batch.get("calls") or []
+            # Per-call replay is intentionally conservative here: use it for
+            # full-context multi-turn traces, and leave compaction-bearing AM
+            # samples on the established segmented replay path. That isolates
+            # DiscoveryWorld full-context KL without changing AM semantics.
+            use_per_call = bool(calls) and not bool(compaction_events)
             use_segmented = config.compaction.window_size > 0
+            dispatch_kind = 2 if use_per_call else (1 if use_segmented else 0)
 
             # Defense-in-depth: verify every DP rank made the SAME branch
             # decision at this step index. prepare_batch partitions by
@@ -571,14 +582,14 @@ def train(config: TrainerConfig):
             # into an informative assertion.
             if dist.is_initialized() and dist.get_world_size() > 1:
                 bool_tensor = torch.tensor(
-                    [int(use_segmented)], device="cuda", dtype=torch.int32
+                    [dispatch_kind], device="cuda", dtype=torch.int32
                 )
                 max_b = bool_tensor.clone()
                 min_b = bool_tensor.clone()
                 dist.all_reduce(max_b, op=dist.ReduceOp.MAX)
                 dist.all_reduce(min_b, op=dist.ReduceOp.MIN)
                 assert int(max_b.item()) == int(min_b.item()), (
-                    "Rank-level divergence in the compaction/standard "
+                    "Rank-level divergence in the replay/standard "
                     "dispatch branch. prepare_batch is supposed to enforce "
                     "modality uniformity across DP ranks at each step index "
                     "via per-group padding, so this should be unreachable. "
@@ -586,17 +597,26 @@ def train(config: TrainerConfig):
                     "FSDP all-gather or the segmented all_reduce."
                 )
 
-            if use_segmented:
+            if use_segmented or use_per_call:
                 assert segmented_forward is not None, (
                     "Micro batch carries compaction_events but the "
                     "kv_eviction package is not importable. Install kv_eviction "
                     "or disable compaction on the inference engine."
                 )
-                assert config.compaction.window_size > 0, (
-                    "Micro batch has compaction_events but trainer config "
-                    "compaction.window_size is 0. The trainer's compaction "
-                    "config must mirror the inference engine's config."
-                )
+                if use_per_call:
+                    assert per_call_segmented_forward is not None, (
+                        "Micro batch carries per-call replay metadata but the "
+                        "kv_eviction package is not importable."
+                    )
+                    assert compute_num_per_call_forwards is not None, (
+                        "per-call replay needs compute_num_per_call_forwards."
+                    )
+                if use_segmented:
+                    assert config.compaction.window_size > 0, (
+                        "Micro batch has compaction_events but trainer config "
+                        "compaction.window_size is 0. The trainer's compaction "
+                        "config must mirror the inference engine's config."
+                    )
                 assert config.model.attn == "flash_attention_2", (
                     f"Compaction requires attn='flash_attention_2' to match "
                     f"vLLM's inference kernel numerics and avoid spurious "
@@ -622,13 +642,14 @@ def train(config: TrainerConfig):
                 # check after get_parallel_dims); no per-micro-batch
                 # re-check needed here.
                 mb_prompt_len = micro_batch.get("prompt_len")
-                assert mb_prompt_len is not None, (
-                    "prompt_len missing on micro_batch in compaction run "
-                    "(compaction.window_size > 0). prepare_sample should "
-                    "set prompt_len on EVERY sample when compaction_enabled "
-                    "is True; a missing value points to a wire-format or "
-                    "packer regression."
-                )
+                if use_segmented:
+                    assert mb_prompt_len is not None, (
+                        "prompt_len missing on micro_batch in compaction run "
+                        "(compaction.window_size > 0). prepare_sample should "
+                        "set prompt_len on EVERY sample when compaction_enabled "
+                        "is True; a missing value points to a wire-format or "
+                        "packer regression."
+                    )
                 # Compaction samples MUST be batch-1. The packer
                 # (prepare_batch in trainer/batch.py) isolates each
                 # compaction sample into its own micro-batch precisely
@@ -644,39 +665,26 @@ def train(config: TrainerConfig):
                     f"invariant), got input_ids.shape={tuple(input_ids.shape)}. "
                     f"Check prepare_batch / _is_compaction_sample partitioning."
                 )
-                bs = config.compaction.block_size
-                prompt_aligned_len = ((mb_prompt_len + bs - 1) // bs) * bs
-                segment_boundaries = [
-                    int(e.num_output_tokens_at_compaction) for e in compaction_events
-                ]
-                # Per-rank segment count may diverge across DP ranks if some
-                # samples have more compaction events than others. All-reduce
-                # MAX so every rank runs the same number of forward passes,
-                # preventing NCCL all-gather deadlock. segmented_forward pads
-                # with dummy passes on ranks whose actual count is below max.
-                #
-                # INVARIANT: all DP ranks must simultaneously take either the
-                # segmented or the standard branch within a single training
-                # step. Mixing (some ranks segmented, others standard) causes
-                # a mismatch in total forward-pass count per step and will
-                # deadlock at the next FSDP all-gather. The usual way this
-                # breaks is a very short rollout that never triggered any
-                # compaction event landing on one rank while other ranks see
-                # long rollouts with events. For Phase 3 initial testing,
-                # configure experiments so all rollouts exceed the compaction
-                # window (avoid mixing long and short rollouts in the same
-                # batch).
                 seq_len_local = input_ids.shape[1]
-                n_forwards_local = compute_num_segments(
-                    seq_len_local,
-                    mb_prompt_len,
-                    segment_boundaries,
-                    compaction_strategy=config.compaction.strategy,
-                    compaction_events=compaction_events,
-                    attention_matching_decode_chunk_size=(
-                        config.compaction.attention_matching_decode_chunk_size
-                    ),
-                )
+                if use_per_call:
+                    n_forwards_local = compute_num_per_call_forwards(calls)
+                else:
+                    bs = config.compaction.block_size
+                    prompt_aligned_len = ((mb_prompt_len + bs - 1) // bs) * bs
+                    segment_boundaries = [
+                        int(e.num_output_tokens_at_compaction)
+                        for e in compaction_events
+                    ]
+                    n_forwards_local = compute_num_segments(
+                        seq_len_local,
+                        mb_prompt_len,
+                        segment_boundaries,
+                        compaction_strategy=config.compaction.strategy,
+                        compaction_events=compaction_events,
+                        attention_matching_decode_chunk_size=(
+                            config.compaction.attention_matching_decode_chunk_size
+                        ),
+                    )
                 if dist.is_initialized() and dist.get_world_size() > 1:
                     n_forwards_t = torch.tensor(
                         [n_forwards_local], device="cuda", dtype=torch.int32
@@ -925,43 +933,55 @@ def train(config: TrainerConfig):
                     maybe_record_function("forward"),
                     maybe_activation_offloading(config.model.ac_offloading),
                 ):
-                    out = segmented_forward(
-                        model=model,
-                        input_ids=input_ids,
-                        position_ids=forward_position_ids,
-                        segment_boundaries=segment_boundaries,
-                        prompt_len=mb_prompt_len,
-                        prompt_aligned_len=prompt_aligned_len,
-                        stride=config.compaction.stride,
-                        temperature=temperatures,
-                        max_forward_passes=max_forwards,
-                        loss_fn=_segment_loss_fn,
-                        bptt_segments=config.compaction.bptt_segments,
-                        compaction_events=compaction_events,
-                        compaction_strategy=config.compaction.strategy,
-                        attention_matching_query_source=(
-                            config.compaction.attention_matching_query_source
-                        ),
-                        attention_matching_max_queries_per_kv_head=(
-                            config.compaction.attention_matching_max_queries_per_kv_head
-                        ),
-                        attention_matching_zerobeta=(
-                            config.compaction.attention_matching_zerobeta
-                        ),
-                        attention_matching_forget_gate_enabled=(
-                            config.compaction.attention_matching_forget_gate_enabled
-                        ),
-                        attention_matching_forget_gate_alpha=(
-                            config.compaction.attention_matching_forget_gate_alpha
-                        ),
-                        attention_matching_gradient_mode=(
-                            config.compaction.attention_matching_gradient_mode
-                        ),
-                        attention_matching_decode_chunk_size=(
-                            config.compaction.attention_matching_decode_chunk_size
-                        ),
-                        lora_num_tokens=lora_num_tokens,
-                    )
+                    if use_per_call:
+                        out = per_call_segmented_forward(
+                            model=model,
+                            calls=calls,
+                            merged_input_ids=input_ids,
+                            merged_position_ids=forward_position_ids,
+                            max_forward_passes=max_forwards,
+                            loss_fn=_segment_loss_fn,
+                            bptt_segments=config.compaction.bptt_segments,
+                            device=torch.device("cuda"),
+                        )
+                    else:
+                        out = segmented_forward(
+                            model=model,
+                            input_ids=input_ids,
+                            position_ids=forward_position_ids,
+                            segment_boundaries=segment_boundaries,
+                            prompt_len=mb_prompt_len,
+                            prompt_aligned_len=prompt_aligned_len,
+                            stride=config.compaction.stride,
+                            temperature=temperatures,
+                            max_forward_passes=max_forwards,
+                            loss_fn=_segment_loss_fn,
+                            bptt_segments=config.compaction.bptt_segments,
+                            compaction_events=compaction_events,
+                            compaction_strategy=config.compaction.strategy,
+                            attention_matching_query_source=(
+                                config.compaction.attention_matching_query_source
+                            ),
+                            attention_matching_max_queries_per_kv_head=(
+                                config.compaction.attention_matching_max_queries_per_kv_head
+                            ),
+                            attention_matching_zerobeta=(
+                                config.compaction.attention_matching_zerobeta
+                            ),
+                            attention_matching_forget_gate_enabled=(
+                                config.compaction.attention_matching_forget_gate_enabled
+                            ),
+                            attention_matching_forget_gate_alpha=(
+                                config.compaction.attention_matching_forget_gate_alpha
+                            ),
+                            attention_matching_gradient_mode=(
+                                config.compaction.attention_matching_gradient_mode
+                            ),
+                            attention_matching_decode_chunk_size=(
+                                config.compaction.attention_matching_decode_chunk_size
+                            ),
+                            lora_num_tokens=lora_num_tokens,
+                        )
 
                 # segmented_forward already ran backward per BPTT
                 # window; accumulated_loss is a detached scalar for
@@ -1067,9 +1087,16 @@ def train(config: TrainerConfig):
                     kl_mean = float(
                         kl_values.mean().item() if kl_values.numel() > 0 else 0.0
                     )
+                    prompt_for_log = (
+                        int(mb_prompt_len)
+                        if mb_prompt_len is not None
+                        else int(len(calls[0].submitted_prompt_ids))
+                        if calls
+                        else -1
+                    )
                     logger.info(
                         f"[KLDEBUG] mb={micro_step}/{len(micro_batches)} "
-                        f"seq={int(input_ids.shape[1])} prompt={int(mb_prompt_len)} "
+                        f"seq={int(input_ids.shape[1])} prompt={prompt_for_log} "
                         f"loss_tokens={int(loss_mask.sum().item())} "
                         f"events={len(compaction_events)} boundaries={event_boundaries} "
                         f"hit_depths={hit_depths} hit_gaps={hit_gaps} "
@@ -1127,6 +1154,53 @@ def train(config: TrainerConfig):
                     loss_scale=loss_scale,
                 )
 
+                if _KVE_DEBUG_KL_BY_EVENT:
+                    std_log_importance_ratio = out["logprobs"] - inference_logprobs
+                    std_mismatch_kl = (
+                        torch.exp(std_log_importance_ratio)
+                        - std_log_importance_ratio
+                        - 1
+                    )
+                    std_mask_count = int(loss_mask.sum().item())
+                    if std_mask_count > 0:
+                        masked_positions = torch.nonzero(
+                            loss_mask, as_tuple=False
+                        )
+                        masked_kl = std_mismatch_kl[loss_mask]
+                        max_local_idx = int(masked_kl.argmax().item())
+                        max_row = int(masked_positions[max_local_idx, 0].item())
+                        max_pos = int(masked_positions[max_local_idx, 1].item())
+                        first_row = int(masked_positions[0, 0].item())
+                        first_pos = int(masked_positions[0, 1].item())
+                        max_old_logp = float(
+                            inference_logprobs[max_row, max_pos].detach().item()
+                        )
+                        max_new_logp = float(
+                            out["logprobs"][max_row, max_pos].detach().item()
+                        )
+                        first_old_logp = float(
+                            inference_logprobs[first_row, first_pos].detach().item()
+                        )
+                        first_new_logp = float(
+                            out["logprobs"][first_row, first_pos].detach().item()
+                        )
+                        logger.info(
+                            f"[KLSTD] mb={micro_step}/{len(micro_batches)} "
+                            f"seq={int(input_ids.shape[1])} "
+                            f"loss_tokens={std_mask_count} "
+                            f"mismatch_kl={float(masked_kl.mean().item()):.6f} "
+                            f"max_kl={float(masked_kl.max().item()):.6f}@{max_pos} "
+                            f"max_tok={int(input_ids[max_row, max_pos].item())} "
+                            f"max_old={max_old_logp:.6f} "
+                            f"max_new={max_new_logp:.6f} "
+                            f"max_delta={max_new_logp - max_old_logp:.6f} "
+                            f"first_kl={float(masked_kl[0].item()):.6f}@{first_pos} "
+                            f"first_tok={int(input_ids[first_row, first_pos].item())} "
+                            f"first_old={first_old_logp:.6f} "
+                            f"first_new={first_new_logp:.6f} "
+                            f"first_delta={first_new_logp - first_old_logp:.6f}"
+                        )
+
                 # Backward pass
                 with maybe_record_function("backward"):
                     loss.backward()
@@ -1140,7 +1214,7 @@ def train(config: TrainerConfig):
             # counted exactly once (disjoint owned ranges across
             # segments guarantee this; see the accumulated_entropy_masked
             # init comment above).
-            if use_segmented:
+            if use_segmented or use_per_call:
                 if accumulated_entropy_masked:
                     tensors["entropy"].append(
                         torch.cat(accumulated_entropy_masked)

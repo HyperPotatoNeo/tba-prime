@@ -62,8 +62,17 @@ def prepare_sample(
     # Compaction events (kv-eviction). Passed through to the MicroBatch and
     # clamped below if the completion was truncated to fit seq_len.
     compaction_events = training_example.compaction_events
+    calls = training_example.calls
 
     if len(input_ids) > seq_len:
+        if calls:
+            raise ValueError(
+                "Cannot truncate a TrainingSample that carries per-call replay "
+                "metadata. Truncation would shift or remove call boundaries and "
+                "make trainer replay scientifically invalid. Increase seq_len "
+                f"or disable KVE_ENABLE_PER_CALL_TRAIN_TRACE. "
+                f"sample_len={len(input_ids)}, seq_len={seq_len}."
+            )
         input_ids = input_ids[:seq_len]
         loss_mask = loss_mask[:seq_len]
         inference_logprobs = inference_logprobs[:seq_len]
@@ -134,6 +143,7 @@ def prepare_sample(
         # kv-eviction compaction events + prompt_len
         compaction_events=compaction_events,
         prompt_len=prompt_len,
+        calls=calls,
     )
 
 
@@ -164,6 +174,11 @@ def _is_compaction_sample(sample: MicroBatch) -> bool:
     pattern as multimodal samples.
     """
     return sample.compaction_events is not None and len(sample.compaction_events) > 0
+
+
+def _is_per_call_sample(sample: MicroBatch) -> bool:
+    """Check if a sample carries multi-turn per-call replay metadata."""
+    return sample.calls is not None and len(sample.calls) > 0
 
 
 def packed_samples_into_micro_bs(
@@ -204,6 +219,7 @@ def packed_samples_into_micro_bs(
         if (
             _is_multimodal_sample(sample)
             or _is_compaction_sample(sample)
+            or _is_per_call_sample(sample)
             or compaction_enabled
         ):
             sample.lora_num_tokens = [0] * num_loras
@@ -214,7 +230,11 @@ def packed_samples_into_micro_bs(
         # Try to find a bin that can fit this sequence (only pack text-only samples)
         for bin_content in micro_batches:
             # Don't pack into multimodal or compaction micro batches
-            if _is_multimodal_sample(bin_content) or _is_compaction_sample(bin_content):
+            if (
+                _is_multimodal_sample(bin_content)
+                or _is_compaction_sample(bin_content)
+                or _is_per_call_sample(bin_content)
+            ):
                 continue
             # Check if sequence fits in this bin
             if len(bin_content.input_ids) + len(sample.input_ids) <= max_seq_len:
@@ -276,7 +296,7 @@ def pad_micro_batch(
     # restart at 0 to mark a new cu_seqlens boundary. In a compaction run
     # we use the continuous layout for ALL samples since they'll all go
     # through segmented_forward.
-    if _is_compaction_sample(micro_batch) or compaction_enabled:
+    if _is_compaction_sample(micro_batch) or _is_per_call_sample(micro_batch) or compaction_enabled:
         last_pos = micro_batch.position_ids[-1] if micro_batch.position_ids else -1
         micro_batch.position_ids.extend(
             list(range(last_pos + 1, last_pos + 1 + padding_size))
@@ -365,7 +385,7 @@ def prepare_batch(
     # Order of checks matters: compaction samples may technically also be
     # multimodal in the future, but today they're mutually exclusive.
     def _treat_as_compaction(b: MicroBatch) -> bool:
-        return _is_compaction_sample(b) or compaction_enabled
+        return _is_compaction_sample(b) or _is_per_call_sample(b) or compaction_enabled
 
     mm_batches = [b for b in micro_batches if _is_multimodal_sample(b)]
     compaction_batches = [

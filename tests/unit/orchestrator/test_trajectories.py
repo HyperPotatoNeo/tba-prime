@@ -385,6 +385,40 @@ def test_interleave_rollout_single_step_trajectory(single_step_trajectory_output
     assert rollout.completion_temperatures == [1.0, 1.0]
 
 
+def test_interleave_rollout_masks_zero_logprob_tokens_for_rl(single_step_trajectory_output):
+    single_step_trajectory_output["trajectory"][0]["tokens"]["completion_ids"] = [3, 4, 5]
+    single_step_trajectory_output["trajectory"][0]["tokens"]["completion_mask"] = [1, 1, 1]
+    single_step_trajectory_output["trajectory"][0]["tokens"]["completion_logprobs"] = [
+        -0.1,
+        0.0,
+        -0.3,
+    ]
+
+    rollouts = interleave_rollout(
+        single_step_trajectory_output,
+        mask_zero_logprob_tokens=True,
+    )
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    assert rollouts[0].completion_ids == [3, 4, 5]
+    assert rollouts[0].completion_mask == [True, False, True]
+    assert rollouts[0].completion_logprobs == [-0.1, 0.0, -0.3]
+
+
+def test_interleave_rollout_fails_on_nonfinite_trainable_logprob(single_step_trajectory_output):
+    single_step_trajectory_output["trajectory"][0]["tokens"]["completion_logprobs"] = [
+        -0.1,
+        float("nan"),
+    ]
+
+    with pytest.raises(ValueError, match="non-finite inference logprob"):
+        interleave_rollout(
+            single_step_trajectory_output,
+            mask_zero_logprob_tokens=True,
+        )
+
+
 def test_interleave_rollout_multi_step_trajectory(multi_step_trajectory_output):
     rollouts = interleave_rollout(multi_step_trajectory_output)
     assert rollouts is not None

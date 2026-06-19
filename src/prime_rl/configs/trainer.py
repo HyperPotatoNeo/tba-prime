@@ -17,7 +17,13 @@ from prime_rl.utils.config import BaseConfig
 
 # -- Shared trainer configs (used by both SFT and RL trainers) --
 
-AttnImplementation: TypeAlias = Literal["sdpa", "flash_attention_2", "flash_attention_3", "fa4"]
+AttnImplementation: TypeAlias = Literal[
+    "sdpa",
+    "flash_attention_2",
+    "flash_attention_3",
+    "fa4",
+    "flex_attention",
+]
 EPCommBackend: TypeAlias = Literal["torch", "deepep"]
 
 # User-facing name -> internal name. Users set `flash_attention_4` in configs,
@@ -379,7 +385,11 @@ class ModelConfig(BaseModelConfig):
     attn: Annotated[
         AttnImplementation,
         Field(
-            description="The attention implementation to use. When CP is enabled, ring attention uses the matching kernel family (FA2 for flash_attention_2, FA3 for flash_attention_3).",
+            description=(
+                "The attention implementation to use. When CP is enabled, ring "
+                "attention uses the matching kernel family (FA2 for "
+                "flash_attention_2, FA3 for flash_attention_3)."
+            ),
         ),
     ] = "flash_attention_2"
 
