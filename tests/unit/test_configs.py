@@ -159,3 +159,100 @@ def test_removed_fused_lm_head_chunk_size_field_is_rejected():
 def test_selective_activation_checkpointing_requires_custom_impl():
     with pytest.raises(ValidationError, match="Selective activation checkpointing requires model.impl='custom'"):
         TrainerModelConfig.model_validate({"impl": "hf", "ac": {"mode": "selective"}})
+
+
+def _am_trainer_config(**compaction_overrides):
+    compaction = {
+        "window_size": 1024,
+        "strategy": "attention_matching",
+        "stride": 16,
+        "block_size": 16,
+        "attention_matching_zerobeta": True,
+    }
+    compaction.update(compaction_overrides)
+    return TrainerConfig.model_validate(
+        {
+            "model": {
+                "impl": "hf",
+                "attn": "flash_attention_2",
+                "ac": None,
+            },
+            "compaction": compaction,
+        }
+    )
+
+
+def test_am_full_bptt_requires_straight_through_gradient_mode():
+    with pytest.raises(ValidationError, match="attention_matching_gradient_mode='detached'"):
+        _am_trainer_config(bptt_segments="full")
+
+
+def test_am_straight_through_accepts_full_bptt_aliases():
+    cfg = _am_trainer_config(
+        attention_matching_gradient_mode="straight_through",
+        bptt_segments="full",
+    )
+    assert cfg.compaction.bptt_segments is None
+
+    cfg_zero = _am_trainer_config(
+        attention_matching_gradient_mode="straight_through",
+        bptt_segments=0,
+    )
+    assert cfg_zero.compaction.bptt_segments is None
+
+
+def _am_rl_config(*, logprobs_mode: str | None):
+    vllm_extra = {
+        "block_size": 16,
+        "attention_backend": "FLASH_ATTN",
+        "compaction_strategy": "attention_matching",
+        "compaction_window_size": 512,
+        "compaction_stride": 16,
+        "attention_matching_zerobeta": True,
+    }
+    if logprobs_mode is not None:
+        vllm_extra["logprobs_mode"] = logprobs_mode
+    return {
+        "max_steps": 1,
+        "seq_len": 4096,
+        "model": {"name": "Qwen/Qwen3-4B-Instruct-2507"},
+        "trainer": {
+            "model": {
+                "name": "Qwen/Qwen3-4B-Instruct-2507",
+                "impl": "hf",
+                "attn": "flash_attention_2",
+            },
+            "compaction": {
+                "window_size": 512,
+                "strategy": "attention_matching",
+                "stride": 16,
+                "block_size": 16,
+                "attention_matching_zerobeta": True,
+            },
+        },
+        "orchestrator": {
+            "batch_size": 2,
+            "rollouts_per_example": 2,
+            "client": {"base_url": ["http://localhost:8000/v1"]},
+            "train": {"env": [{"id": "dummy-env"}]},
+        },
+        "inference": {
+            "model": {
+                "name": "Qwen/Qwen3-4B-Instruct-2507",
+                "max_model_len": 4096,
+            },
+            "vllm_extra": vllm_extra,
+        },
+    }
+
+
+def test_attention_matching_rl_requires_raw_vllm_logprobs():
+    with pytest.raises(ValidationError, match="logprobs_mode"):
+        RLConfig.model_validate(_am_rl_config(logprobs_mode=None))
+
+    with pytest.raises(ValidationError, match="logprobs_mode"):
+        RLConfig.model_validate(_am_rl_config(logprobs_mode="processed_logprobs"))
+
+    cfg = RLConfig.model_validate(_am_rl_config(logprobs_mode="raw_logprobs"))
+    assert cfg.inference is not None
+    assert cfg.inference.vllm_extra["logprobs_mode"] == "raw_logprobs"

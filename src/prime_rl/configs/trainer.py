@@ -2,7 +2,7 @@ import warnings
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from prime_rl.configs.shared import (
     BaseModelConfig,
@@ -60,6 +60,16 @@ class CompactionConfig(BaseConfig):
         ),
     ] = 0
 
+    strategy: Annotated[
+        Literal["fifo", "attention_matching"],
+        Field(
+            description=(
+                "Trainer replay strategy. Must match "
+                "inference.vllm_extra.compaction_strategy."
+            ),
+        ),
+    ] = "fifo"
+
     stride: Annotated[
         int,
         Field(
@@ -76,6 +86,104 @@ class CompactionConfig(BaseConfig):
         ),
     ] = 16
 
+    protected_prefix_tokens: Annotated[
+        int,
+        Field(
+            ge=-1,
+            description=(
+                "Optional number of leading prompt tokens protected from compaction. "
+                "-1 means use the inference-side default."
+            ),
+        ),
+    ] = -1
+
+    attention_matching_query_source: Annotated[
+        Literal["random_queries", "recent_cache_keys", "prefix_cache_keys"],
+        Field(
+            description=(
+                "AM query source used for trainer-side replay. Must match "
+                "inference when strategy='attention_matching'."
+            ),
+        ),
+    ] = "random_queries"
+
+    attention_matching_max_queries_per_kv_head: Annotated[
+        int,
+        Field(
+            gt=0,
+            description=(
+                "Maximum AM probe queries per KV head. Must match inference "
+                "when strategy='attention_matching'."
+            ),
+        ),
+    ] = 128
+
+    attention_matching_zerobeta: Annotated[
+        bool,
+        Field(
+            description=(
+                "Use the zero-beta AM variant in trainer replay. Full-beta "
+                "AM requires a custom trainer attention path and is rejected "
+                "for RL until that exists."
+            ),
+        ),
+    ] = False
+
+    attention_matching_forget_gate_enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "Enable recurrent forget-gate blending during trainer-side AM "
+                "replay. Must match inference.vllm_extra when strategy="
+                "'attention_matching'."
+            ),
+        ),
+    ] = False
+
+    attention_matching_forget_gate_alpha: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Retention weight for optional AM forget-gate replay. The "
+                "gated synthetic KV is alpha * previous_synthetic + "
+                "(1-alpha) * current_candidate. Ignored unless the gate is "
+                "enabled."
+            ),
+        ),
+    ] = 0.5
+
+    attention_matching_gradient_mode: Annotated[
+        Literal["detached", "straight_through"],
+        Field(
+            description=(
+                "Backward semantics for AM replay. 'detached' is the default "
+                "faithful inference-logprob replay path: the AM rewrite is a "
+                "state update and no distal gradient flows through synthetic "
+                "KV. 'straight_through' preserves the autograd graph through "
+                "retained KV and the continuous AM reconstruction, while "
+                "treating OMP's discrete key-selection decisions as fixed in "
+                "the backward pass. Use with bptt_segments='full' or 0 for "
+                "RNN-style full-trajectory BPTT."
+            ),
+        ),
+    ] = "detached"
+
+    attention_matching_decode_chunk_size: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Trainer replay chunk size for post-prompt AM decode. 0 keeps "
+                "the historical efficient segmented replay. 1 scores one "
+                "token per forward after AM boundaries, matching vLLM decode "
+                "logprob production most closely and reducing mismatch KL "
+                "diagnostics at the cost of speed."
+            ),
+        ),
+    ] = 0
+
     bptt_segments: Annotated[
         int | None,
         Field(
@@ -86,16 +194,32 @@ class CompactionConfig(BaseConfig):
                 "gradients flow through retained KV within K consecutive "
                 "segments before detach, O(K segments) memory. None = full "
                 "trajectory in one BPTT window (M4 semantics, G_distal term "
-                "preserved) — requires enough memory to hold every segment's "
+                "preserved). TOML configs may set this to 'full' or 0 to "
+                "select None, since TOML has no null scalar. Full BPTT "
+                "requires enough memory to hold every segment's "
                 "activations simultaneously. Only consulted when window_size "
-                "> 0. NOTE: values other than 1 are currently restricted to "
-                "single-GPU runs; under multi-rank FSDP2 the reduce-scatter "
-                "count mismatch between ranks with differing per-sample "
-                "segment counts would deadlock (see the runtime check in "
-                "train.py). Multi-rank K > 1 is a TODO for a future round."
+                "> 0. NOTE: finite values > 1 remain restricted to single-"
+                "rank runs; under multi-rank FSDP2 the reduce-scatter count "
+                "mismatch between ranks with differing per-sample BPTT-window "
+                "counts would deadlock (see the runtime check in train.py). "
+                "Multi-rank full BPTT is supported by padding zero-loss dummy "
+                "forward graphs before the single trajectory backward."
             ),
         ),
     ] = 1
+
+    @field_validator("bptt_segments", mode="before")
+    @classmethod
+    def normalize_bptt_segments(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"full", "none", "null"}:
+                return None
+        if value == 0:
+            return None
+        return value
 
 
 class GCConfig(BaseConfig):
@@ -965,6 +1089,28 @@ class TrainerConfig(BaseConfig):
                     f"trainer.compaction.bptt_segments must be None or >= 1, "
                     f"got {self.compaction.bptt_segments}."
                 )
+            if self.compaction.strategy == "attention_matching":
+                if not self.compaction.attention_matching_zerobeta:
+                    raise ValueError(
+                        "trainer.compaction.strategy='attention_matching' "
+                        "currently requires "
+                        "trainer.compaction.attention_matching_zerobeta=true. "
+                        "Full-beta AM needs a custom trainer attention path to "
+                        "apply vLLM's per-layer score_mod beta biases; without "
+                        "that path, training would produce wrong logprobs."
+                    )
+                if (
+                    self.compaction.attention_matching_gradient_mode == "detached"
+                    and self.compaction.bptt_segments != 1
+                ):
+                    raise ValueError(
+                        "trainer.compaction.strategy='attention_matching' "
+                        "with attention_matching_gradient_mode='detached' "
+                        "requires trainer.compaction.bptt_segments=1. To run "
+                        "RNN-style BPTT through AM compaction, set "
+                        "attention_matching_gradient_mode='straight_through' "
+                        "and choose bptt_segments='full' (or a finite K)."
+                    )
             if self.model.ac is not None:
                 # Per-block activation checkpointing + use_cache=True +
                 # DynamicCache is a known broken combination: prime-rl's

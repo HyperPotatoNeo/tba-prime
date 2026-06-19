@@ -4,6 +4,8 @@ from contextlib import nullcontext
 import os
 import time
 
+import torch
+
 # D5 debug: memory trace at every micro-batch boundary. Guarded by env
 # var so non-debug runs are unaffected. When KVE_MEM_TRACE=1, each
 # micro-batch logs its path, pre/post-forward/backward memory_allocated
@@ -11,6 +13,13 @@ import time
 # across the compaction -> text transition on step 1 (see D5
 # investigation notes in plans/phase3_training_integration.md).
 _KVE_MEM_TRACE = os.environ.get("KVE_MEM_TRACE") == "1"
+_SEGMENTED_LOGPROB_CHUNK_TOKENS = max(
+    1, int(os.environ.get("PRIME_RL_SEGMENTED_LOGPROB_CHUNK_TOKENS", "512"))
+)
+_SEGMENTED_ENTROPY_CHUNK_TOKENS = max(
+    1, int(os.environ.get("PRIME_RL_SEGMENTED_ENTROPY_CHUNK_TOKENS", "128"))
+)
+_KVE_DEBUG_KL_BY_EVENT = os.environ.get("KVE_DEBUG_KL_BY_EVENT") == "1"
 
 
 def _mem_snap(tag: str) -> str:
@@ -21,6 +30,60 @@ def _mem_snap(tag: str) -> str:
     peak = _t.cuda.max_memory_allocated() / 1e9
     reserved = _t.cuda.memory_reserved() / 1e9
     return f"[MEM] {tag} alloc={alloc:.3f}GB peak={peak:.3f}GB reserved={reserved:.3f}GB"
+
+
+def _selective_log_softmax_seq_chunked(
+    logits: torch.Tensor,
+    index: torch.Tensor,
+    *,
+    chunk_tokens: int = _SEGMENTED_LOGPROB_CHUNK_TOKENS,
+) -> torch.Tensor:
+    def _selective_fp32(
+        chunk_logits: torch.Tensor,
+        chunk_index: torch.Tensor,
+    ) -> torch.Tensor:
+        # vLLM reports raw logprobs by converting BF16 logits to FP32 before
+        # log-softmax. Match that numerics here; BF16 log_softmax inflates the
+        # train-vs-inference KL even when the KV replay is correct.
+        chunk_logprobs = chunk_logits.float().log_softmax(dim=-1)
+        return torch.gather(
+            chunk_logprobs,
+            dim=-1,
+            index=chunk_index.unsqueeze(-1),
+        ).squeeze(-1)
+
+    if logits.shape[1] <= chunk_tokens:
+        return _selective_fp32(logits, index)
+
+    pieces = []
+    for start in range(0, logits.shape[1], chunk_tokens):
+        end = min(start + chunk_tokens, logits.shape[1])
+        pieces.append(_selective_fp32(logits[:, start:end, :], index[:, start:end]))
+    return torch.cat(pieces, dim=1)
+
+
+def _masked_entropy_seq_chunked(
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    chunk_tokens: int = _SEGMENTED_ENTROPY_CHUNK_TOKENS,
+) -> torch.Tensor:
+    pieces = []
+    with torch.no_grad():
+        for start in range(0, logits.shape[1], chunk_tokens):
+            end = min(start + chunk_tokens, logits.shape[1])
+            chunk_logits = logits[:, start:end, :]
+            chunk_mask = mask[:, start:end].bool()
+            if not chunk_mask.any():
+                continue
+            lse = torch.logsumexp(chunk_logits, dim=-1)
+            pd = torch.nn.functional.softmax(chunk_logits, dim=-1)
+            chunk_entropy = lse - torch.sum(pd * chunk_logits, dim=-1)
+            pieces.append(chunk_entropy[chunk_mask])
+
+    if pieces:
+        return torch.cat(pieces, dim=0)
+    return torch.empty(0, device=logits.device, dtype=logits.dtype)
 from datetime import timedelta
 
 # Import environment before any other imports
@@ -29,7 +92,6 @@ from datetime import timedelta
 from prime_rl.trainer.models.layers.attn import substitute_ring_attn
 from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
 from prime_rl.utils.act_offloading import maybe_activation_offloading
-import torch
 import torch.distributed as dist
 from torch.profiler import profile, ProfilerActivity, record_function
 from prime_rl.trainer.ckpt import setup_ckpt_managers
@@ -151,7 +213,7 @@ def train(config: TrainerConfig):
     # Initialize parallel dimensions
     parallel_dims = get_parallel_dims(config.model)
 
-    # Early check: reject bptt_segments != 1 under multi-rank FSDP2.
+    # Early check: reject finite TBPTT(K>1) under multi-rank FSDP2.
     # Compaction's per-segment backward mode issues one backward per
     # BPTT window, and the number of real backwards per rank is
     # ceil(per_rank_segments / K). Under DP > 1 this count varies
@@ -160,23 +222,27 @@ def train(config: TrainerConfig):
     # first compaction micro-batch. Fail at training init (before any
     # model load or data fetch) so a misconfigured run crashes
     # immediately instead of after a few mixed-sample steps.
-    # TODO: implement max_backwards all-reduce + mixed dummy padding
-    # in segmented_forward so bptt_segments > 1 works under FSDP2.
+    #
+    # Full BPTT (bptt_segments=None) is allowed: segmented_forward pads
+    # shorter ranks with zero-loss dummy forward graphs before the single
+    # trajectory backward, so both FSDP forward and backward hook counts match.
+    # TODO: implement max_backwards all-reduce + mixed dummy padding for
+    # finite K > 1 TBPTT under FSDP2.
     if (
         config.compaction.window_size > 0
-        and config.compaction.bptt_segments != 1
+        and config.compaction.bptt_segments not in (1, None)
         and dist.is_initialized()
         and dist.get_world_size() > 1
     ):
         raise ValueError(
-            "Compaction with trainer.compaction.bptt_segments != 1 is not "
+            "Compaction with finite trainer.compaction.bptt_segments > 1 is not "
             "yet supported under multi-rank FSDP2 data parallelism due to "
             "a reduce-scatter count mismatch in the dummy-pass padding "
             "inside segmented_forward. Got world_size="
             f"{dist.get_world_size()}, bptt_segments="
             f"{config.compaction.bptt_segments}. Set "
-            "trainer.compaction.bptt_segments=1 (the default) for "
-            "multi-rank compaction runs, or run on a single GPU."
+            "trainer.compaction.bptt_segments=1 (the default) or "
+            "bptt_segments='full' for multi-rank compaction runs."
         )
 
     # For single-run, check for checkpoint to resume from
@@ -456,6 +522,7 @@ def train(config: TrainerConfig):
             else:
                 forward_position_ids = position_ids
 
+            lora_num_tokens = None
             if config.model.lora:
                 lora_num_tokens = micro_batch["lora_num_tokens"].to("cuda")
                 if cp_enabled:
@@ -601,7 +668,14 @@ def train(config: TrainerConfig):
                 # batch).
                 seq_len_local = input_ids.shape[1]
                 n_forwards_local = compute_num_segments(
-                    seq_len_local, mb_prompt_len, segment_boundaries
+                    seq_len_local,
+                    mb_prompt_len,
+                    segment_boundaries,
+                    compaction_strategy=config.compaction.strategy,
+                    compaction_events=compaction_events,
+                    attention_matching_decode_chunk_size=(
+                        config.compaction.attention_matching_decode_chunk_size
+                    ),
                 )
                 if dist.is_initialized() and dist.get_world_size() > 1:
                     n_forwards_t = torch.tensor(
@@ -704,7 +778,7 @@ def train(config: TrainerConfig):
                         return seg_logits.sum() * 0.0
 
                     seg_labels = labels[:, full_logit_start:effective_logit_end]
-                    seg_raw_logprobs = selective_log_softmax(
+                    seg_raw_logprobs = _selective_log_softmax_seq_chunked(
                         seg_logits_effective, seg_labels
                     )
                     # Target token positions for these logits:
@@ -719,6 +793,86 @@ def train(config: TrainerConfig):
                         teacher_logprobs[:, tgt_start:tgt_end]
                         if teacher_logprobs is not None
                         else None
+                    )
+                    # For segmented replay, report the primary train-vs-inference
+                    # KL as a token-weighted distribution. compute_loss returns
+                    # per-segment scalar means, and averaging those would
+                    # overweight tiny AM replay segments.
+                    seg_log_importance_ratio = seg_raw_logprobs - seg_inf
+                    seg_mismatch_kl = (
+                        torch.exp(seg_log_importance_ratio)
+                        - seg_log_importance_ratio
+                        - 1
+                    )
+                    if _KVE_DEBUG_KL_BY_EVENT:
+                        seg_mask_count = int(seg_mask.sum().item())
+                        if seg_mask_count > 0:
+                            masked_kl = seg_mismatch_kl[seg_mask]
+                            seg_kl_mean = float(masked_kl.mean().item())
+                            seg_kl_max = float(masked_kl.max().item())
+                            masked_positions = torch.nonzero(
+                                seg_mask.squeeze(0), as_tuple=False
+                            ).flatten()
+                            max_local_idx = int(masked_kl.argmax().item())
+                            max_mask_offset = int(
+                                masked_positions[max_local_idx].item()
+                            )
+                            max_target_pos = int(
+                                tgt_start + max_mask_offset
+                            )
+                            max_token_id = int(input_ids[0, max_target_pos].item())
+                            max_old_logp = float(
+                                seg_inf[0, max_mask_offset].detach().item()
+                            )
+                            max_new_logp = float(
+                                seg_raw_logprobs[0, max_mask_offset]
+                                .detach()
+                                .item()
+                            )
+                            first_mask_offset = int(masked_positions[0].item())
+                            first_target_pos = int(
+                                tgt_start + first_mask_offset
+                            )
+                            first_token_id = int(input_ids[0, first_target_pos].item())
+                            first_old_logp = float(
+                                seg_inf[0, first_mask_offset].detach().item()
+                            )
+                            first_new_logp = float(
+                                seg_raw_logprobs[0, first_mask_offset]
+                                .detach()
+                                .item()
+                            )
+                            first_kl = float(masked_kl[0].item())
+                        else:
+                            seg_kl_mean = 0.0
+                            seg_kl_max = 0.0
+                            max_target_pos = -1
+                            max_token_id = -1
+                            max_old_logp = 0.0
+                            max_new_logp = 0.0
+                            first_target_pos = -1
+                            first_token_id = -1
+                            first_old_logp = 0.0
+                            first_new_logp = 0.0
+                            first_kl = 0.0
+                        logger.info(
+                            f"[KLSEG] logits=({full_logit_start},{full_logit_end}) "
+                            f"targets=({tgt_start},{tgt_end}) "
+                            f"mask_tokens={seg_mask_count} "
+                            f"mismatch_kl={seg_kl_mean:.6f} "
+                            f"max_kl={seg_kl_max:.6f}@{max_target_pos} "
+                            f"max_tok={max_token_id} "
+                            f"max_old={max_old_logp:.6f} "
+                            f"max_new={max_new_logp:.6f} "
+                            f"max_delta={max_new_logp - max_old_logp:.6f} "
+                            f"first_kl={first_kl:.6f}@{first_target_pos} "
+                            f"first_tok={first_token_id} "
+                            f"first_old={first_old_logp:.6f} "
+                            f"first_new={first_new_logp:.6f} "
+                            f"first_delta={first_new_logp - first_old_logp:.6f}"
+                        )
+                    accumulated_loss_tensors.setdefault("mismatch_kl", []).append(
+                        seg_mismatch_kl[seg_mask].detach()
                     )
                     seg_loss_val, seg_metrics = compute_loss(
                         trainer_logprobs=(seg_raw_logprobs.squeeze(0),),
@@ -737,6 +891,8 @@ def train(config: TrainerConfig):
                     # input, so we just stash each segment's tensors
                     # into lists and stack at the end.
                     for mk, mv in seg_metrics.items():
+                        if mk == "mismatch_kl":
+                            continue
                         accumulated_loss_tensors.setdefault(mk, []).append(
                             mv.detach()
                         )
@@ -758,16 +914,8 @@ def train(config: TrainerConfig):
                     # on step 0 (Inductor recompile thrash). The
                     # inlined math runs under torch.no_grad so there
                     # is no autograd overhead.
-                    with torch.no_grad():
-                        lse = torch.logsumexp(seg_logits_effective, dim=-1)
-                        pd = torch.nn.functional.softmax(
-                            seg_logits_effective, dim=-1
-                        )
-                        seg_entropy = lse - torch.sum(
-                            pd * seg_logits_effective, dim=-1
-                        )
                     accumulated_entropy_masked.append(
-                        seg_entropy.squeeze(0)[seg_mask.squeeze(0).bool()]
+                        _masked_entropy_seq_chunked(seg_logits_effective, seg_mask)
                         .detach()
                         .to("cpu")
                     )
@@ -789,6 +937,30 @@ def train(config: TrainerConfig):
                         max_forward_passes=max_forwards,
                         loss_fn=_segment_loss_fn,
                         bptt_segments=config.compaction.bptt_segments,
+                        compaction_events=compaction_events,
+                        compaction_strategy=config.compaction.strategy,
+                        attention_matching_query_source=(
+                            config.compaction.attention_matching_query_source
+                        ),
+                        attention_matching_max_queries_per_kv_head=(
+                            config.compaction.attention_matching_max_queries_per_kv_head
+                        ),
+                        attention_matching_zerobeta=(
+                            config.compaction.attention_matching_zerobeta
+                        ),
+                        attention_matching_forget_gate_enabled=(
+                            config.compaction.attention_matching_forget_gate_enabled
+                        ),
+                        attention_matching_forget_gate_alpha=(
+                            config.compaction.attention_matching_forget_gate_alpha
+                        ),
+                        attention_matching_gradient_mode=(
+                            config.compaction.attention_matching_gradient_mode
+                        ),
+                        attention_matching_decode_chunk_size=(
+                            config.compaction.attention_matching_decode_chunk_size
+                        ),
+                        lora_num_tokens=lora_num_tokens,
                     )
 
                 # segmented_forward already ran backward per BPTT
@@ -843,6 +1015,67 @@ def train(config: TrainerConfig):
                         "different segmented aggregation path."
                     )
                     loss_tensors[k] = torch.cat(v)
+                if _KVE_DEBUG_KL_BY_EVENT and "mismatch_kl" in loss_tensors:
+                    kl_values = loss_tensors["mismatch_kl"]
+                    hit_depths: list[int] = []
+                    hit_gaps: list[int] = []
+                    event_boundaries: list[int] = []
+                    event_summaries: list[str] = []
+                    for event in compaction_events:
+                        boundary = int(
+                            getattr(event, "num_output_tokens_at_compaction", 0)
+                            or 0
+                        )
+                        event_boundaries.append(boundary)
+                        cache_hit_tokens = int(
+                            getattr(event, "attention_matching_cache_hit_tokens", 0)
+                            or 0
+                        )
+                        if cache_hit_tokens > 0:
+                            replay_steps = (
+                                getattr(
+                                    event,
+                                    "attention_matching_replay_steps",
+                                    None,
+                                )
+                                or []
+                            )
+                            target_len = int(
+                                getattr(event, "target_len", 0) or 0
+                            )
+                            hit_depths.append(len(replay_steps))
+                            hit_gaps.append(target_len - cache_hit_tokens)
+                        replay_steps = (
+                            getattr(event, "attention_matching_replay_steps", None)
+                            or []
+                        )
+                        step_summary = ""
+                        if replay_steps:
+                            last_step = replay_steps[-1]
+                            step_summary = (
+                                f";last={int(last_step.get('source_len', 0) or 0)}"
+                                f"->{int(last_step.get('target_len', 0) or 0)}"
+                            )
+                        event_summaries.append(
+                            "b="
+                            f"{boundary}:src={int(getattr(event, 'source_len', 0) or 0)}"
+                            f"->tgt={int(getattr(event, 'target_len', 0) or 0)}"
+                            f":hit={cache_hit_tokens}"
+                            f":steps={len(replay_steps)}"
+                            f"{step_summary}"
+                        )
+                    kl_mean = float(
+                        kl_values.mean().item() if kl_values.numel() > 0 else 0.0
+                    )
+                    logger.info(
+                        f"[KLDEBUG] mb={micro_step}/{len(micro_batches)} "
+                        f"seq={int(input_ids.shape[1])} prompt={int(mb_prompt_len)} "
+                        f"loss_tokens={int(loss_mask.sum().item())} "
+                        f"events={len(compaction_events)} boundaries={event_boundaries} "
+                        f"hit_depths={hit_depths} hit_gaps={hit_gaps} "
+                        f"event_details={event_summaries} "
+                        f"mismatch_kl={kl_mean:.6f}"
+                    )
             else:
                 # Forward pass with per-token temperatures (standard path)
                 with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
@@ -950,9 +1183,10 @@ def train(config: TrainerConfig):
             # degenerate segmented case (all segments had zero owned
             # tokens), the appended tensor is zero-length and .mean()
             # returns NaN — acceptable for a debug log.
+            micro_step_loss = tensors["loss"][-1].mean().item()
             micro_step_message = (
                 f"Micro Step {micro_step}/{len(micro_batches)} | "
-                f"Loss: {tensors['loss'][-1].mean().item():.4f}"
+                f"Loss: {micro_step_loss:.8f} ({micro_step_loss:.3e})"
             )
             if len(tensors["entropy"]) > 0 and tensors["entropy"][-1].numel() > 0:
                 micro_step_message += (
@@ -1021,7 +1255,12 @@ def train(config: TrainerConfig):
 
         # Log step metrics
         step_time = time.perf_counter() - step_start_time
-        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Loss: {tensor_stats['loss/mean']:.4f} | Entropy: {tensor_stats['entropy/mean']:.4f}"
+        loss_mean = tensor_stats["loss/mean"]
+        step_message = (
+            f"Step {progress.step} | Time: {step_time:.2f}s | "
+            f"Loss: {loss_mean:.8f} ({loss_mean:.3e}) | "
+            f"Entropy: {tensor_stats['entropy/mean']:.4f}"
+        )
         if "mismatch_kl/mean" in tensor_stats:
             step_message += f" | Mismatch KL: {tensor_stats['mismatch_kl/mean']:.4f}"
         if grad_norm is not None:

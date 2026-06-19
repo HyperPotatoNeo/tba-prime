@@ -400,6 +400,1347 @@ def test_interleave_rollout_multi_step_trajectory(multi_step_trajectory_output):
     assert rollout.completion_temperatures == [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 
+def _am_prompt_event(
+    *,
+    source_len: int,
+    target_len: int,
+    num_prompt_tokens: int,
+    tokens_evicted: int,
+    position_offset_after: int,
+    replay_steps: list[dict],
+    cache_hit_tokens: int | None = None,
+    hidden_tail_token_ids: list[int] | None = None,
+) -> dict:
+    last = replay_steps[-1]
+    protected = last["protected_prefix_len"]
+    synthetic = last["synthetic_prefix_len"]
+    return {
+        "num_output_tokens_at_compaction": 0,
+        "tokens_evicted": tokens_evicted,
+        "position_offset_after": position_offset_after,
+        "num_prompt_tokens": num_prompt_tokens,
+        "evict_start": 0,
+        "compaction_strategy": "attention_matching",
+        "source_len": source_len,
+        "target_len": target_len,
+        "protected_prefix_len": protected,
+        "synthetic_prefix_len": synthetic,
+        "exact_kept_tokens": target_len - protected - synthetic,
+        "attention_matching_query_source": "random_queries",
+        "attention_matching_max_queries_per_kv_head": 8,
+        "attention_matching_query_seed": last["attention_matching_query_seed"],
+        "attention_matching_zerobeta": True,
+        "attention_matching_pre_sample": True,
+        "attention_matching_replay_steps": replay_steps,
+        "attention_matching_cache_hit_tokens": (
+            max(0, target_len - 1)
+            if cache_hit_tokens is None
+            else cache_hit_tokens
+        ),
+        "attention_matching_hidden_tail_token_ids": hidden_tail_token_ids,
+    }
+
+
+def _trajectory_step(
+    *,
+    prompt_ids: list[int],
+    completion_ids: list[int],
+    completion_logprobs: list[float],
+    extras: dict | None = None,
+    trajectory_id: str = "0",
+) -> vf.TrajectoryStep:
+    return vf.TrajectoryStep(
+        prompt=[{"role": "user", "content": "U"}],
+        completion=[{"role": "assistant", "content": "A"}],
+        response=MagicMock(),
+        tokens=vf.TrajectoryStepTokens(
+            prompt_ids=prompt_ids,
+            prompt_mask=[0] * len(prompt_ids),
+            completion_ids=completion_ids,
+            completion_mask=[1] * len(completion_ids),
+            completion_logprobs=completion_logprobs,
+            overlong_prompt=False,
+            is_truncated=False,
+        ),
+        reward=None,
+        advantage=None,
+        is_truncated=False,
+        trajectory_id=trajectory_id,
+        extras=extras or {},
+    )
+
+
+def test_interleave_rollout_merges_stateful_cross_turn_am_prompt_events():
+    first_replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    second_replay = first_replay + [
+        {
+            "source_len": 9,
+            "target_len": 7,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 5,
+            "attention_matching_query_seed": 202,
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                            cache_hit_tokens=0,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 20, 21, 30, 31, 32],
+                completion_ids=[40],
+                completion_logprobs=[-0.3],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=11,
+                            target_len=7,
+                            num_prompt_tokens=11,
+                            tokens_evicted=4,
+                            position_offset_after=4,
+                            replay_steps=second_replay,
+                            cache_hit_tokens=4,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.prompt_ids == [10, 11, 12, 13, 14, 15]
+    assert rollout.completion_ids == [20, 21, 30, 31, 32, 40]
+    assert rollout.completion_mask == [True, True, False, False, False, True]
+    assert rollout.completion_logprobs == [-0.1, -0.2, 0.0, 0.0, 0.0, -0.3]
+    assert rollout.compaction_events is not None
+    assert len(rollout.compaction_events) == 2
+
+    first_event, second_event = rollout.compaction_events
+    assert first_event.num_output_tokens_at_compaction == 0
+    assert first_event.source_len == 6
+    assert first_event.target_len == 4
+    assert len(first_event.attention_matching_replay_steps or []) == 1
+
+    assert second_event.num_output_tokens_at_compaction == 5
+    assert second_event.num_prompt_tokens == 6
+    assert second_event.source_len == 9
+    assert second_event.target_len == 7
+    assert second_event.tokens_evicted == 2
+    assert second_event.position_offset_after == 4
+    assert second_event.attention_matching_query_seed == 202
+    assert second_event.attention_matching_replay_steps == second_replay[1:]
+
+
+def test_interleave_rollout_uses_nohit_am_prompt_event_as_state_producer():
+    first_replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+            "attention_matching_prefix_cache_key": "am-key-a",
+        }
+    ]
+    second_replay = first_replay + [
+        {
+            "source_len": 9,
+            "target_len": 7,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 5,
+            "attention_matching_query_seed": 202,
+            "attention_matching_prefix_cache_key": "am-key-b",
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                            cache_hit_tokens=0,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 20, 21, 30, 31, 32],
+                completion_ids=[40],
+                completion_logprobs=[-0.3],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=11,
+                            target_len=7,
+                            num_prompt_tokens=11,
+                            tokens_evicted=4,
+                            position_offset_after=4,
+                            replay_steps=second_replay,
+                            cache_hit_tokens=6,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.completion_ids == [20, 21, 30, 31, 32, 40]
+    assert rollout.completion_mask == [True, True, False, False, False, True]
+    assert rollout.compaction_events is not None
+    assert len(rollout.compaction_events) == 2
+    assert rollout.compaction_events[0].attention_matching_cache_hit_tokens == 0
+    assert rollout.compaction_events[1].num_output_tokens_at_compaction == 5
+    assert rollout.compaction_events[1].attention_matching_replay_steps == second_replay[1:]
+    assert rollout.compaction_events[1].attention_matching_cache_hit_tokens == 0
+
+
+def test_interleave_rollout_splits_noevent_turn_after_active_am_state():
+    replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+            "attention_matching_prefix_cache_key": "am-key-a",
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=replay,
+                            cache_hit_tokens=0,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 20, 21, 30, 31],
+                completion_ids=[40],
+                completion_logprobs=[-0.3],
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 2
+    first, second = rollouts
+    assert first.completion_ids == [20, 21]
+    assert first.compaction_events is not None
+    assert len(first.compaction_events) == 1
+    assert first.compaction_events[0].attention_matching_replay_steps == replay
+    assert second.prompt_ids == [10, 11, 12, 13, 14, 15, 20, 21, 30, 31]
+    assert second.completion_ids == [40]
+    assert second.compaction_events is None
+
+
+def test_interleave_rollout_does_not_consume_state_for_current_nohit_am_event():
+    first_replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+            "attention_matching_prefix_cache_key": "am-key-a",
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                            cache_hit_tokens=0,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 20, 21, 30],
+                completion_ids=[40],
+                completion_logprobs=[-0.3],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=9,
+                            target_len=7,
+                            num_prompt_tokens=9,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                            cache_hit_tokens=0,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 2
+    assert rollouts[0].completion_ids == [20, 21]
+    assert rollouts[1].prompt_ids == [10, 11, 12, 13, 14, 15, 20, 21, 30]
+
+
+def test_interleave_rollout_does_not_merge_different_am_prefix_cache_keys():
+    first_replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+            "attention_matching_prefix_cache_key": "am-key-a",
+        }
+    ]
+    second_replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+            "attention_matching_prefix_cache_key": "am-key-b",
+        },
+        {
+            "source_len": 9,
+            "target_len": 7,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 5,
+            "attention_matching_query_seed": 202,
+            "attention_matching_prefix_cache_key": "am-key-c",
+        },
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 20, 21, 30, 31, 32],
+                completion_ids=[40],
+                completion_logprobs=[-0.3],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=11,
+                            target_len=7,
+                            num_prompt_tokens=11,
+                            tokens_evicted=4,
+                            position_offset_after=4,
+                            replay_steps=second_replay,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 2
+    assert rollouts[0].completion_ids == [20, 21]
+    assert rollouts[1].prompt_ids == [10, 11, 12, 13, 14, 15, 20, 21, 30, 31, 32]
+    assert rollouts[1].completion_ids == [40]
+    assert rollouts[1].completion_mask == [True]
+
+
+def test_interleave_rollout_stateful_am_handles_turn_padding_boundary():
+    pad = 151643
+    first_replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    second_replay = first_replay + [
+        {
+            "source_len": 9,
+            "target_len": 7,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 5,
+            "attention_matching_query_seed": 202,
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, pad, pad, 20, 21],
+                completion_ids=[30],
+                completion_logprobs=[-0.1],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=8,
+                            target_len=6,
+                            num_prompt_tokens=8,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                            cache_hit_tokens=0,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 20, 21, 30, 40, 41, 42, 43],
+                completion_ids=[50],
+                completion_logprobs=[-0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=11,
+                            target_len=9,
+                            num_prompt_tokens=11,
+                            tokens_evicted=4,
+                            position_offset_after=4,
+                            replay_steps=second_replay,
+                            cache_hit_tokens=6,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.prompt_ids == [10, 11, 12, 13, pad, pad, 20, 21]
+    assert rollout.completion_ids == [30, 40, 41, 42, 43, 50]
+    assert rollout.completion_mask == [True, False, False, False, False, True]
+    assert rollout.compaction_events is not None
+    assert len(rollout.compaction_events) == 2
+
+    second_event = rollout.compaction_events[1]
+    assert second_event.num_output_tokens_at_compaction == 5
+    assert second_event.num_prompt_tokens == 8
+    assert second_event.source_len == 11
+    assert second_event.target_len == 9
+    assert second_event.tokens_evicted == 2
+    assert second_event.position_offset_after == 4
+    assert second_event.attention_matching_query_seed == 202
+    assert second_event.attention_matching_replay_steps == second_replay[1:]
+
+
+def test_interleave_rollout_stateful_am_handles_replay_boundary_behind_trace():
+    first_replay = [
+        {
+            "source_len": 8,
+            "target_len": 6,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 4,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    second_replay = first_replay + [
+        {
+            "source_len": 10,
+            "target_len": 8,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 6,
+            "attention_matching_query_seed": 202,
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 16, 17],
+                completion_ids=[20, 21, 22, 23, 24],
+                completion_logprobs=[-0.1, -0.2, -0.3, -0.4, -0.5],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=8,
+                            target_len=6,
+                            num_prompt_tokens=8,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    16,
+                    17,
+                    20,
+                    21,
+                    22,
+                    23,
+                    24,
+                    60,
+                    61,
+                ],
+                completion_ids=[70],
+                completion_logprobs=[-0.6],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=15,
+                            target_len=11,
+                            num_prompt_tokens=15,
+                            tokens_evicted=4,
+                            position_offset_after=4,
+                            replay_steps=second_replay,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.completion_ids == [20, 21, 22, 23, 24, 60, 61, 70]
+    assert rollout.completion_mask == [
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+        False,
+        True,
+    ]
+    assert rollout.compaction_events is not None
+    assert len(rollout.compaction_events) == 2
+    second_event = rollout.compaction_events[1]
+    assert second_event.num_output_tokens_at_compaction == 7
+    assert second_event.num_prompt_tokens == 8
+    assert second_event.source_len == 13
+    assert second_event.target_len == 11
+    assert second_event.tokens_evicted == 2
+    assert second_event.position_offset_after == 4
+    assert second_event.attention_matching_pre_sample
+    assert second_event.attention_matching_query_seed == 202
+    assert second_event.attention_matching_replay_steps == second_replay[1:]
+
+
+def test_interleave_rollout_stateful_am_splits_behind_replay_boundaries():
+    first_replay = [
+        {
+            "source_len": 8,
+            "target_len": 6,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 4,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    second_replay = first_replay + [
+        {
+            "source_len": 10,
+            "target_len": 8,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 6,
+            "attention_matching_query_seed": 202,
+        },
+        {
+            "source_len": 12,
+            "target_len": 10,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 8,
+            "attention_matching_query_seed": 303,
+        },
+    ]
+    first_prompt = [10, 11, 12, 13, 14, 15, 16, 17]
+    first_completion = [20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=first_prompt,
+                completion_ids=first_completion,
+                completion_logprobs=[-0.1] * len(first_completion),
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=8,
+                            target_len=6,
+                            num_prompt_tokens=8,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=first_prompt + first_completion + [60, 61],
+                completion_ids=[70],
+                completion_logprobs=[-0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=20,
+                            target_len=14,
+                            num_prompt_tokens=20,
+                            tokens_evicted=6,
+                            position_offset_after=6,
+                            replay_steps=second_replay,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.completion_ids == first_completion + [60, 61, 70]
+    assert rollout.completion_mask == [True] * len(first_completion) + [
+        False,
+        False,
+        True,
+    ]
+    assert rollout.compaction_events is not None
+    assert [e.num_output_tokens_at_compaction for e in rollout.compaction_events] == [
+        0,
+        12,
+    ]
+    assert [
+        e.attention_matching_query_seed for e in rollout.compaction_events
+    ] == [101, 303]
+    assert rollout.compaction_events[1].attention_matching_replay_steps == second_replay[1:]
+    assert all(e.attention_matching_pre_sample for e in rollout.compaction_events)
+
+
+def test_interleave_rollout_can_disable_stateful_am_trace(monkeypatch):
+    monkeypatch.setenv("KVE_DISABLE_STATEFUL_AM_TRACE", "1")
+    replay = [
+        {
+            "source_len": 8,
+            "target_len": 6,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 4,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 16, 17],
+                completion_ids=[20, 21],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=8,
+                            target_len=6,
+                            num_prompt_tokens=8,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=replay,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 60, 61],
+                completion_ids=[70],
+                completion_logprobs=[-0.3],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=12,
+                            target_len=10,
+                            num_prompt_tokens=12,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=replay,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 2
+    assert [r.completion_ids[-1] for r in rollouts] == [21, 70]
+
+
+def test_interleave_rollout_coalesces_standalone_deep_am_prompt_replay():
+    replay_steps = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+        },
+        {
+            "source_len": 8,
+            "target_len": 6,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 4,
+            "attention_matching_query_seed": 202,
+        },
+        {
+            "source_len": 10,
+            "target_len": 8,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 6,
+            "attention_matching_query_seed": 303,
+        },
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 20, 21, 30, 31, 40, 41],
+                completion_ids=[50, 51],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=12,
+                            target_len=8,
+                            num_prompt_tokens=12,
+                            tokens_evicted=4,
+                            position_offset_after=4,
+                            replay_steps=replay_steps,
+                            cache_hit_tokens=0,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.prompt_ids == [10, 11, 12, 13, 14, 15, 20, 21, 30, 31, 40, 41]
+    assert rollout.completion_ids == [50, 51]
+    assert rollout.completion_mask == [True, True]
+    assert rollout.compaction_events is not None
+    assert len(rollout.compaction_events) == 1
+    event = rollout.compaction_events[0]
+    assert event.num_output_tokens_at_compaction == 0
+    assert event.source_len == 12
+    assert event.target_len == 6
+    assert event.attention_matching_query_seed == 303
+    assert event.attention_matching_replay_steps == replay_steps
+    assert event.attention_matching_cache_hit_tokens == 0
+
+
+def test_interleave_rollout_coalesces_standalone_cache_hit_am_prompt_replay():
+    replay_steps = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+        },
+        {
+            "source_len": 8,
+            "target_len": 6,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 4,
+            "attention_matching_query_seed": 202,
+        },
+        {
+            "source_len": 10,
+            "target_len": 8,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 6,
+            "attention_matching_query_seed": 303,
+        },
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 20, 21, 30, 31, 40, 41],
+                completion_ids=[50, 51],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=12,
+                            target_len=8,
+                            num_prompt_tokens=12,
+                            tokens_evicted=4,
+                            position_offset_after=4,
+                            replay_steps=replay_steps,
+                            cache_hit_tokens=4,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.prompt_ids == [10, 11, 12, 13, 14, 15, 20, 21, 30, 31, 40, 41]
+    assert rollout.completion_ids == [50, 51]
+    assert rollout.completion_mask == [True, True]
+    assert rollout.compaction_events is not None
+    assert len(rollout.compaction_events) == 1
+    event = rollout.compaction_events[0]
+    assert event.num_output_tokens_at_compaction == 0
+    assert event.source_len == 12
+    assert event.target_len == 6
+    assert event.attention_matching_replay_steps == replay_steps
+    assert event.attention_matching_cache_hit_tokens == 4
+
+
+def test_interleave_rollout_stateful_am_keeps_new_prompt_block_padding():
+    pad = 151643
+    first_replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21, 30],
+                completion_logprobs=[-0.1, -0.2, -0.3],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15, 20, 21, 30, pad, 40, 41],
+                completion_ids=[50],
+                completion_logprobs=[-0.4],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=12,
+                            target_len=10,
+                            num_prompt_tokens=12,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=first_replay,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.completion_ids == [20, 21, 30, pad, 40, 41, 50]
+    assert rollout.completion_mask == [True, True, True, False, False, False, True]
+    assert rollout.completion_logprobs == [-0.1, -0.2, -0.3, 0.0, 0.0, 0.0, -0.4]
+
+
+def test_interleave_rollout_replays_am_hidden_tail_once_across_turns():
+    hidden_tail = [151645, 151643, 151643]
+    replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=replay,
+                            hidden_tail_token_ids=hidden_tail,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    20,
+                    21,
+                    *hidden_tail,
+                    30,
+                    31,
+                ],
+                completion_ids=[40],
+                completion_logprobs=[-0.3],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=11,
+                            target_len=9,
+                            num_prompt_tokens=11,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=replay,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.completion_ids == [20, 21, *hidden_tail, 30, 31, 40]
+    assert rollout.completion_mask == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert rollout.completion_logprobs == [-0.1, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0, -0.3]
+
+
+def test_interleave_rollout_merges_stateful_am_when_hidden_tail_is_not_visible():
+    hidden_tail = [151645, 198, 151643, 151643]
+    replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21],
+                completion_logprobs=[-0.1, -0.2],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=replay,
+                            hidden_tail_token_ids=hidden_tail,
+                        )
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    20,
+                    21,
+                    151644,
+                    872,
+                    271,
+                ],
+                completion_ids=[40],
+                completion_logprobs=[-0.3],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=11,
+                            target_len=9,
+                            num_prompt_tokens=11,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=replay,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.completion_ids == [20, 21, *hidden_tail, 151644, 872, 271, 40]
+    assert rollout.completion_mask == [
+        True,
+        True,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert rollout.completion_logprobs == [
+        -0.1,
+        -0.2,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -0.3,
+    ]
+
+
+def test_interleave_rollout_mixed_prompt_and_decode_am_produces_next_state():
+    hidden_tail = [151645, 198, 151643, 151643]
+    prompt_replay = [
+        {
+            "source_len": 6,
+            "target_len": 4,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 2,
+            "attention_matching_query_seed": 101,
+        }
+    ]
+    decode_replay = [
+        {
+            "source_len": 8,
+            "target_len": 6,
+            "protected_prefix_len": 1,
+            "synthetic_prefix_len": 1,
+            "exact_kept_tokens": 4,
+            "attention_matching_query_seed": 202,
+        }
+    ]
+    full_replay = prompt_replay + decode_replay
+    decode_event = _am_prompt_event(
+        source_len=8,
+        target_len=6,
+        num_prompt_tokens=6,
+        tokens_evicted=2,
+        position_offset_after=4,
+        replay_steps=decode_replay,
+        cache_hit_tokens=0,
+        hidden_tail_token_ids=hidden_tail,
+    )
+    decode_event["num_output_tokens_at_compaction"] = 2
+    output = vf.RolloutOutput(
+        example_id=0,
+        trajectory=[
+            _trajectory_step(
+                prompt_ids=[10, 11, 12, 13, 14, 15],
+                completion_ids=[20, 21, 22, 23],
+                completion_logprobs=[-0.1, -0.2, -0.3, -0.4],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=6,
+                            target_len=4,
+                            num_prompt_tokens=6,
+                            tokens_evicted=2,
+                            position_offset_after=2,
+                            replay_steps=prompt_replay,
+                        ),
+                        decode_event,
+                    ]
+                },
+                trajectory_id="1",
+            ),
+            _trajectory_step(
+                prompt_ids=[
+                    10,
+                    11,
+                    12,
+                    13,
+                    14,
+                    15,
+                    20,
+                    21,
+                    22,
+                    23,
+                    151644,
+                    872,
+                ],
+                completion_ids=[40],
+                completion_logprobs=[-0.5],
+                extras={
+                    "compaction_events": [
+                        _am_prompt_event(
+                            source_len=12,
+                            target_len=8,
+                            num_prompt_tokens=12,
+                            tokens_evicted=4,
+                            position_offset_after=4,
+                            replay_steps=full_replay,
+                            cache_hit_tokens=6,
+                        )
+                    ]
+                },
+                trajectory_id="2",
+            ),
+        ],
+        sampling_args={"temperature": 1.0},
+        error=None,
+    )
+
+    rollouts = interleave_rollout(output)
+
+    assert rollouts is not None
+    assert len(rollouts) == 1
+    rollout = rollouts[0]
+    assert rollout.completion_ids == [
+        20,
+        21,
+        22,
+        23,
+        *hidden_tail,
+        151644,
+        872,
+        40,
+    ]
+    assert rollout.compaction_events is not None
+    assert [event.num_output_tokens_at_compaction for event in rollout.compaction_events] == [
+        0,
+        2,
+    ]
+    assert [
+        len(event.attention_matching_replay_steps or [])
+        for event in rollout.compaction_events
+    ] == [1, 1]
+
+
 def test_interleave_rollout_multi_step_trajectory_with_tool_calls(multi_step_trajectory_with_tool_calls_output):
     rollouts = interleave_rollout(multi_step_trajectory_with_tool_calls_output)
     assert rollouts is not None

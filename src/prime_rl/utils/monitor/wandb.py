@@ -61,7 +61,7 @@ class WandbMonitor(Monitor):
                 "This is an experimental feature. Disable with --wandb.shared False"
             )
         else:
-            run_id = None
+            run_id = config.id
             primary = False
             settings = wandb.Settings(
                 mode="offline" if config.offline else "online",
@@ -74,6 +74,7 @@ class WandbMonitor(Monitor):
                         id=run_id,
                         project=config.project,
                         name=config.name,
+                        group=config.group,
                         dir=output_dir,
                         config=run_config.model_dump() if run_config else None,
                         settings=settings,

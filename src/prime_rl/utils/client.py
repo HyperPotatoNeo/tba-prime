@@ -228,7 +228,7 @@ async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
     logger.info("Pausing inference engines for weight update")
 
     async def _pause(client: AsyncClient) -> None:
-        response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
+        response = await client.post("/pause", params={"mode": "wait", "clear_cache": "true"})
         response.raise_for_status()
 
     await asyncio.gather(*[_pause(client) for client in admin_clients])
@@ -271,7 +271,10 @@ async def update_weights(
     else:
 
         async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
-            response = await admin_client.post("/update_weights", json={"weight_dir": weight_dir})
+            response = await admin_client.post(
+                "/update_weights",
+                json={"weight_dir": weight_dir, "step": step},
+            )
             response.raise_for_status()
 
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast

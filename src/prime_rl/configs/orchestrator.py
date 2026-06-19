@@ -87,6 +87,21 @@ class TrainSamplingConfig(BaseConfig):
         ),
     ] = 1.0
 
+    top_p: Annotated[
+        float,
+        Field(gt=0.0, le=1.0, description="Nucleus sampling threshold for training rollouts."),
+    ] = 1.0
+
+    top_k: Annotated[
+        int | None,
+        Field(description="Top-k sampling forwarded through vLLM extra_body. None uses the server default."),
+    ] = None
+
+    min_p: Annotated[
+        float | None,
+        Field(ge=0, description="Min-p sampling forwarded through vLLM extra_body. None uses the server default."),
+    ] = None
+
     max_completion_tokens: Annotated[
         int | None,
         Field(
@@ -124,7 +139,7 @@ class TrainSamplingConfig(BaseConfig):
         # Top-level OAI params
         args: dict[str, Any] = {
             "temperature": self.temperature,
-            "top_p": 1.0,
+            "top_p": self.top_p,
             "logprobs": True,
         }
         if self.max_completion_tokens is not None:
@@ -134,6 +149,10 @@ class TrainSamplingConfig(BaseConfig):
 
         # vLLM extra_body params
         extra_body = dict(self.extra_body)
+        if self.top_k is not None:
+            extra_body["top_k"] = self.top_k
+        if self.min_p is not None:
+            extra_body["min_p"] = self.min_p
         if self.min_tokens > 0:
             extra_body["min_tokens"] = self.min_tokens
         if self.repetition_penalty != 1.0:
@@ -782,6 +801,126 @@ class TeacherRolloutModelConfig(BaseConfig):
     ] = ModelConfig()
 
 
+class CompactionPaddingConfig(BaseConfig):
+    """Client-side prompt-token override used by block-level KV eviction.
+
+    When enabled, kv_eviction renders chat messages into a block-aligned
+    token stream and sends those ids to the vLLM fork via extra_body. This is
+    intentionally separate from Markovian Thinker, which rewrites messages
+    rather than padding them.
+    """
+
+    enabled: Annotated[
+        bool,
+        Field(description="Enable block-aligned message padding for KV eviction."),
+    ] = False
+
+    block_size: Annotated[
+        int,
+        Field(ge=1, description="PagedAttention block size used by vLLM."),
+    ] = 16
+
+    filler_token_id: Annotated[
+        int | None,
+        Field(description="Optional filler token id. If unset, derive from tokenizer."),
+    ] = None
+
+    im_end_token_id: Annotated[
+        int | None,
+        Field(description="Optional <|im_end|> token id. If unset, derive from tokenizer."),
+    ] = None
+
+    log_evicted_text: Annotated[
+        bool,
+        Field(description="Debug-only placeholder for logging text removed by turn eviction."),
+    ] = False
+
+
+class MarkovianSummaryConfig(BaseConfig):
+    """Optional summary exchange inserted when Markovian turn windows overflow."""
+
+    enabled: Annotated[
+        bool,
+        Field(description="Enable summary generation when the Markovian trigger fires."),
+    ] = False
+
+    mode: Annotated[
+        Literal["markovian", "eviction"],
+        Field(description="Summary splice mode: client-side reset or append-only eviction mode."),
+    ] = "markovian"
+
+    compaction_max_turns: Annotated[
+        int,
+        Field(ge=0, description="Number of real turn groups before a summary is generated."),
+    ] = 0
+
+    max_len_summary: Annotated[
+        int,
+        Field(ge=16, description="Maximum summary completion length."),
+    ] = 512
+
+    instruction_text: Annotated[
+        str,
+        Field(description="Instruction appended to request the summary."),
+    ] = "Please summarize everything important for the task."
+
+    resume_text: Annotated[
+        str,
+        Field(description="Optional user message appended after a markovian summary."),
+    ] = ""
+
+    temperature: Annotated[
+        float,
+        Field(ge=0.0, le=2.0, description="Sampling temperature for summaries."),
+    ] = 0.3
+
+    top_p: Annotated[
+        float,
+        Field(gt=0.0, le=1.0, description="Nucleus sampling threshold for summaries."),
+    ] = 0.95
+
+    on_error: Annotated[
+        Literal["drop", "raise"],
+        Field(description="Fallback behavior when summary generation fails."),
+    ] = "drop"
+
+    log_summaries: Annotated[
+        bool,
+        Field(description="Log generated summaries for debugging."),
+    ] = False
+
+
+class MarkovianThinkerConfig(BaseConfig):
+    """Client-side message truncation baseline for multi-turn RL.
+
+    vLLM sees a normal chat completion over the retained message window. No
+    vLLM KV eviction or trainer segmented-forward replay is used in the plain
+    Markovian mode.
+    """
+
+    enabled: Annotated[
+        bool,
+        Field(description="Enable Markovian Thinker client-side message truncation."),
+    ] = False
+
+    max_turns: Annotated[
+        int,
+        Field(ge=1, description="Maximum complete turn groups to retain."),
+    ] = 6
+
+    stride: Annotated[
+        int | None,
+        Field(ge=1, description="Number of recent turn groups to retain after a trigger."),
+    ] = None
+
+    log_truncated_messages: Annotated[
+        bool,
+        Field(description="Log one line each time Markovian drops old messages."),
+    ] = False
+
+    summary: MarkovianSummaryConfig = MarkovianSummaryConfig()
+
+
 class OrchestratorConfig(BaseConfig):
     """Configures the orchestrator for RL training."""
 
@@ -817,6 +956,10 @@ class OrchestratorConfig(BaseConfig):
             ),
         ),
     ] = None
+
+    compaction_padding: CompactionPaddingConfig = CompactionPaddingConfig()
+
+    markovian_thinker: MarkovianThinkerConfig = MarkovianThinkerConfig()
 
     # The evaluation configuration
     eval: EvalConfig | None = None

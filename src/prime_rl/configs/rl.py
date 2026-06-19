@@ -68,6 +68,10 @@ class SharedWandbConfig(BaseConfig):
 
     name: Annotated[str | None, Field(description="The W&B run name to use.")] = None
 
+    id: Annotated[str | None, Field(description="Optional stable W&B run id.")] = None
+
+    group: Annotated[str | None, Field(description="Optional W&B group name.")] = None
+
     offline: Annotated[bool | None, Field(description="Whether to run W&B in offline mode.")] = False
 
     shared: Annotated[
@@ -404,6 +408,26 @@ class RLConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_default_rl_has_advantage_signal(self):
+        if (
+            self.max_steps > 1
+            and self.trainer.loss.type == "default"
+            and self.trainer.loss.adv_tau > 0
+            and self.trainer.loss.teacher_tau == 0
+            and self.trainer.loss.kl_tau == 0
+            and self.orchestrator.advantage is not None
+            and self.orchestrator.advantage.type == "default"
+            and self.orchestrator.rollouts_per_example <= 1
+        ):
+            raise ValueError(
+                "Default GRPO with rollouts_per_example <= 1 produces exactly zero advantages "
+                "when using the default per-problem baseline. With teacher_tau = 0 and kl_tau = 0, "
+                "this gives zero loss and zero gradients. Increase orchestrator.rollouts_per_example "
+                "or enable another nonzero loss term."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_external_rollout_mode(self):
         if self.orchestrator.teacher_rollout_model is None:
             return self
@@ -422,6 +446,163 @@ class RLConfig(BaseConfig):
                 "orchestrator.use_token_client must be false when orchestrator.teacher_rollout_model is configured."
             )
 
+        return self
+
+    @staticmethod
+    def _vllm_compaction_knobs(vllm_extra: dict | None) -> tuple[int, int]:
+        vllm_extra = vllm_extra or {}
+        return (
+            int(vllm_extra.get("compaction_window_size", 0) or 0),
+            int(vllm_extra.get("compaction_max_turns", 0) or 0),
+        )
+
+    @model_validator(mode="after")
+    def validate_markovian_thinker(self):
+        """Markovian Thinker rewrites chat messages before inference.
+
+        Plain Markovian samples have no KV eviction events, so the vLLM
+        compaction path, block-aligned padding, and token-in-token-out client
+        must be disabled. Summary eviction mode is the one exception: it
+        deliberately combines Markovian summaries with vLLM-side eviction for
+        the summary request.
+        """
+        mt = self.orchestrator.markovian_thinker
+        if mt.stride is not None and mt.stride > mt.max_turns:
+            raise ValueError(
+                f"orchestrator.markovian_thinker.stride={mt.stride} must be <= max_turns={mt.max_turns}"
+            )
+        if not mt.enabled:
+            return self
+
+        summary_eviction = mt.summary.enabled and mt.summary.mode == "eviction"
+
+        if self.inference is not None:
+            inf_window, inf_max_turns = self._vllm_compaction_knobs(
+                self.inference.vllm_extra
+            )
+            if not summary_eviction:
+                if inf_window > 0:
+                    raise ValueError(
+                        "orchestrator.markovian_thinker.enabled=true is incompatible "
+                        f"with inference.vllm_extra.compaction_window_size={inf_window}. "
+                        "Markovian Thinker performs client-side truncation; vLLM-side "
+                        "compaction must be disabled."
+                    )
+                if inf_max_turns > 0:
+                    raise ValueError(
+                        "orchestrator.markovian_thinker.enabled=true is incompatible "
+                        f"with inference.vllm_extra.compaction_max_turns={inf_max_turns}. "
+                        "Markovian Thinker performs client-side truncation; vLLM-side "
+                        "compaction must be disabled."
+                    )
+
+        if self.trainer.compaction.window_size > 0 and not summary_eviction:
+            raise ValueError(
+                "orchestrator.markovian_thinker.enabled=true is incompatible "
+                "with trainer.compaction.window_size > 0. Plain Markovian "
+                "samples have no CompactionEvents; use the standard full-context forward."
+            )
+
+        if self.orchestrator.compaction_padding.enabled and not summary_eviction:
+            raise ValueError(
+                "orchestrator.markovian_thinker.enabled=true is incompatible "
+                "with orchestrator.compaction_padding.enabled=true. Markovian "
+                "rewrites messages and stashes its own prompt_token_ids."
+            )
+
+        if self.orchestrator.use_token_client:
+            raise ValueError(
+                "orchestrator.markovian_thinker.enabled=true requires "
+                "use_token_client=false. TITO assumes the prompt extension "
+                "property across turns, which client-side truncation breaks."
+            )
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_markovian_summary(self):
+        mt = self.orchestrator.markovian_thinker
+        summary = mt.summary
+        if not summary.enabled:
+            return self
+
+        if not mt.enabled:
+            raise ValueError(
+                "orchestrator.markovian_thinker.summary.enabled=true requires "
+                "orchestrator.markovian_thinker.enabled=true"
+            )
+
+        if summary.compaction_max_turns <= 0:
+            raise ValueError(
+                "orchestrator.markovian_thinker.summary.compaction_max_turns "
+                "must be > 0 when summaries are enabled"
+            )
+
+        if self.orchestrator.teacher_rollout_model is not None:
+            raise ValueError(
+                "orchestrator.markovian_thinker.summary is incompatible with "
+                "orchestrator.teacher_rollout_model"
+            )
+
+        if self.inference is not None and self.inference.model.max_model_len is not None:
+            max_allowed = int(self.inference.model.max_model_len) + 2048
+            if summary.max_len_summary > max_allowed:
+                raise ValueError(
+                    "orchestrator.markovian_thinker.summary.max_len_summary "
+                    f"({summary.max_len_summary}) must be <= inference.model.max_model_len + 2048 ({max_allowed})"
+                )
+
+        inf_window = inf_max_turns = 0
+        if self.inference is not None:
+            inf_window, inf_max_turns = self._vllm_compaction_knobs(
+                self.inference.vllm_extra
+            )
+
+        if summary.mode == "markovian":
+            if inf_window > 0:
+                raise ValueError(
+                    "markovian summary mode is incompatible with "
+                    f"inference.vllm_extra.compaction_window_size={inf_window}"
+                )
+            if inf_max_turns > 0:
+                raise ValueError(
+                    "markovian summary mode is incompatible with "
+                    f"inference.vllm_extra.compaction_max_turns={inf_max_turns}"
+                )
+        elif summary.mode == "eviction":
+            if inf_window <= 0 and inf_max_turns <= 0:
+                raise ValueError(
+                    "eviction summary mode requires inference.vllm_extra."
+                    "compaction_window_size > 0 or compaction_max_turns > 0"
+                )
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_compaction_padding(self):
+        padding = self.orchestrator.compaction_padding
+        if not padding.enabled:
+            return self
+
+        if self.trainer.compaction.window_size > 0:
+            if padding.block_size != self.trainer.compaction.block_size:
+                raise ValueError(
+                    "orchestrator.compaction_padding.block_size must match "
+                    "trainer.compaction.block_size"
+                )
+
+        if self.inference is None:
+            # External/manual inference server: the RL config cannot inspect
+            # vLLM's block_size, so only trainer-side consistency is checked.
+            return self
+
+        vllm_extra = self.inference.vllm_extra or {}
+        inf_block_size = int(vllm_extra.get("block_size", 16) or 16)
+        if padding.block_size != inf_block_size:
+            raise ValueError(
+                "orchestrator.compaction_padding.block_size must match "
+                "inference.vllm_extra.block_size"
+            )
         return self
 
     @model_validator(mode="after")
@@ -457,16 +638,39 @@ class RLConfig(BaseConfig):
         inf_window = int(vllm_extra.get("compaction_window_size", 0) or 0)
         inf_stride = int(vllm_extra.get("compaction_stride", 0) or 0)
         inf_block_size = int(vllm_extra.get("block_size", 16) or 16)
+        inf_strategy = str(vllm_extra.get("compaction_strategy", "fifo") or "fifo")
+        inf_am_query_source = str(
+            vllm_extra.get("attention_matching_query_source", "random_queries")
+            or "random_queries"
+        )
+        inf_am_max_queries = int(
+            vllm_extra.get("attention_matching_max_queries_per_kv_head", 128)
+            or 128
+        )
+        inf_am_zerobeta = bool(vllm_extra.get("attention_matching_zerobeta", False))
+        inf_am_forget_gate_enabled = bool(
+            vllm_extra.get("attention_matching_forget_gate_enabled", False)
+        )
+        inf_am_forget_gate_alpha = float(
+            vllm_extra.get("attention_matching_forget_gate_alpha", 0.5)
+        )
+        inf_attention_backend = str(vllm_extra.get("attention_backend", "") or "")
+        inf_logprobs_mode = vllm_extra.get("logprobs_mode")
 
         tr_window = self.trainer.compaction.window_size
         tr_stride = self.trainer.compaction.stride
         tr_block_size = self.trainer.compaction.block_size
+        tr_strategy = self.trainer.compaction.strategy
 
         compaction_in_use = tr_window > 0 or inf_window > 0
         if not compaction_in_use:
             return self
 
         mismatches: list[str] = []
+        if tr_strategy != inf_strategy:
+            mismatches.append(
+                f"strategy: trainer={tr_strategy}, inference.vllm_extra.compaction_strategy={inf_strategy}"
+            )
         if tr_window != inf_window:
             mismatches.append(
                 f"window_size: trainer={tr_window}, inference.vllm_extra.compaction_window_size={inf_window}"
@@ -480,6 +684,90 @@ class RLConfig(BaseConfig):
                 f"block_size: trainer={tr_block_size}, inference.vllm_extra.block_size={inf_block_size} "
                 "(vLLM default is 16)"
             )
+        if inf_strategy == "attention_matching":
+            if inf_logprobs_mode != "raw_logprobs":
+                mismatches.append(
+                    "logprobs_mode: attention_matching RL compares trainer "
+                    "model logprobs against vLLM inference model logprobs, "
+                    "so inference.vllm_extra.logprobs_mode must be "
+                    f"'raw_logprobs'. Got {inf_logprobs_mode!r}. PrimeRL's "
+                    "inference wrapper otherwise defaults vLLM to "
+                    "'processed_logprobs', which includes sampling-processor "
+                    "renormalization and inflates mismatch KL."
+                )
+            if not inf_am_zerobeta or not self.trainer.compaction.attention_matching_zerobeta:
+                mismatches.append(
+                    "attention_matching_zerobeta: full-beta AM is not yet a faithful RL "
+                    "configuration because trainer replay cannot apply vLLM's per-layer "
+                    "score_mod beta biases. Set both inference.vllm_extra."
+                    "attention_matching_zerobeta=true and trainer.compaction."
+                    "attention_matching_zerobeta=true, or implement the custom trainer "
+                    "attention path documented in plans/attention_matching_continuous_batching.md."
+                )
+            if inf_am_zerobeta and inf_attention_backend:
+                normalized_backend = inf_attention_backend.upper()
+                if normalized_backend != "FLASH_ATTN":
+                    mismatches.append(
+                        "attention_backend: zero-beta attention_matching RL "
+                        "requires inference.vllm_extra.attention_backend="
+                        "'FLASH_ATTN' so vLLM numerics match the trainer's "
+                        "flash_attention_2 segmented replay. Got "
+                        f"{inf_attention_backend!r}. FLEX_ATTENTION is only "
+                        "appropriate for unsupported full-beta score_mod AM, "
+                        "which this trainer path rejects."
+                    )
+            if (
+                self.trainer.compaction.attention_matching_query_source
+                != inf_am_query_source
+            ):
+                mismatches.append(
+                    "attention_matching_query_source: "
+                    f"trainer={self.trainer.compaction.attention_matching_query_source}, "
+                    f"inference={inf_am_query_source}"
+                )
+            if (
+                self.trainer.compaction.attention_matching_max_queries_per_kv_head
+                != inf_am_max_queries
+            ):
+                mismatches.append(
+                    "attention_matching_max_queries_per_kv_head: "
+                    f"trainer={self.trainer.compaction.attention_matching_max_queries_per_kv_head}, "
+                    f"inference={inf_am_max_queries}"
+                )
+            if (
+                self.trainer.compaction.attention_matching_forget_gate_enabled
+                != inf_am_forget_gate_enabled
+            ):
+                mismatches.append(
+                    "attention_matching_forget_gate_enabled: "
+                    f"trainer={self.trainer.compaction.attention_matching_forget_gate_enabled}, "
+                    f"inference={inf_am_forget_gate_enabled}"
+                )
+            if (
+                self.trainer.compaction.attention_matching_forget_gate_enabled
+                and abs(
+                    self.trainer.compaction.attention_matching_forget_gate_alpha
+                    - inf_am_forget_gate_alpha
+                )
+                > 1e-12
+            ):
+                mismatches.append(
+                    "attention_matching_forget_gate_alpha: "
+                    f"trainer={self.trainer.compaction.attention_matching_forget_gate_alpha}, "
+                    f"inference={inf_am_forget_gate_alpha}"
+                )
+            if (
+                self.trainer.compaction.attention_matching_gradient_mode == "detached"
+                and self.trainer.compaction.bptt_segments != 1
+            ):
+                mismatches.append(
+                    "attention_matching with trainer.compaction."
+                    "attention_matching_gradient_mode='detached' requires "
+                    "trainer.compaction.bptt_segments=1. For RNN-style "
+                    "BPTT through AM compaction, set attention_matching_"
+                    "gradient_mode='straight_through' and choose "
+                    "bptt_segments='full' or a finite K."
+                )
 
         if mismatches:
             joined = "\n  - ".join(mismatches)
@@ -576,6 +864,13 @@ class RLConfig(BaseConfig):
                 if self.wandb.name:
                     self.trainer.wandb.name = f"{self.wandb.name}-trainer"
                     self.orchestrator.wandb.name = f"{self.wandb.name}-orchestrator"
+
+            if self.wandb.id:
+                self.trainer.wandb.id = self.wandb.id
+                self.orchestrator.wandb.id = self.wandb.id
+            if self.wandb.group:
+                self.trainer.wandb.group = self.wandb.group
+                self.orchestrator.wandb.group = self.wandb.group
 
             if self.wandb.offline:
                 self.trainer.wandb.offline = self.wandb.offline

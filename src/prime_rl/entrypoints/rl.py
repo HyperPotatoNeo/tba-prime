@@ -144,7 +144,9 @@ def rl_local(config: RLConfig):
     wandb_shared_env: dict[str, str] = {}
     if config.wandb and config.wandb.shared:
         wandb_shared_env["WANDB_SHARED_MODE"] = "1"
-        wandb_shared_env["WANDB_SHARED_RUN_ID"] = os.environ.get("WANDB_SHARED_RUN_ID", uuid.uuid4().hex)
+        wandb_shared_env["WANDB_SHARED_RUN_ID"] = os.environ.get(
+            "WANDB_SHARED_RUN_ID", config.wandb.id or uuid.uuid4().hex
+        )
 
     # Check for existing processes on GPUs
     all_gpu_ids = list(set(infer_gpu_ids + trainer_gpu_ids + teacher_gpu_ids))
@@ -301,16 +303,19 @@ def rl_local(config: RLConfig):
 
         # Start training process
         trainer_cmd = [
-            "torchrun",
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
             "--role=trainer",
-            f"--rdzv-endpoint=localhost:{get_free_port()}",
-            f"--rdzv-id={uuid.uuid4().hex}",
+            f"--rdzv_endpoint=localhost:{get_free_port()}",
+            f"--rdzv_id={uuid.uuid4().hex}",
             # Pipe all logs to file, and only master rank logs to stdout
-            f"--log-dir={log_dir / 'trainer' / 'torchrun'}",
-            f"--local-ranks-filter={','.join(map(str, config.trainer.log.ranks_filter))}",
-            "--redirect=3",
-            "--tee=3",
-            f"--nproc-per-node={len(trainer_gpu_ids)}",
+            f"--log_dir={log_dir / 'trainer' / 'torchrun'}",
+            "-r",
+            "3",
+            "-t",
+            "3",
+            f"--nproc_per_node={len(trainer_gpu_ids)}",
             "-m",
             "prime_rl.trainer.rl.train",
             "@",

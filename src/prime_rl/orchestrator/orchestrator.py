@@ -139,6 +139,83 @@ async def orchestrate(config: OrchestratorConfig):
     logger.info(f"Initializing tokenizer for {config.model.name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
 
+    if config.compaction_padding.enabled:
+        from kv_eviction.env import configure_message_padding
+        from kv_eviction.padding import resolve_filler_token_id, resolve_im_end_token_id
+
+        filler_token_id = resolve_filler_token_id(
+            tokenizer, override=config.compaction_padding.filler_token_id
+        )
+        im_end_token_id = (
+            config.compaction_padding.im_end_token_id
+            if config.compaction_padding.im_end_token_id is not None
+            else resolve_im_end_token_id(tokenizer)
+        )
+        configure_message_padding(
+            enabled=True,
+            tokenizer=tokenizer,
+            block_size=config.compaction_padding.block_size,
+            filler_token_id=filler_token_id,
+            im_end_token_id=im_end_token_id,
+            max_prompt_len=config.seq_len,
+        )
+        os.environ["KV_EVICTION_PADDING_MODEL"] = config.model.name
+        os.environ["KV_EVICTION_PADDING_BLOCK_SIZE"] = str(config.compaction_padding.block_size)
+        os.environ["KV_EVICTION_PADDING_FILLER_ID"] = str(filler_token_id)
+        os.environ["KV_EVICTION_PADDING_IM_END_ID"] = str(im_end_token_id)
+        os.environ["KV_EVICTION_PADDING_MAX_PROMPT_LEN"] = str(config.seq_len)
+
+    if config.markovian_thinker.enabled:
+        from kv_eviction.env import configure_markovian_summary, configure_markovian_thinker
+
+        configure_markovian_thinker(
+            enabled=True,
+            tokenizer=tokenizer,
+            max_turns=config.markovian_thinker.max_turns,
+            stride=config.markovian_thinker.stride,
+            log_truncated_messages=config.markovian_thinker.log_truncated_messages,
+        )
+        os.environ["KV_EVICTION_MARKOVIAN_ENABLED"] = "1"
+        os.environ["KV_EVICTION_MARKOVIAN_MODEL"] = config.model.name
+        os.environ["KV_EVICTION_MARKOVIAN_MAX_TURNS"] = str(config.markovian_thinker.max_turns)
+        if config.markovian_thinker.stride is not None:
+            os.environ["KV_EVICTION_MARKOVIAN_STRIDE"] = str(config.markovian_thinker.stride)
+        if config.markovian_thinker.log_truncated_messages:
+            os.environ["KV_EVICTION_MARKOVIAN_LOG_TRUNCATED"] = "1"
+
+        if config.markovian_thinker.summary.enabled:
+            summary = config.markovian_thinker.summary
+            configure_markovian_summary(
+                enabled=True,
+                mode=summary.mode,
+                compaction_max_turns=summary.compaction_max_turns,
+                max_len_summary=summary.max_len_summary,
+                instruction_text=summary.instruction_text,
+                resume_text=summary.resume_text,
+                temperature=summary.temperature,
+                top_p=summary.top_p,
+                on_error=summary.on_error,
+                log_summaries=summary.log_summaries,
+            )
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ENABLED"] = "1"
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MODE"] = summary.mode
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MAX_TURNS"] = str(summary.compaction_max_turns)
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_MAX_LEN"] = str(summary.max_len_summary)
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_INSTRUCTION"] = summary.instruction_text
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_RESUME"] = summary.resume_text
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_TEMPERATURE"] = str(summary.temperature)
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_TOP_P"] = str(summary.top_p)
+            os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_ON_ERROR"] = summary.on_error
+            if summary.log_summaries:
+                os.environ["KV_EVICTION_MARKOVIAN_SUMMARY_LOG"] = "1"
+
+        logger.info(
+            "Markovian Thinker enabled (max_turns=%s, stride=%s, summary=%s)",
+            config.markovian_thinker.max_turns,
+            config.markovian_thinker.stride,
+            config.markovian_thinker.summary.enabled,
+        )
+
     processor = None
     if is_vlm:
         logger.info(f"Loading VLM processor for {config.model.name}")

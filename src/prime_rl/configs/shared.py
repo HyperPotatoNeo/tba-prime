@@ -354,6 +354,16 @@ class WandbConfig(BaseConfig):
         ),
     ] = None
 
+    id: Annotated[
+        str | None,
+        Field(description="Optional stable W&B run id."),
+    ] = None
+
+    group: Annotated[
+        str | None,
+        Field(description="Optional W&B group name."),
+    ] = None
+
     offline: Annotated[bool, Field(description="Whether to run W&B in offline mode.")] = False
 
 
