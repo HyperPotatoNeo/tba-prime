@@ -4,14 +4,14 @@
 #SBATCH --job-name=rgmix-warmup
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:4
 #SBATCH --exclusive
-#SBATCH --partition=h100
+#SBATCH --partition=gb200
 #SBATCH --account=reasoning
 #SBATCH --qos=priority-reasoning
 #SBATCH --time=06:00:00
-#SBATCH --output=/mnt/vast/home/siddarth.venkatraman/rgmix_runs/logs/warmup_%j.log
-#SBATCH --error=/mnt/vast/home/siddarth.venkatraman/rgmix_runs/logs/warmup_%j.log
+#SBATCH --output=/home/siddarth.venkatraman/rgmix_runs/logs/warmup_%j.log
+#SBATCH --error=/home/siddarth.venkatraman/rgmix_runs/logs/warmup_%j.log
 
 set -eux
 export PATH="$HOME/.local/bin:$PATH"

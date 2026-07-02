@@ -12,8 +12,8 @@ estimators on the RG-Mix environment, following the value-corrected GRPO handoff
 | `mixture_linear` | linear mixture, constant `rho=0.5`: `A = R - [(1-rho) B_loo + rho V_t]` |
 | `mixture_position` | position-aware mixture, `rho(t)` linear 0->1 along the response |
 
-Grid: 4 baselines x K in {2, 4, 8} x 2 seeds = 24 runs, 500 steps, one H100 node
-each (4 inference / 4 trainer; value function co-located on the trainer GPUs).
+Grid: 4 baselines x K in {2, 4, 8} x 2 seeds = 24 runs, 500 steps, one GB200 node
+each (2 inference / 2 trainer; value function co-located on the trainer GPUs).
 Batch size 128, seq_len 8192, ancestral sampling (temp 1, top_p 1, top_k off),
 policy lr 3e-6, full fine-tuning, checkpoint every 50 steps.
 

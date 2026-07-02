@@ -34,7 +34,7 @@ extra_body = { top_k = -1, min_p = 0.0 }
 [[orchestrator.train.env]]
 id = "rg-mix"
 name = "rg-mix"
-args = { dataset_path = "/mnt/vast/home/siddarth.venkatraman/datasets/rg_mix_10k", num_train_examples = 10000, num_eval_examples = 500, seed = 42 }
+args = { dataset_path = "/home/siddarth.venkatraman/datasets/rg_mix_10k", num_train_examples = 10000, num_eval_examples = 500, seed = 42 }
 
 [orchestrator.renderer]
 name = "default"
@@ -43,8 +43,8 @@ name = "default"
 lr = 3e-6                    # policy LR; full fine-tuning (no LoRA)
 
 [deployment]
-gpus_per_node = 8           # H100 node = 8 GPUs; value function is co-located on the trainer GPUs
-num_infer_gpus = 4
-num_train_gpus = 4
+gpus_per_node = 4           # GB200 node = 4 GPUs; value function is co-located on the trainer GPUs
+num_infer_gpus = 2
+num_train_gpus = 2
 
 [inference]

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Single RG-Mix value-corrected GRPO run on one H100 node (4 inference / 4 trainer,
+# Single RG-Mix value-corrected GRPO run on one GB200 node (2 inference / 2 trainer,
 # value function co-located on the trainer GPUs). Parameterized by env vars:
 #   BASELINE   one of: loo, pure_value, mixture_linear, mixture_position
 #   K          group size (2, 4, 8)
@@ -9,9 +9,9 @@
 # Submit via experiments/rgmix_value_baselines/submit_all.sh.
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:4
 #SBATCH --exclusive
-#SBATCH --partition=h100
+#SBATCH --partition=gb200
 #SBATCH --account=reasoning
 #SBATCH --qos=priority-reasoning
 #SBATCH --time=24:00:00
