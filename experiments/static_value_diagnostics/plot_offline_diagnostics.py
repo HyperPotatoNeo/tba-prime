@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 
 POSITION_METHODS = {
     "linear": "linear_variance_overall_rho",
+    "linear_position": "linear_position_variance",
     "mixed_add": "mixed_add_variance_overall_params",
     "mixed_add_clipped": "mixed_add_clipped_variance_overall_params",
 }
@@ -140,7 +141,7 @@ def plot_position_global_delta(rows: list[dict[str, str]], output_dir: Path) -> 
     plt.xticks(xs, labels, rotation=25, ha="right")
     plt.xlabel("generated-token bucket")
     plt.ylabel("delta vs LOO (%)")
-    plt.title("Global-coefficient value baselines by token bucket")
+    plt.title("Global and scheduled value baselines by token bucket")
     plt.legend(fontsize=8)
     plt.tight_layout()
     plt.savefig(output_dir / "position_global_delta.png", dpi=180)

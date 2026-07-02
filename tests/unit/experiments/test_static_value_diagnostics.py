@@ -184,6 +184,18 @@ def test_linear_rho_uses_no_intercept_fit():
     assert summary_at_rhos(table, selected)["linear"]["variance"] == pytest.approx(0.0)
 
 
+def test_position_linear_ramp_goes_from_loo_to_value():
+    table = build_token_table(_prediction_set(), group_size=2)
+    pred = method_prediction(table, "linear_position", 0.0)
+
+    assert table.position_rho.tolist() == pytest.approx([0.0, 1.0] * 4)
+    assert pred[::2].tolist() == pytest.approx(table.loo[::2].tolist())
+    assert pred[1::2].tolist() == pytest.approx(table.value[1::2].tolist())
+    assert summary_at_rhos(table, select_rhos(table, np.asarray([0.0, 1.0])))["linear_position"][
+        "variance"
+    ] == pytest.approx(0.5)
+
+
 def test_anchored_odds_uses_binary_logit_difference():
     table = build_token_table(_prediction_set(), group_size=2)
     pred0 = method_prediction(table, "anchored_odds", 0.0)
@@ -227,6 +239,7 @@ def test_position_buckets_scale_to_long_rollouts():
         odds_prior=table.odds_prior,
         position=np.asarray([0, 511, 512, 1023, 1024, 2047, 4096, 7679], dtype=np.int32),
         frac_position=table.frac_position,
+        position_rho=table.position_rho,
         group_id=table.group_id,
         rollout_id=table.rollout_id,
     )
