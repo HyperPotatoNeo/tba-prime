@@ -27,6 +27,8 @@ The config defaults to:
 - `100` value-training steps with global batch size `256`;
 - two value-training nodes with `micro_batch_tokens = 32768`;
 - FlashAttention 3 on Perlmutter H100 nodes;
+- position diagnostics at generated-token edges
+  `[0, 512, 1024, 2048, 4096, 6144, 8192]`;
 - ancestral sampling: `temperature = 1.0`, `top_p = 1.0`, `top_k = -1`,
   `min_p = 0.0`.
 

@@ -13,7 +13,7 @@ Outputs under each run directory:
 - `value/value_checkpoint`: distributed value-model checkpoint, including optimizer and scheduler state.
 - `value_eval/predictions_{val,test}_rank*.npz`: per-token expected values and binary odds logits loaded from the saved value checkpoint.
 - `diagnostics/diagnostics.json`: variance proxy summaries and rho selections.
-- `diagnostics/position_summary.csv`: early/middle/late and fixed-position buckets.
+- `diagnostics/position_summary.csv`: early/middle/late and configured absolute-position buckets.
 - `diagnostics/group_size_sensitivity.csv`: rollout-count sensitivity with resampled groups.
 - `diagnostics/plots/*.png`: summary plots.
 

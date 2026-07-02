@@ -211,6 +211,8 @@ class StaticValueRunner:
             str(self.config.diagnostics.rho_step),
             "--sensitivity-draws",
             str(self.config.diagnostics.sensitivity_draws),
+            "--position-bucket-edges",
+            *[str(edge) for edge in self.config.diagnostics.position_bucket_edges],
             "--seed",
             str(self.config.diagnostics.seed),
             *self._wandb_args("diagnostics"),

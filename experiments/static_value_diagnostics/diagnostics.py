@@ -233,18 +233,28 @@ def variance_proxy(table: TokenTable, method: str, rho: float = 0.0, mask: np.nd
     return float(err.mean()) if err.size else math.nan
 
 
-def bucket_masks(table: TokenTable) -> dict[str, np.ndarray]:
+def _position_bucket_name(lo: int, hi: int | None, width: int) -> str:
+    if hi is None:
+        return f"pos_{lo:0{width}d}_plus"
+    return f"pos_{lo:0{width}d}_{hi:0{width}d}"
+
+
+def bucket_masks(table: TokenTable, position_bucket_edges: list[int] | None = None) -> dict[str, np.ndarray]:
     pos = table.position
     frac = table.frac_position
-    return {
+    edges = position_bucket_edges or [0, 512, 1024, 2048, 4096, 6144, 8192]
+    if len(edges) < 2 or edges[0] != 0 or any(b <= a for a, b in zip(edges, edges[1:])):
+        raise ValueError("position_bucket_edges must start at 0 and be strictly increasing")
+    width = max(4, len(str(edges[-1])))
+    masks = {
         "early": frac < 0.25,
         "middle": (frac >= 0.25) & (frac < 0.75),
         "late": frac >= 0.75,
-        "pos_000_032": (pos >= 0) & (pos < 32),
-        "pos_032_064": (pos >= 32) & (pos < 64),
-        "pos_064_128": (pos >= 64) & (pos < 128),
-        "pos_128_plus": pos >= 128,
     }
+    for lo, hi in zip(edges, edges[1:]):
+        masks[_position_bucket_name(lo, hi, width)] = (pos >= lo) & (pos < hi)
+    masks[_position_bucket_name(edges[-1], None, width)] = pos >= edges[-1]
+    return masks
 
 
 def rho_curves(table: TokenTable, rhos: np.ndarray, methods: list[str] | None = None) -> dict[str, dict[str, float]]:
@@ -298,14 +308,19 @@ def position_summary(
     test_table: TokenTable,
     selected_rhos: dict[str, float],
     rhos: np.ndarray,
+    position_bucket_edges: list[int] | None = None,
     methods: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     methods = methods or rho_methods(include_odds=True)
     rows: list[dict[str, Any]] = []
-    val_masks = bucket_masks(val_table)
-    test_masks = bucket_masks(test_table)
+    val_masks = bucket_masks(val_table, position_bucket_edges)
+    test_masks = bucket_masks(test_table, position_bucket_edges)
     for bucket in val_masks:
-        row: dict[str, Any] = {"bucket": bucket, "test_tokens": int(test_masks[bucket].sum())}
+        val_tokens = int(val_masks[bucket].sum())
+        test_tokens = int(test_masks[bucket].sum())
+        if val_tokens == 0 or test_tokens == 0:
+            continue
+        row: dict[str, Any] = {"bucket": bucket, "val_tokens": val_tokens, "test_tokens": test_tokens}
         row["loo_variance"] = variance_proxy(test_table, "loo", mask=test_masks[bucket])
         for method in methods:
             val_curve = {
@@ -406,6 +421,7 @@ def run_diagnostics(
     rho_step: float,
     sensitivity_draws: int,
     seed: int,
+    position_bucket_edges: list[int] | None = None,
 ) -> dict[str, Any]:
     rhos = np.round(np.arange(0.0, 1.0 + rho_step / 2, rho_step), 6)
     val_pred = load_prediction_set(predictions_dir, "val")
@@ -428,7 +444,7 @@ def run_diagnostics(
         "val_curves": rho_curves(val_table, rhos, methods),
         "test_curves_descriptive": rho_curves(test_table, rhos, methods),
         "test_summary": summary_at_rhos(test_table, selected, methods),
-        "position_summary": position_summary(val_table, test_table, selected, rhos, methods),
+        "position_summary": position_summary(val_table, test_table, selected, rhos, position_bucket_edges, methods),
         "group_size_sensitivity": group_size_sensitivity(
             val_pred,
             test_pred,

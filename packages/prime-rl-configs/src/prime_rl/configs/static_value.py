@@ -161,7 +161,22 @@ class StaticDiagnosticsConfig(BaseConfig):
     group_sizes: list[int] = Field(default_factory=lambda: [2, 4, 8])
     rho_step: float = Field(0.05, gt=0, le=1)
     sensitivity_draws: int = Field(200, ge=1)
+    position_bucket_edges: list[int] = Field(default_factory=lambda: [0, 512, 1024, 2048, 4096, 6144, 8192])
+    """Absolute generated-token position bucket edges for position diagnostics."""
+
     seed: int = 0
+
+    @model_validator(mode="after")
+    def validate_position_buckets(self):
+        if len(self.position_bucket_edges) < 2:
+            raise ValueError("diagnostics.position_bucket_edges must contain at least two edges")
+        if self.position_bucket_edges[0] != 0:
+            raise ValueError("diagnostics.position_bucket_edges must start at 0")
+        if any(edge < 0 for edge in self.position_bucket_edges):
+            raise ValueError("diagnostics.position_bucket_edges must be non-negative")
+        if any(b <= a for a, b in zip(self.position_bucket_edges, self.position_bucket_edges[1:])):
+            raise ValueError("diagnostics.position_bucket_edges must be strictly increasing")
+        return self
 
 
 class StaticValueDeploymentConfig(BaseConfig):

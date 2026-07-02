@@ -68,6 +68,7 @@ mfu_peak_tflops_per_gpu = 312.0
 
 [diagnostics]
 group_sizes = [2, 4, 8]
+position_bucket_edges = [0, 512, 1024, 2048, 4096, 6144, 8192]
 rho_step = 0.05
 sensitivity_draws = 200
 seed = 0

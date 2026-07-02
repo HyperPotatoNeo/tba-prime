@@ -8,6 +8,7 @@ import torch
 from experiments.static_value_diagnostics.common import RolloutRecord
 from experiments.static_value_diagnostics.diagnostics import (
     PredictionSet,
+    bucket_masks,
     build_token_table,
     has_binary_rewards,
     method_prediction,
@@ -77,6 +78,7 @@ def test_static_value_example_toml_loads_with_static_model_defaults():
     assert config.train.micro_batch_tokens == 32_768
     assert config.train.num_nodes == 2
     assert config.diagnostics.group_sizes == [2, 4, 8]
+    assert config.diagnostics.position_bucket_edges == [0, 512, 1024, 2048, 4096, 6144, 8192]
 
 
 def test_static_value_config_rejects_prompt_overlap_and_bad_inference_layout():
@@ -102,6 +104,9 @@ def test_static_value_config_rejects_prompt_overlap_and_bad_inference_layout():
 
     with pytest.raises(ValueError, match="micro_batch_tokens"):
         StaticValueConfig.model_validate({"train": {"micro_batch_tokens": 1024}})
+
+    with pytest.raises(ValueError, match="position_bucket_edges"):
+        StaticValueConfig.model_validate({"diagnostics": {"position_bucket_edges": [0, 512, 512]}})
 
 
 def test_static_value_runner_builds_multinode_value_torchrun(tmp_path, monkeypatch):
@@ -171,6 +176,32 @@ def test_anchored_odds_uses_binary_logit_difference():
     assert pred0.tolist() == pytest.approx(table.odds_prior.tolist())
     assert pred1[:2].mean() > 0.99
     assert pred1[2:4].mean() < 0.01
+
+
+def test_position_buckets_scale_to_long_rollouts():
+    table = build_token_table(_prediction_set(), group_size=2)
+    table = table.__class__(
+        reward=table.reward,
+        group_mean=table.group_mean,
+        loo=table.loo,
+        value=table.value,
+        value0=table.value0,
+        logit=table.logit,
+        logit0=table.logit0,
+        odds_prior=table.odds_prior,
+        position=np.asarray([0, 511, 512, 1023, 1024, 2047, 4096, 7679], dtype=np.int32),
+        frac_position=table.frac_position,
+        group_id=table.group_id,
+        rollout_id=table.rollout_id,
+    )
+    masks = bucket_masks(table, [0, 512, 1024, 2048, 4096, 6144, 8192])
+
+    assert "pos_0000_0512" in masks
+    assert "pos_0512_1024" in masks
+    assert "pos_4096_6144" in masks
+    assert "pos_000_032" not in masks
+    assert masks["pos_0000_0512"].sum() == 2
+    assert masks["pos_4096_6144"].sum() == 1
 
 
 def test_fractional_rewards_skip_binary_odds_methods():

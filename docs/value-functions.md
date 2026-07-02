@@ -204,6 +204,9 @@ The value-training stage can use one or more allocated nodes:
 global_batch_size = 256
 micro_batch_tokens = 32768  # optional; defaults to model.seq_len
 num_nodes = 2               # value trainer/predict nodes
+
+[diagnostics]
+position_bucket_edges = [0, 512, 1024, 2048, 4096, 6144, 8192]
 ```
 
 `micro_batch_tokens` is the packed-token budget for each value
@@ -214,6 +217,11 @@ memory allows.
 With the default `gae_lambda = 1.0`, static value targets are Monte Carlo
 return-to-go values, so the trainer skips the extra no-grad value forward that
 would otherwise be needed for bootstrapped lambda returns.
+
+Position diagnostics always include fractional early/middle/late buckets. The
+absolute generated-token buckets are configurable through
+`diagnostics.position_bucket_edges`; the RGMix example uses 512-token and wider
+buckets because generated outputs are usually thousands of tokens long.
 
 ### Stages
 
@@ -266,6 +274,8 @@ The default example uses:
 - classifier value loss with `reward_range = [0.0, 1.0]`, `n_bins = 1`;
 - `100` value-training steps with global batch size `256`;
 - two value-training nodes with `micro_batch_tokens = 32768`.
+- absolute position diagnostics at generated-token edges
+  `[0, 512, 1024, 2048, 4096, 6144, 8192]`.
 
 This keeps default activation checkpointing and `model.dp_replicate = 4`.
 On Qwen3-4B with 8192-token rollouts, disabling activation checkpointing OOMs
