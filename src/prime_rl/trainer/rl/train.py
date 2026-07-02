@@ -13,7 +13,7 @@ from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
 from torch.profiler import profile, ProfilerActivity, record_function
-from prime_rl.trainer.ckpt import setup_ckpt_managers
+from prime_rl.trainer.ckpt import load_value_checkpoint, setup_ckpt_managers
 from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
@@ -166,10 +166,11 @@ def train(config: TrainerConfig):
     value_config = config.value_function
     if value_config is not None:
         logger.info(f"Initializing value function ({value_config})")
+        loading_value_from_ckpt_later = loading_from_ckpt_later or value_config.init_checkpoint is not None
         value_model = setup_value_model(
             config.model,
             parallel_dims,
-            loading_from_ckpt_later,
+            loading_value_from_ckpt_later,
             value_head_output_size(value_config.loss),
         )
 
@@ -274,6 +275,8 @@ def train(config: TrainerConfig):
 
     # Optionally, resume training from a checkpoint
     progress = Progress()
+    if checkpoint_step is not None and value_config is not None and value_config.init_checkpoint is not None:
+        raise ValueError("trainer.value_function.init_checkpoint cannot be combined with ckpt.resume_step.")
     if checkpoint_step is not None:
         ckpt_manager.load(
             checkpoint_step,
@@ -286,6 +289,11 @@ def train(config: TrainerConfig):
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
         if progress.data_step == 0 and progress.step > 0:
             progress.data_step = progress.step
+    elif value_config is not None and value_config.init_checkpoint is not None:
+        if value_model is None or value_optimizer is None or value_scheduler is None:
+            raise RuntimeError("value_function.init_checkpoint requires an initialized value function.")
+        load_value_checkpoint(value_config.init_checkpoint, value_model, [value_optimizer], value_scheduler)
+        logger.info(f"Loaded value function checkpoint from {value_config.init_checkpoint}")
 
     logger.info(
         f"Starting from step {progress.step}, data_step {progress.data_step} "

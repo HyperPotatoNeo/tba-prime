@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import gzip
 import json
-from json import JSONDecodeError
 from dataclasses import asdict, dataclass
+from json import JSONDecodeError
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -25,7 +25,7 @@ class RolloutRecord:
 
     @property
     def usable(self) -> bool:
-        return not self.has_error and any(self.mask) and len(self.token_ids) == len(self.mask)
+        return not self.has_error and any(self.mask) and len(self.token_ids) == len(self.mask) == len(self.logprobs)
 
 
 def open_text(path: Path, mode: str = "rt"):
@@ -105,5 +105,10 @@ def action_indices(mask: list[bool], seq_len: int | None = None) -> list[int]:
 
 
 def clipped_record_arrays(record: RolloutRecord, seq_len: int) -> tuple[list[int], list[bool], list[float]]:
+    if len(record.token_ids) != len(record.mask) or len(record.token_ids) != len(record.logprobs):
+        raise ValueError(
+            f"rollout {record.split}:{record.prompt_id}:{record.rollout_id} has mismatched token/mask/logprob lengths: "
+            f"{len(record.token_ids)}, {len(record.mask)}, {len(record.logprobs)}"
+        )
     cut = min(seq_len, len(record.token_ids), len(record.mask), len(record.logprobs))
     return record.token_ids[:cut], record.mask[:cut], record.logprobs[:cut]

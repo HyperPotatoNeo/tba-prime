@@ -481,6 +481,9 @@ class ValueFunctionConfig(BaseConfig):
     loss: ValueLossConfig = MSEValueLossConfig()
     """Value-function training loss."""
 
+    init_checkpoint: Path | None = None
+    """Optional value-only checkpoint to initialize the value model, optimizer, and scheduler."""
+
     optim: OptimizerConfig = AdamWConfig(lr=5e-5)
     """Optimizer for the value function. Defaults to AdamW with lr=5e-5."""
 

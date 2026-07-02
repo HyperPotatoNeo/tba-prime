@@ -11,7 +11,6 @@ from typing import Any
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
 from torchtitan.distributed.utils import clip_grad_norm_
 
 import prime_rl._compat  # noqa: F401
@@ -24,6 +23,7 @@ from experiments.static_value_diagnostics.common import (
 )
 from prime_rl.configs.trainer import ModelConfig, ValueFunctionConfig
 from prime_rl.trainer.batch import prepare_batch
+from prime_rl.trainer.ckpt import load_value_checkpoint, save_value_checkpoint
 from prime_rl.trainer.model import predict_value, setup_value_model
 from prime_rl.trainer.optim import setup_optimizer
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
@@ -49,11 +49,13 @@ from prime_rl.utils.logger import setup_logger
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a static-policy value function on collected rollouts.")
     parser.add_argument("--rollouts", type=Path, required=True)
+    parser.add_argument("--predict-rollouts", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B-Instruct-2507")
     parser.add_argument("--seq-len", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--group-size", type=int, default=None)
     parser.add_argument("--updates-per-batch", type=int, default=1)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--warmup-steps", type=int, default=50)
@@ -80,6 +82,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--predict-splits", type=str, nargs="+", default=["val", "test"])
+    parser.add_argument("--skip-predict", action="store_true")
+    parser.add_argument("--predict-only", action="store_true")
+    parser.add_argument("--load-value-checkpoint", type=Path, default=None)
     parser.add_argument("--stream", action="store_true", help="Reload the rollout file while collection is still running.")
     parser.add_argument("--reload-records-interval", type=int, default=5)
     parser.add_argument("--min-train-records", type=int, default=None)
@@ -153,6 +158,64 @@ def usable_records(
     if require and not out:
         raise ValueError(f"no usable records for split={split!r}")
     return out
+
+
+def validate_rollout_records(
+    records: list[RolloutRecord],
+    *,
+    path: Path,
+    vconfig: ValueFunctionConfig,
+    group_size: int | None,
+) -> None:
+    seen: set[tuple[str, str, int]] = set()
+    group_counts: dict[tuple[str, str], int] = {}
+    reward_range: tuple[float, float] | None = None
+    if hasattr(vconfig.loss, "reward_range"):
+        low, high = vconfig.loss.reward_range
+        reward_range = (float(low), float(high))
+
+    for record in records:
+        lengths = (len(record.token_ids), len(record.mask), len(record.logprobs))
+        if len(set(lengths)) != 1:
+            raise ValueError(
+                f"{path}: rollout {record.split}:{record.prompt_id}:{record.rollout_id} has mismatched "
+                f"token/mask/logprob lengths {lengths}"
+            )
+        if int(sum(record.mask)) != int(record.num_output_tokens):
+            raise ValueError(
+                f"{path}: rollout {record.split}:{record.prompt_id}:{record.rollout_id} has "
+                f"num_output_tokens={record.num_output_tokens}, but mask sum={int(sum(record.mask))}"
+            )
+        if not np.isfinite(record.reward):
+            raise ValueError(
+                f"{path}: rollout {record.split}:{record.prompt_id}:{record.rollout_id} has non-finite reward"
+            )
+        if reward_range is not None:
+            low, high = reward_range
+            tol = 1e-5 * max(high - low, 1.0)
+            if record.reward < low - tol or record.reward > high + tol:
+                raise ValueError(
+                    f"{path}: rollout {record.split}:{record.prompt_id}:{record.rollout_id} reward={record.reward} "
+                    f"is outside reward_range={reward_range}"
+                )
+        key = (record.split, record.group_id, record.rollout_id)
+        if key in seen:
+            raise ValueError(f"{path}: duplicate rollout key {key}")
+        seen.add(key)
+        if not record.has_error:
+            group_counts[(record.split, record.group_id)] = group_counts.get((record.split, record.group_id), 0) + 1
+
+    if group_size is not None:
+        bad_groups = [(key, count) for key, count in group_counts.items() if count != group_size]
+        if bad_groups:
+            key, count = bad_groups[0]
+            raise ValueError(f"{path}: group {key} has {count} usable rollouts, expected {group_size}")
+
+
+def load_validated_rollouts(path: Path, args: argparse.Namespace, vconfig: ValueFunctionConfig) -> list[RolloutRecord]:
+    records = load_rollout_records(path)
+    validate_rollout_records(records, path=path, vconfig=vconfig, group_size=args.group_size)
+    return records
 
 
 def wait_for_usable_records(
@@ -310,8 +373,14 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError(f"global_batch_size must be >= 1, got {args.global_batch_size}")
     if args.updates_per_batch < 1:
         raise ValueError(f"updates_per_batch must be >= 1, got {args.updates_per_batch}")
+    if args.steps < 0:
+        raise ValueError(f"steps must be non-negative, got {args.steps}")
     if args.log_every < 1:
         raise ValueError(f"log_every must be >= 1, got {args.log_every}")
+    if args.predict_only and args.load_value_checkpoint is None:
+        raise ValueError("--predict-only requires --load-value-checkpoint")
+    if args.stream and args.predict_rollouts is not None:
+        raise ValueError("--stream is only supported when training and prediction use --rollouts")
 
     mconfig = model_config(args)
     vconfig = value_config(args)
@@ -323,7 +392,7 @@ def train(args: argparse.Namespace) -> None:
     value_model = setup_value_model(
         mconfig,
         parallel_dims,
-        loading_from_checkpoint_later=False,
+        loading_from_checkpoint_later=args.load_value_checkpoint is not None,
         head_output_size=value_head_output_size(vconfig.loss),
     )
     optimizer = setup_optimizer(
@@ -332,7 +401,7 @@ def train(args: argparse.Namespace) -> None:
         parallel_dims,
         cpu_offload=mconfig.optim_cpu_offload,
     )
-    scheduler = setup_scheduler(optimizer, vconfig.scheduler, args.steps, vconfig.optim.lr)
+    scheduler = setup_scheduler(optimizer, vconfig.scheduler, max(args.steps, 1), vconfig.optim.lr)
     bin_cost = build_bin_cost(value_model.config)
     cp_enabled = parallel_dims.cp_enabled
     cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
@@ -459,22 +528,32 @@ def train(args: argparse.Namespace) -> None:
         optimizer.zero_grad()
         return ValueUpdateStats(grad_norm=value_grad_norm, zero_grad_ratio=value_zero_grad_ratio)
 
-    min_train_records = args.min_train_records or args.global_batch_size
-    if args.stream:
-        all_records, train_records = wait_for_usable_records(
-            args.rollouts,
-            split="train",
-            seq_len=args.seq_len,
-            min_count=min_train_records,
-            timeout_seconds=args.wait_timeout_seconds,
-            logger=logger,
-        )
-    else:
-        all_records = load_rollout_records(args.rollouts)
-        train_records = usable_records(all_records, "train", args.seq_len)
+    if args.load_value_checkpoint is not None:
+        if args.predict_only:
+            load_value_checkpoint(args.load_value_checkpoint, value_model)
+        else:
+            load_value_checkpoint(args.load_value_checkpoint, value_model, [optimizer], scheduler)
+        logger.info(f"Loaded value model checkpoint from {args.load_value_checkpoint}")
+
+    all_records: list[RolloutRecord] = []
+    train_records: list[RolloutRecord] = []
     rng = random.Random(args.seed)
-    rng.shuffle(train_records)
-    logger.info(f"Loaded {len(train_records)} train records")
+    if not args.predict_only:
+        min_train_records = args.min_train_records or args.global_batch_size
+        if args.stream:
+            all_records, train_records = wait_for_usable_records(
+                args.rollouts,
+                split="train",
+                seq_len=args.seq_len,
+                min_count=min_train_records,
+                timeout_seconds=args.wait_timeout_seconds,
+                logger=logger,
+            )
+        else:
+            all_records = load_validated_rollouts(args.rollouts, args, vconfig)
+            train_records = usable_records(all_records, "train", args.seq_len)
+        rng.shuffle(train_records)
+        logger.info(f"Loaded {len(train_records)} train records")
 
     wandb = None
     if world.is_master and args.wandb_project:
@@ -493,7 +572,7 @@ def train(args: argparse.Namespace) -> None:
             },
         )
 
-    for step in range(args.steps):
+    for step in range(0 if args.predict_only else args.steps):
         torch.cuda.synchronize()
         step_start = time.perf_counter()
         if args.stream and step > 0 and step % args.reload_records_interval == 0:
@@ -584,27 +663,30 @@ def train(args: argparse.Namespace) -> None:
             if wandb is not None:
                 wandb.log(metrics, step=step + 1)
 
-    ckpt_dir = args.output_dir / "value_checkpoint"
-    state_dict = {"value_model": value_model.state_dict(), "scheduler": scheduler.state_dict()}
-    dcp_save(state_dict, checkpoint_id=ckpt_dir)
-    dist.barrier()
+    if not args.predict_only:
+        ckpt_dir = args.output_dir / "value_checkpoint"
+        save_value_checkpoint(ckpt_dir, value_model, [optimizer], scheduler)
+        logger.info(f"Saved value checkpoint to {ckpt_dir}")
+        dist.barrier()
 
-    expected_by_split = {"val": args.expected_val_records, "test": args.expected_test_records}
-    for split in args.predict_splits:
-        expected = expected_by_split.get(split, 0)
-        if args.stream and expected > 0:
-            all_records, _ = wait_for_usable_records(
-                args.rollouts,
-                split=split,
-                seq_len=args.seq_len,
-                min_count=expected,
-                timeout_seconds=args.wait_timeout_seconds,
-                logger=logger,
-            )
-        else:
-            all_records = load_rollout_records(args.rollouts)
-        predict_split(value_model, vconfig, all_records, split, args, device)
-    dist.barrier()
+    if not args.skip_predict:
+        predict_rollouts = args.predict_rollouts or args.rollouts
+        expected_by_split = {"val": args.expected_val_records, "test": args.expected_test_records}
+        for split in args.predict_splits:
+            expected = expected_by_split.get(split, 0)
+            if args.stream and expected > 0:
+                all_records, _ = wait_for_usable_records(
+                    predict_rollouts,
+                    split=split,
+                    seq_len=args.seq_len,
+                    min_count=expected,
+                    timeout_seconds=args.wait_timeout_seconds,
+                    logger=logger,
+                )
+            else:
+                all_records = load_validated_rollouts(predict_rollouts, args, vconfig)
+            predict_split(value_model, vconfig, all_records, split, args, device)
+        dist.barrier()
     if wandb is not None:
         wandb.finish()
     dist.destroy_process_group()

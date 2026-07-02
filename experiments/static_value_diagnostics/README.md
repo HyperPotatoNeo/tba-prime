@@ -8,9 +8,10 @@ Diagnostics are evaluated on held-out prompts. `rho` is selected on the validati
 
 Outputs under each run directory:
 
-- `data/rollouts.jsonl`: collected static-policy rollouts. The launcher writes only complete groups of usable rollouts; failures go to `data/collection_errors.jsonl`.
-- `value/value_checkpoint`: distributed value-model checkpoint.
-- `value/predictions_{val,test}_rank*.npz`: per-token expected values and binary odds logits.
+- `data/train_rollouts.jsonl`: 10,000 tokenized static-policy train rollouts collected before value training.
+- `data/eval_rollouts.jsonl`: 1,024 tokenized held-out rollouts collected after value training (`512` val, `512` test by default).
+- `value/value_checkpoint`: distributed value-model checkpoint, including optimizer and scheduler state.
+- `value_eval/predictions_{val,test}_rank*.npz`: per-token expected values and binary odds logits loaded from the saved value checkpoint.
 - `diagnostics/diagnostics.json`: variance proxy summaries and rho selections.
 - `diagnostics/position_summary.csv`: early/middle/late and fixed-position buckets.
 - `diagnostics/group_size_sensitivity.csv`: rollout-count sensitivity with resampled groups.
@@ -23,7 +24,7 @@ cd /pscratch/sd/s/siddart2/value-functions-prime-rl/prime-rl
 bash experiments/static_value_diagnostics/run_sweep.sh
 ```
 
-Submit the two-node throughput run, with 4 inference GPUs on one node and 4 value-trainer GPUs on the second node:
+Submit the staged two-node run. It uses both nodes for bulk inference, trains the value function offline for 100 steps on one node, then uses both nodes again for held-out inference and checkpointed prediction/diagnostics:
 
 ```bash
 cd /pscratch/sd/s/siddart2/value-functions-prime-rl/prime-rl
@@ -37,4 +38,4 @@ sbatch --export=ALL,EXPERIMENT_NAME=rgmix-qwen4b-classifier,INFER_GPUS=2,VALUE_G
   experiments/static_value_diagnostics/launch_one_node.sbatch
 ```
 
-The one-node Slurm script requests one full GPU node with `-A m4881`, `-C "gpu&hbm80g"`, `--qos=premium`, and a 48h time limit. The two-node script requests two full GPU nodes with the same account/QOS. The default sweep uses group size 8, 32 validation groups, 32 test groups, 8192 sequence length, global value batch size 256, disabled value-model `torch.compile`, and 300 value steps. Train rollout groups default to `ceil(VALUE_STEPS * GLOBAL_BATCH_SIZE / GROUP_SIZE)`, so the default 300-step run targets 9600 train groups / 76800 train rollouts. The saved prompt pool is capped by the dataset size and cycled when more train groups than unique prompts are requested. Value training logs step seconds, forward-token throughput, and an approximate MFU. The default `all` stage keeps inference running while value training streams from the growing rollout file and reloads new rollouts every value step; use `STAGE=offline` for collect-then-train debugging. `run_sweep.sh` submits the stable 3-inference/1-value split by default; set `INCLUDE_2GPU_VALUE_SPLIT=1` to also submit the experimental 2-inference/2-value split.
+The one-node Slurm script requests one full GPU node with `-A m4881`, `-C "gpu&hbm80g"`, `--qos=premium`, and a 48h time limit. The staged two-node script requests two full GPU nodes with the same account/QOS and a 24h time limit. Defaults are group size 8, 8192 sequence length, 10,000 train episodes, 1,024 held-out episodes, global value batch size 256, disabled value-model `torch.compile`, and 100 offline value steps. The train set is fixed tokenized data and is cycled by the trainer when `VALUE_STEPS * GLOBAL_BATCH_SIZE` exceeds 10,000. Held-out collection uses explicit prompt offsets near the end of the saved 7,500-example RGMix dataset to avoid train/eval overlap.

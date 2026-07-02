@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -207,3 +209,62 @@ def test_static_value_targets_match_terminal_reward_after_packing():
     )
 
     assert returns[micro_batch["loss_mask"]].tolist() == pytest.approx([0.0] * 5 + [1.0] * 5)
+
+
+def test_rollout_validation_catches_bad_tokenized_groups():
+    pytest.importorskip("torchtitan")
+    from experiments.static_value_diagnostics import train_static_value
+    from prime_rl.configs.trainer import ValueFunctionConfig
+
+    vconfig = ValueFunctionConfig.model_validate(
+        {"loss": {"type": "classification", "reward_range": (0.0, 1.0), "n_bins": 1}}
+    )
+    records = [
+        RolloutRecord(
+            split="train",
+            prompt_id=0,
+            rollout_id=i,
+            group_id="node0:train:0",
+            reward=float(i),
+            token_ids=[1, 2, 3],
+            mask=[False, True, True],
+            logprobs=[0.0, -0.1, -0.2],
+            num_output_tokens=2,
+        )
+        for i in range(2)
+    ]
+    train_static_value.validate_rollout_records(
+        records,
+        path=Path("rollouts.jsonl"),
+        vconfig=vconfig,
+        group_size=2,
+    )
+
+    bad = [
+        RolloutRecord(
+            split="train",
+            prompt_id=0,
+            rollout_id=0,
+            group_id="node0:train:0",
+            reward=1.0,
+            token_ids=[1, 2, 3],
+            mask=[False, True, True],
+            logprobs=[0.0, -0.1],
+            num_output_tokens=2,
+        )
+    ]
+    with pytest.raises(ValueError, match="mismatched"):
+        train_static_value.validate_rollout_records(
+            bad,
+            path=Path("rollouts.jsonl"),
+            vconfig=vconfig,
+            group_size=2,
+        )
+
+    with pytest.raises(ValueError, match="expected 3"):
+        train_static_value.validate_rollout_records(
+            records,
+            path=Path("rollouts.jsonl"),
+            vconfig=vconfig,
+            group_size=3,
+        )

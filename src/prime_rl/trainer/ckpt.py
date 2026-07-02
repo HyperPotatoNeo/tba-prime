@@ -187,6 +187,99 @@ class AppState(Stateful):
             torch.cuda.empty_cache()
 
 
+def _base_optimizers(optimizers: list[Optimizer]) -> list[Optimizer]:
+    return [opt.base_optimizer if isinstance(opt, CPUOffloadOptimizer) else opt for opt in optimizers]
+
+
+def _has_cpu_offload(optimizers: list[Optimizer]) -> bool:
+    return any(isinstance(opt, CPUOffloadOptimizer) for opt in optimizers)
+
+
+def _stage_cpu_offload_optimizers_for_dcp(optimizers: list[Optimizer]) -> None:
+    for opt in optimizers:
+        if isinstance(opt, CPUOffloadOptimizer):
+            opt._move_states("cpu")
+            if opt.state:
+                opt._initialized = True
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def save_value_checkpoint(
+    path: Path,
+    value_model: Module,
+    value_optimizers: list[Optimizer],
+    value_scheduler: LRScheduler | None,
+) -> None:
+    """Save a value-model-only checkpoint, including optimizer and scheduler state."""
+    for opt in value_optimizers:
+        if isinstance(opt, CPUOffloadOptimizer) and opt._initialized:
+            opt._move_states("cuda")
+            torch.cuda.synchronize()
+
+    value_model_state_dict, value_optimizer_state_dict = get_state_dict(
+        value_model, _base_optimizers(value_optimizers)
+    )
+    state_dict = {
+        "value_model": value_model_state_dict,
+        "value_optimizers": value_optimizer_state_dict,
+    }
+    if value_scheduler is not None:
+        state_dict["value_scheduler"] = value_scheduler.state_dict()
+    if _has_cpu_offload(value_optimizers):
+        _stage_cpu_offload_optimizers_for_dcp(value_optimizers)
+    dcp_save(state_dict, checkpoint_id=path)
+
+
+def load_value_checkpoint(
+    path: Path,
+    value_model: Module,
+    value_optimizers: list[Optimizer] | None = None,
+    value_scheduler: LRScheduler | None = None,
+) -> None:
+    """Load a value-model-only checkpoint saved by save_value_checkpoint."""
+    value_optimizers = value_optimizers or []
+    if value_optimizers:
+        value_model_state_dict, value_optimizer_state_dict = get_state_dict(
+            value_model, _base_optimizers(value_optimizers)
+        )
+        state_dict = {
+            "value_model": value_model_state_dict,
+            "value_optimizers": value_optimizer_state_dict,
+        }
+        if value_scheduler is not None:
+            state_dict["value_scheduler"] = value_scheduler.state_dict()
+        has_cpu_offload = _has_cpu_offload(value_optimizers)
+        if has_cpu_offload:
+            _stage_cpu_offload_optimizers_for_dcp(value_optimizers)
+        dcp_load(state_dict=state_dict, checkpoint_id=path)
+        if has_cpu_offload:
+            set_model_state_dict(value_model, model_state_dict=state_dict["value_model"])
+            for opt in value_optimizers:
+                if isinstance(opt, CPUOffloadOptimizer):
+                    opt._initialized = True
+            if value_scheduler is not None:
+                value_scheduler.load_state_dict(state_dict["value_scheduler"])
+            state_dict.clear()
+            gc.collect()
+            torch.cuda.empty_cache()
+        else:
+            set_state_dict(
+                value_model,
+                _base_optimizers(value_optimizers),
+                model_state_dict=state_dict["value_model"],
+                optim_state_dict=state_dict["value_optimizers"],
+            )
+            if value_scheduler is not None:
+                value_scheduler.load_state_dict(state_dict["value_scheduler"])
+        return
+
+    value_model_state_dict, _ = get_state_dict(value_model, [])
+    state_dict = {"value_model": value_model_state_dict}
+    dcp_load(state_dict=state_dict, checkpoint_id=path)
+    set_model_state_dict(value_model, model_state_dict=state_dict["value_model"])
+
+
 class CheckpointManager:
     """Utility class to save and load trainer checkpoints to resume SFT and RL training."""
 

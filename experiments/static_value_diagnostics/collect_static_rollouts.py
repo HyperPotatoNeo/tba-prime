@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:8000/v1")
     parser.add_argument("--api-key-var", type=str, default="VLLM_API_KEY")
     parser.add_argument("--group-size", type=int, default=16)
+    parser.add_argument("--group-id-prefix", type=str, default="")
     parser.add_argument("--num-train-prompts", type=int, default=1024)
     parser.add_argument(
         "--num-train-groups",
@@ -184,6 +185,7 @@ async def collect(args: argparse.Namespace) -> None:
             "model": args.model,
             "base_url": args.base_url,
             "group_size": args.group_size,
+            "group_id_prefix": args.group_id_prefix,
             "splits": {k: [min(v), max(v)] if v else [] for k, v in prompt_pools.items()},
             "train_groups": num_train_groups,
             "sampling": sampling_args,
@@ -274,11 +276,15 @@ async def collect(args: argparse.Namespace) -> None:
                 print(f"collected {split} prompt_id={prompt_id} rows={len(rows)}")
 
     tasks = [
-        collect_one("train", prompt_pools["train"][group_idx % len(prompt_pools["train"])], f"train:{group_idx}")
+        collect_one(
+            "train",
+            prompt_pools["train"][group_idx % len(prompt_pools["train"])],
+            f"{args.group_id_prefix}train:{group_idx}",
+        )
         for group_idx in range(num_train_groups)
     ]
     tasks.extend(
-        collect_one(split, prompt_id, f"{split}:{prompt_id}")
+        collect_one(split, prompt_id, f"{args.group_id_prefix}{split}:{prompt_id}")
         for split in ("val", "test")
         for prompt_id in prompt_pools[split]
     )
