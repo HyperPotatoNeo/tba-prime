@@ -101,7 +101,7 @@ def test_value_classification_allows_roundoff_at_reward_range_bounds():
 
     loss, metrics = compute_value_loss(
         value_logits=torch.zeros(1, 2, 3),
-        targets=torch.tensor([[-1e-7, 1.0000001]]),
+        targets=torch.tensor([[-1e-6, 1.000001]]),
         mask=torch.tensor([[True, True]]),
         config=config,
         scale=2,

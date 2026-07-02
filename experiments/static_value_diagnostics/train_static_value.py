@@ -6,7 +6,7 @@ import random
 import time
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import torch
@@ -23,14 +23,26 @@ from experiments.static_value_diagnostics.common import (
     write_json,
 )
 from prime_rl.configs.trainer import ModelConfig, ValueFunctionConfig
+from prime_rl.trainer.batch import prepare_batch
 from prime_rl.trainer.model import predict_value, setup_value_model
 from prime_rl.trainer.optim import setup_optimizer
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
+from prime_rl.trainer.rl.data import TensorMicroBatch, _torch_dtype
 from prime_rl.trainer.scheduler import setup_scheduler
-from prime_rl.trainer.utils import get_zero_gradient_ratio, setup_torch_distributed
-from prime_rl.trainer.value import align_value_logits, compute_value_loss, predict_values, value_head_output_size
+from prime_rl.trainer.utils import Tensors, build_bin_cost, get_zero_gradient_ratio, setup_torch_distributed
+from prime_rl.trainer.value import (
+    ValueTargets,
+    ValueUpdateStats,
+    align_value_logits,
+    compute_gae,
+    compute_value_loss,
+    predict_values,
+    value_head_output_size,
+)
 from prime_rl.trainer.world import get_world
+from prime_rl.transport import MicroBatch, TrainingSample
 from prime_rl.utils.act_offloading import maybe_activation_offloading
+from prime_rl.utils.cp import gather_for_cp, setup_cp_params, shard_for_cp
 from prime_rl.utils.logger import setup_logger
 
 
@@ -42,10 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--global-batch-size", type=int, default=256)
-    parser.add_argument("--micro-batch-size", type=int, default=1)
-    parser.add_argument("--micro-batch-token-budget", type=int, default=None)
+    parser.add_argument("--updates-per-batch", type=int, default=1)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument("--gamma", type=float, default=1.0)
+    parser.add_argument("--gae-lambda", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--reward-range", type=float, nargs=2, default=[0.0, 1.0])
     parser.add_argument("--n-bins", type=int, default=1)
@@ -112,6 +125,9 @@ def value_config(args: argparse.Namespace) -> ValueFunctionConfig:
             },
             "optim": {"type": "adamw", "lr": args.lr, "weight_decay": 0.01, "max_norm": 1.0},
             "scheduler": {"type": "linear", "warmup_steps": args.warmup_steps, "decay_steps": 0, "min_lr": 0.0},
+            "gamma": args.gamma,
+            "gae_lambda": args.gae_lambda,
+            "warmup_updates_per_batch": args.updates_per_batch,
         }
     )
 
@@ -163,51 +179,28 @@ def wait_for_usable_records(
         time.sleep(10)
 
 
-def forward_records(
-    model: torch.nn.Module,
-    records: list[RolloutRecord],
-    seq_len: int,
-    device: torch.device,
-    ac_offloading: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    clipped = [clipped_record_arrays(record, seq_len) for record in records]
-    total_len = sum(len(ids) for ids, _, _ in clipped)
-    if total_len == 0:
-        raise ValueError("cannot forward an empty value microbatch")
+def training_sample_from_record(record: RolloutRecord) -> TrainingSample:
+    """Convert one static rollout into the same trainer wire type used by RL warmup."""
+    token_ids, mask, logprobs = clipped_record_arrays(record, len(record.token_ids))
+    action_idxs = action_indices(mask, len(token_ids))
+    if not action_idxs:
+        raise ValueError(f"record prompt_id={record.prompt_id} rollout_id={record.rollout_id} has no actions")
 
-    input_ids: list[int] = []
-    position_ids: list[int] = []
-    targets: list[float] = []
-    mask: list[bool] = []
+    rewards = [0.0] * len(token_ids)
+    dones = [False] * len(token_ids)
+    rewards[action_idxs[-1]] = float(record.reward)
+    dones[action_idxs[-1]] = True
 
-    for record, (ids, mask_list, _) in zip(records, clipped, strict=True):
-        mask_idxs = [idx for idx in action_indices(mask_list, len(ids)) if idx > 0]
-        if not mask_idxs:
-            raise ValueError(f"record prompt_id={record.prompt_id} rollout_id={record.rollout_id} has no aligned actions")
-        input_ids.extend(ids)
-        position_ids.extend(range(len(ids)))
-        targets.extend([float(record.reward)] * len(ids))
-        mask.extend(idx in mask_idxs for idx in range(len(ids)))
-
-    input_tensor = torch.tensor(input_ids, dtype=torch.long, device=device).unsqueeze(0)
-    position_tensor = torch.tensor(position_ids, dtype=torch.long, device=device).unsqueeze(0)
-    target_tensor = torch.tensor(targets, dtype=torch.float32, device=device).unsqueeze(0)
-    mask_tensor = torch.tensor(mask, dtype=torch.bool, device=device).unsqueeze(0)
-    with maybe_activation_offloading(ac_offloading):
-        logits = align_value_logits(predict_value(model, input_tensor, position_tensor))
-    return logits, target_tensor, mask_tensor
-
-
-def forward_record(
-    model: torch.nn.Module,
-    record: RolloutRecord,
-    seq_len: int,
-    device: torch.device,
-    ac_offloading: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
-    logits, targets, mask = forward_records(model, [record], seq_len, device, ac_offloading)
-    mask_idxs = mask[0].nonzero(as_tuple=False).flatten().tolist()
-    return logits, targets, mask, mask_idxs
+    return TrainingSample(
+        token_ids=token_ids,
+        mask=mask,
+        logprobs=logprobs,
+        temperatures=[1.0] * len(token_ids),
+        env_name="rg_mix",
+        rl_weights=[0.0] * len(token_ids),
+        value_rewards=rewards,
+        value_dones=dones,
+    )
 
 
 def _cycle_batch_indices(records: list[RolloutRecord], batch_size: int, step: int, rng: random.Random) -> list[int]:
@@ -219,25 +212,92 @@ def _cycle_batch_indices(records: list[RolloutRecord], batch_size: int, step: in
     return [rng.randrange(len(records)) for _ in range(batch_size)]
 
 
-def iter_record_microbatches(
+def micro_batch_to_tensor(micro_batch: MicroBatch, max_runs: int = 1) -> TensorMicroBatch:
+    """Local copy of the trainer DataLoader MicroBatch -> tensor conversion."""
+    if micro_batch.lora_num_tokens is None:
+        micro_batch.lora_num_tokens = [0] * max_runs
+        micro_batch.lora_num_tokens[0] = len(micro_batch.input_ids)
+    mm_kwargs: dict[str, torch.Tensor] | None = None
+    if micro_batch.mm_kwargs:
+        mm_kwargs = {
+            key: torch.frombuffer(bytearray(payload.data), dtype=_torch_dtype(payload.dtype)).reshape(payload.shape)
+            for key, payload in micro_batch.mm_kwargs.items()
+        }
+    routed_experts = None
+    packed_routed_experts = micro_batch.routed_experts
+    if packed_routed_experts is not None:
+        routed_experts = (
+            torch.frombuffer(packed_routed_experts.data, dtype=_torch_dtype(packed_routed_experts.dtype))
+            .reshape(packed_routed_experts.shape)
+            .to(torch.int32)
+            .unsqueeze(0)
+        )
+    return TensorMicroBatch(
+        input_ids=torch.tensor(micro_batch.input_ids, dtype=torch.long).unsqueeze(0),
+        position_ids=torch.tensor(micro_batch.position_ids, dtype=torch.long).unsqueeze(0),
+        advantages=torch.tensor(micro_batch.advantages, dtype=torch.float).unsqueeze(0),
+        inference_logprobs=torch.tensor(micro_batch.inference_logprobs, dtype=torch.float).unsqueeze(0),
+        ref_logprobs=torch.tensor(micro_batch.ref_logprobs, dtype=torch.float).unsqueeze(0)
+        if micro_batch.ref_logprobs is not None
+        else None,
+        loss_mask=torch.tensor(micro_batch.loss_mask, dtype=torch.bool).unsqueeze(0),
+        temperatures=torch.tensor(micro_batch.temperatures, dtype=torch.float).unsqueeze(0),
+        env_names=micro_batch.env_names,
+        sequence_lengths=micro_batch.sequence_lengths,
+        lora_num_tokens=torch.tensor(micro_batch.lora_num_tokens, dtype=torch.int32),
+        routed_experts=routed_experts,
+        mm_kwargs=mm_kwargs,
+        mm_token_type_ids=torch.tensor(micro_batch.mm_token_type_ids, dtype=torch.long).unsqueeze(0)
+        if micro_batch.mm_token_type_ids is not None
+        else None,
+        rl_weights=torch.tensor(micro_batch.rl_weights, dtype=torch.float).unsqueeze(0)
+        if micro_batch.rl_weights is not None
+        else None,
+        ce_weights=torch.tensor(micro_batch.ce_weights, dtype=torch.float).unsqueeze(0)
+        if micro_batch.ce_weights is not None
+        else None,
+        ref_kl_weights=torch.tensor(micro_batch.ref_kl_weights, dtype=torch.float).unsqueeze(0)
+        if micro_batch.ref_kl_weights is not None
+        else None,
+        value_rewards=torch.tensor(micro_batch.value_rewards, dtype=torch.float).unsqueeze(0)
+        if micro_batch.value_rewards is not None
+        else None,
+        value_dones=torch.tensor(micro_batch.value_dones, dtype=torch.bool).unsqueeze(0)
+        if micro_batch.value_dones is not None
+        else None,
+        run_id=micro_batch.run_id,
+        run_step=micro_batch.run_step,
+        phase=micro_batch.phase,
+        save_checkpoint=micro_batch.save_checkpoint,
+    )
+
+
+def prepare_value_micro_batches(
     records: list[RolloutRecord],
     *,
     seq_len: int,
-    max_records: int,
-    max_tokens: int,
-) -> Iterable[list[RolloutRecord]]:
-    chunk: list[RolloutRecord] = []
-    chunk_tokens = 0
-    for record in records:
-        record_tokens = len(clipped_record_arrays(record, seq_len)[0])
-        if chunk and (len(chunk) >= max_records or chunk_tokens + record_tokens > max_tokens):
-            yield chunk
-            chunk = []
-            chunk_tokens = 0
-        chunk.append(record)
-        chunk_tokens += record_tokens
-    if chunk:
-        yield chunk
+    dp_rank: int,
+    dp_world_size: int,
+    bin_cost,
+    pad_to_multiple_of: int,
+) -> list[TensorMicroBatch]:
+    samples = [training_sample_from_record(record) for record in records]
+    micro_batch_grid = prepare_batch(
+        rollouts=samples,
+        seq_len=seq_len,
+        num_train_workers=dp_world_size,
+        idxs=[0] * len(samples),
+        num_loras=1,
+        bin_cost=bin_cost,
+        pad_to_multiple_of=pad_to_multiple_of,
+        phase="value_warmup",
+    )
+    return [micro_batch_to_tensor(micro_batch) for micro_batch in micro_batch_grid[dp_rank]]
+
+
+def data_parallel_rank(global_rank: int, world_size: int, dp_world_size: int) -> int:
+    non_dp_world_size = world_size // dp_world_size
+    return global_rank // non_dp_world_size
 
 
 def train(args: argparse.Namespace) -> None:
@@ -246,23 +306,19 @@ def train(args: argparse.Namespace) -> None:
     setup_torch_distributed(timeout=timedelta(seconds=args.dist_timeout_seconds), enable_gloo=False)
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda", world.local_rank)
-    if args.global_batch_size % world.world_size != 0:
-        raise ValueError(
-            f"global_batch_size={args.global_batch_size} must be divisible by world_size={world.world_size} "
-            "so every FSDP rank executes the same number of forwards."
-        )
-    if args.micro_batch_size < 1:
-        raise ValueError(f"micro_batch_size must be >= 1, got {args.micro_batch_size}")
-    if args.micro_batch_token_budget is not None and args.micro_batch_token_budget < 1:
-        raise ValueError(f"micro_batch_token_budget must be >= 1, got {args.micro_batch_token_budget}")
+    if args.global_batch_size < 1:
+        raise ValueError(f"global_batch_size must be >= 1, got {args.global_batch_size}")
+    if args.updates_per_batch < 1:
+        raise ValueError(f"updates_per_batch must be >= 1, got {args.updates_per_batch}")
     if args.log_every < 1:
         raise ValueError(f"log_every must be >= 1, got {args.log_every}")
 
     mconfig = model_config(args)
-    micro_batch_token_budget = args.micro_batch_token_budget or args.seq_len
     vconfig = value_config(args)
     resolve_ep(mconfig)
     parallel_dims = get_parallel_dims(mconfig, seq_len=args.seq_len)
+    dp_world_size = parallel_dims.get_mesh("dp").size()
+    dp_rank = data_parallel_rank(world.rank, world.world_size, dp_world_size)
     logger.info(f"Initializing static value model ({mconfig})")
     value_model = setup_value_model(
         mconfig,
@@ -277,6 +333,131 @@ def train(args: argparse.Namespace) -> None:
         cpu_offload=mconfig.optim_cpu_offload,
     )
     scheduler = setup_scheduler(optimizer, vconfig.scheduler, args.steps, vconfig.optim.lr)
+    bin_cost = build_bin_cost(value_model.config)
+    cp_enabled = parallel_dims.cp_enabled
+    cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
+    cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
+    cp_size = parallel_dims.cp
+
+    def prepare_value_inputs(micro_batch: TensorMicroBatch):
+        if micro_batch["value_rewards"] is None or micro_batch["value_dones"] is None:
+            raise ValueError("Value functions require value_rewards and value_dones in every training batch.")
+
+        input_ids = micro_batch["input_ids"].to(device)
+        position_ids = micro_batch["position_ids"].to(device)
+        loss_mask = micro_batch["loss_mask"].to(device)
+        rewards = micro_batch["value_rewards"].to(device)
+        dones = micro_batch["value_dones"].to(device)
+        routed_experts = micro_batch["routed_experts"].to(device) if micro_batch["routed_experts"] is not None else None
+        mm_kwargs_raw = micro_batch.get("mm_kwargs")
+        mm_kwargs = {k: v.to(device) for k, v in mm_kwargs_raw.items()} if mm_kwargs_raw else None
+        mm_token_type_ids = (
+            micro_batch["mm_token_type_ids"].to(device) if micro_batch.get("mm_token_type_ids") is not None else None
+        )
+        if cp_enabled and mm_kwargs is not None:
+            raise NotImplementedError("Context parallelism is not supported with VLM/multimodal training")
+
+        if cp_enabled:
+            input_ids, forward_position_ids = setup_cp_params(
+                input_ids, position_ids, cp_rank, cp_size, cp_group, cp_style=mconfig.cp_style
+            )
+            if routed_experts is not None:
+                routed_experts = shard_for_cp(routed_experts, cp_rank=cp_rank, cp_world_size=cp_size)
+        else:
+            forward_position_ids = position_ids
+
+        return {
+            "input_ids": input_ids,
+            "position_ids": forward_position_ids,
+            "routed_experts": routed_experts,
+            "mm_kwargs": mm_kwargs,
+            "mm_token_type_ids": mm_token_type_ids,
+            "mask": loss_mask,
+            "rewards": rewards,
+            "dones": dones,
+        }
+
+    def forward_value_logits(value_inputs: dict[str, torch.Tensor | dict[str, torch.Tensor] | None]) -> torch.Tensor:
+        with maybe_activation_offloading(mconfig.ac_offloading):
+            value_logits = predict_value(
+                value_model,
+                value_inputs["input_ids"],
+                value_inputs["position_ids"],
+                mm_kwargs=value_inputs["mm_kwargs"],
+                mm_token_type_ids=value_inputs["mm_token_type_ids"],
+                routed_experts=value_inputs["routed_experts"],
+            )
+        if cp_enabled:
+            value_logits = gather_for_cp(value_logits, cp_group)
+        return align_value_logits(value_logits)
+
+    def build_value_targets(micro_batches: list[TensorMicroBatch]) -> dict[int, ValueTargets]:
+        targets = {}
+        for micro_step, micro_batch in enumerate(micro_batches):
+            value_inputs = prepare_value_inputs(micro_batch)
+            with torch.no_grad():
+                value_logits = forward_value_logits(value_inputs)
+                values = predict_values(value_logits, vconfig.loss)
+                advantages, returns = compute_gae(
+                    rewards=value_inputs["rewards"],
+                    dones=value_inputs["dones"],
+                    values=values,
+                    mask=value_inputs["mask"],
+                    sequence_lengths=micro_batch["sequence_lengths"],
+                    gamma=vconfig.gamma,
+                    gae_lambda=vconfig.gae_lambda,
+                )
+            targets[micro_step] = ValueTargets(
+                advantages=advantages.detach(),
+                returns=returns.detach(),
+                mask=value_inputs["mask"].detach(),
+            )
+        return targets
+
+    def run_value_updates(
+        micro_batches: list[TensorMicroBatch],
+        value_targets: dict[int, ValueTargets],
+        value_scale: int,
+        tensors: Tensors,
+    ) -> ValueUpdateStats:
+        value_grad_norm: torch.Tensor | None = None
+        value_zero_grad_ratio: float | None = None
+        for _ in range(vconfig.warmup_updates_per_batch):
+            optimizer.zero_grad()
+            for micro_step, micro_batch in enumerate(micro_batches):
+                value_inputs = prepare_value_inputs(micro_batch)
+                value_logits = forward_value_logits(value_inputs)
+                value_loss, value_tensors = compute_value_loss(
+                    value_logits,
+                    targets=value_targets[micro_step].returns,
+                    mask=value_targets[micro_step].mask,
+                    config=vconfig,
+                    scale=value_scale,
+                )
+                value_loss.backward()
+                tensors["value/scaled_loss"].append(value_loss.detach().to("cpu").unsqueeze(0))
+                for key, value_tensor in value_tensors.items():
+                    tensors[key].append(value_tensor.detach().to("cpu"))
+
+            for param in value_model.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
+
+            if vconfig.optim.max_norm is not None:
+                value_grad_norm = clip_grad_norm_(
+                    value_model.parameters(),
+                    max_norm=vconfig.optim.max_norm,
+                    ep_enabled=parallel_dims.ep_enabled,
+                )
+                if value_grad_norm.device.type == "cpu":
+                    value_grad_norm = value_grad_norm.to(device)
+
+            value_zero_grad_ratio = get_zero_gradient_ratio(value_model.parameters(), parallel_dims.dp_replicate)
+            optimizer.step()
+            scheduler.step()
+
+        optimizer.zero_grad()
+        return ValueUpdateStats(grad_norm=value_grad_norm, zero_grad_ratio=value_zero_grad_ratio)
 
     min_train_records = args.min_train_records or args.global_batch_size
     if args.stream:
@@ -313,6 +494,7 @@ def train(args: argparse.Namespace) -> None:
         )
 
     for step in range(args.steps):
+        torch.cuda.synchronize()
         step_start = time.perf_counter()
         if args.stream and step > 0 and step % args.reload_records_interval == 0:
             _, refreshed_records = wait_for_usable_records(
@@ -328,105 +510,76 @@ def train(args: argparse.Namespace) -> None:
                 rng.shuffle(train_records)
                 logger.info(f"Reloaded {len(train_records)} train records")
         value_model.train()
-        optimizer.zero_grad(set_to_none=True)
         batch_indices = _cycle_batch_indices(train_records, args.global_batch_size, step, rng)
-        local_indices = batch_indices[world.rank :: world.world_size]
-        local_action_tokens = sum(
-            len([i for i in action_indices(train_records[idx].mask, args.seq_len) if i > 0]) for idx in local_indices
+        batch_records = [train_records[idx] for idx in batch_indices]
+        micro_batches = prepare_value_micro_batches(
+            batch_records,
+            seq_len=args.seq_len,
+            dp_rank=dp_rank,
+            dp_world_size=dp_world_size,
+            bin_cost=bin_cost,
+            pad_to_multiple_of=mconfig.cp,
         )
-        local_forward_tokens = sum(len(clipped_record_arrays(train_records[idx], args.seq_len)[0]) for idx in local_indices)
-        scale_tensor = torch.tensor(local_action_tokens, dtype=torch.float32, device=device)
-        forward_tokens_tensor = torch.tensor(local_forward_tokens, dtype=torch.float32, device=device)
-        dist.all_reduce(scale_tensor, op=dist.ReduceOp.SUM, group=parallel_dims.get_mesh("dp_cp").get_group())
-        dist.all_reduce(
-            forward_tokens_tensor,
-            op=dist.ReduceOp.SUM,
-            group=parallel_dims.get_mesh("dp_cp").get_group(),
-        )
-        global_scale = max(int(scale_tensor.item()), 1)
-        loss_sum = torch.zeros((), dtype=torch.float32, device=device)
-        metric_tokens = torch.zeros((), dtype=torch.float32, device=device)
+        local_value_scale = sum(int(micro_batch["loss_mask"].sum()) for micro_batch in micro_batches)
+        local_forward_tokens = sum(int(micro_batch["input_ids"].numel()) for micro_batch in micro_batches)
+        global_counts = torch.tensor([local_value_scale, local_forward_tokens], dtype=torch.float32, device=device)
+        dist.all_reduce(global_counts, op=dist.ReduceOp.SUM, group=parallel_dims.get_mesh("dp_cp").get_group())
+        value_scale = max(int(global_counts[0].item()), 1)
+        forward_tokens = float(global_counts[1].item())
 
-        local_records = [train_records[idx] for idx in local_indices]
-        local_micro_batches = list(
-            iter_record_microbatches(
-                local_records,
-                seq_len=args.seq_len,
-                max_records=args.micro_batch_size,
-                max_tokens=micro_batch_token_budget,
-            )
-        )
         if world.is_master and step == 0:
-            micro_batch_tokens = [
-                sum(len(clipped_record_arrays(record, args.seq_len)[0]) for record in micro_records)
-                for micro_records in local_micro_batches
+            micro_batch_tokens = [int(micro_batch["input_ids"].numel()) for micro_batch in micro_batches]
+            sequence_lengths = [
+                length for micro_batch in micro_batches for length in micro_batch["sequence_lengths"] if length > 0
             ]
             logger.info(
                 json.dumps(
                     {
-                        "value_train/local_records": len(local_records),
-                        "value_train/local_micro_batches": len(local_micro_batches),
+                        "value_train/dp_world_size": dp_world_size,
+                        "value_train/local_micro_batches": len(micro_batches),
                         "value_train/local_microbatch_max_tokens": max(micro_batch_tokens, default=0),
                         "value_train/local_microbatch_mean_tokens": sum(micro_batch_tokens)
                         / max(len(micro_batch_tokens), 1),
-                        "value_train/mean_records_per_local_microbatch": len(local_records)
-                        / max(len(local_micro_batches), 1),
+                        "value_train/local_max_sequence_length": max(sequence_lengths, default=0),
+                        "value_train/mean_sequences_per_local_microbatch": len(sequence_lengths)
+                        / max(len(micro_batches), 1),
                     },
                     sort_keys=True,
                 )
             )
-        for micro_records in local_micro_batches:
-            logits, targets, mask = forward_records(
-                value_model,
-                micro_records,
-                args.seq_len,
-                device,
-                mconfig.ac_offloading,
-            )
-            loss, metrics = compute_value_loss(logits, targets, mask, vconfig, scale=global_scale)
-            loss.backward()
-            if metrics["value/loss"].numel():
-                loss_sum += metrics["value/loss"].sum().to(device)
-                metric_tokens += metrics["value/loss"].numel()
 
-        for param in value_model.parameters():
-            if param.grad is not None:
-                param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
-
-        grad_norm = None
-        if vconfig.optim.max_norm is not None:
-            grad_norm = clip_grad_norm_(
-                value_model.parameters(),
-                max_norm=vconfig.optim.max_norm,
-                ep_enabled=parallel_dims.ep_enabled,
-            )
-            if grad_norm.device.type == "cpu":
-                grad_norm = grad_norm.to(device)
-        zero_grad_ratio = get_zero_gradient_ratio(value_model.parameters(), parallel_dims.dp_replicate)
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=parallel_dims.get_mesh("dp_cp").get_group())
-        dist.all_reduce(metric_tokens, op=dist.ReduceOp.SUM, group=parallel_dims.get_mesh("dp_cp").get_group())
+        tensors = Tensors()
+        value_targets = build_value_targets(micro_batches)
+        value_update_stats = run_value_updates(
+            micro_batches,
+            value_targets,
+            value_scale,
+            tensors,
+        )
+        tensor_stats = tensors.compute_stats()
         if world.is_master and (step == 0 or (step + 1) % args.log_every == 0 or step + 1 == args.steps):
+            torch.cuda.synchronize()
             step_seconds = time.perf_counter() - step_start
-            forward_tokens = float(forward_tokens_tensor.item())
             peak_flops = args.mfu_peak_tflops_per_gpu * 1e12 * world.world_size
-            estimated_flops = 6.0 * args.mfu_model_params * forward_tokens
+            estimated_flops = (2.0 + 6.0 * vconfig.warmup_updates_per_batch) * args.mfu_model_params * forward_tokens
             metrics = {
                 "value_train/step": step + 1,
-                "value_train/loss": float(loss_sum.item() / max(metric_tokens.item(), 1.0)),
+                "value_train/loss": tensor_stats.get("value/loss/mean", float("nan")),
                 "value_train/lr": float(scheduler.get_last_lr()[0]),
-                "value_train/tokens": int(scale_tensor.item()),
+                "value_train/tokens": int(global_counts[0].item()),
                 "value_train/forward_tokens": int(forward_tokens),
                 "value_train/step_seconds": step_seconds,
                 "value_train/forward_tokens_per_second": forward_tokens / max(step_seconds, 1e-6),
                 "value_train/estimated_mfu": estimated_flops / max(step_seconds * peak_flops, 1e-6),
-                "value_train/zero_grad_ratio": zero_grad_ratio,
+                "value_train/updates_per_batch": vconfig.warmup_updates_per_batch,
             }
-            if grad_norm is not None:
-                metrics["value_train/grad_norm"] = float(grad_norm.item())
+            for key in ("value/accuracy/mean", "value/prediction/mean", "value/target/mean", "value/abs_error/mean"):
+                if key in tensor_stats:
+                    metrics[f"value_train/{key}"] = tensor_stats[key]
+            if value_update_stats.zero_grad_ratio is not None:
+                metrics["value_train/zero_grad_ratio"] = value_update_stats.zero_grad_ratio
+            if value_update_stats.grad_norm is not None:
+                metrics["value_train/grad_norm"] = float(value_update_stats.grad_norm.item())
             logger.info(json.dumps(metrics, sort_keys=True))
             if wandb is not None:
                 wandb.log(metrics, step=step + 1)

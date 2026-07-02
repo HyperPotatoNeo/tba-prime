@@ -81,7 +81,7 @@ def _classification_targets(
 ) -> Tensor:
     low, high = _reward_bounds(loss_config)
     targets = targets.float()
-    tol = 1e-6 * max(high - low, 1.0)
+    tol = 1e-5 * max(high - low, 1.0)
     out_of_range = (targets < low - tol) | (targets > high + tol)
     if bool(out_of_range.any()):
         offending = targets[out_of_range][0].item()

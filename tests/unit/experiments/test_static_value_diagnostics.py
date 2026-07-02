@@ -89,7 +89,7 @@ def test_fractional_rewards_skip_binary_odds_methods():
     assert "anchored_add_clipped" in summary
 
 
-def test_forward_record_aligns_generated_tokens_to_previous_prefix(monkeypatch):
+def test_training_sample_from_record_stamps_terminal_value_reward():
     pytest.importorskip("torchtitan")
     from experiments.static_value_diagnostics import train_static_value
 
@@ -105,21 +105,24 @@ def test_forward_record_aligns_generated_tokens_to_previous_prefix(monkeypatch):
         num_output_tokens=2,
     )
 
-    def fake_predict_value(model, input_ids, position_ids):
-        del model, position_ids
-        return input_ids.float().unsqueeze(-1)
+    sample = train_static_value.training_sample_from_record(record)
+    [micro_batch] = train_static_value.prepare_value_micro_batches(
+        [record],
+        seq_len=16,
+        dp_rank=0,
+        dp_world_size=1,
+        bin_cost=lambda seqlens: sum(seqlens),
+        pad_to_multiple_of=1,
+    )
 
-    monkeypatch.setattr(train_static_value, "predict_value", fake_predict_value)
-    logits, targets, mask, mask_idxs = train_static_value.forward_record(None, record, 16, torch.device("cpu"), None)
-
-    assert mask_idxs == [2, 3]
-    assert mask.tolist() == [[False, False, True, True]]
-    assert targets[0, 2:].tolist() == pytest.approx([1.0, 1.0])
-    assert logits[0, 2, 0].item() == pytest.approx(22.0)
-    assert logits[0, 3, 0].item() == pytest.approx(33.0)
+    assert sample.rl_weights == [0.0, 0.0, 0.0, 0.0]
+    assert sample.value_rewards == [0.0, 0.0, 0.0, 1.0]
+    assert sample.value_dones == [False, False, False, True]
+    assert micro_batch["loss_mask"].tolist() == [[False, False, True, True]]
+    assert micro_batch["value_rewards"].tolist() == [[0.0, 0.0, 0.0, 1.0]]
 
 
-def test_forward_records_packs_microbatch_with_sequence_resets(monkeypatch):
+def test_prepare_value_micro_batches_uses_prime_packer_sequence_resets():
     pytest.importorskip("torchtitan")
     from experiments.static_value_diagnostics import train_static_value
 
@@ -148,25 +151,26 @@ def test_forward_records_packs_microbatch_with_sequence_resets(monkeypatch):
         ),
     ]
 
-    def fake_predict_value(model, input_ids, position_ids):
-        del model
-        assert input_ids.shape == (1, 7)
-        assert position_ids.tolist() == [[0, 1, 2, 3, 0, 1, 2]]
-        assert position_ids.is_contiguous()
-        return input_ids.float().unsqueeze(-1)
+    [micro_batch] = train_static_value.prepare_value_micro_batches(
+        records,
+        seq_len=16,
+        dp_rank=0,
+        dp_world_size=1,
+        bin_cost=lambda seqlens: sum(seqlens),
+        pad_to_multiple_of=1,
+    )
 
-    monkeypatch.setattr(train_static_value, "predict_value", fake_predict_value)
-    logits, targets, mask = train_static_value.forward_records(None, records, 16, torch.device("cpu"), None)
-
-    assert mask.tolist() == [[False, False, True, True, False, True, True]]
-    assert targets[0, mask[0]].tolist() == pytest.approx([1.0, 1.0, 0.0, 0.0])
-    assert logits[0, 5, 0].item() == pytest.approx(55.0)
-    assert logits[0, 6, 0].item() == pytest.approx(66.0)
+    assert micro_batch["input_ids"].shape == (1, 7)
+    assert micro_batch["position_ids"].tolist() == [[0, 1, 2, 3, 0, 1, 2]]
+    assert micro_batch["sequence_lengths"] == [4, 3]
+    assert micro_batch["loss_mask"].tolist() == [[False, False, True, True, False, True, True]]
+    assert micro_batch["value_dones"].tolist() == [[False, False, False, True, False, False, True]]
 
 
-def test_microbatch_token_budget_can_exceed_sequence_length():
+def test_static_value_targets_match_terminal_reward_after_packing():
     pytest.importorskip("torchtitan")
     from experiments.static_value_diagnostics import train_static_value
+    from prime_rl.trainer.value import compute_gae
 
     records = [
         RolloutRecord(
@@ -174,21 +178,32 @@ def test_microbatch_token_budget_can_exceed_sequence_length():
             prompt_id=i,
             rollout_id=0,
             group_id=f"train:{i}",
-            reward=0.0,
+            reward=float(i),
             token_ids=list(range(6)),
             mask=[False, True, True, True, True, True],
             logprobs=[0.0] * 6,
             num_output_tokens=5,
         )
-        for i in range(3)
+        for i in range(2)
     ]
 
-    capped = list(
-        train_static_value.iter_record_microbatches(records, seq_len=8, max_records=8, max_tokens=8)
+    [micro_batch] = train_static_value.prepare_value_micro_batches(
+        records,
+        seq_len=16,
+        dp_rank=0,
+        dp_world_size=1,
+        bin_cost=lambda seqlens: sum(seqlens),
+        pad_to_multiple_of=1,
     )
-    expanded = list(
-        train_static_value.iter_record_microbatches(records, seq_len=8, max_records=8, max_tokens=24)
+    values = torch.zeros_like(micro_batch["value_rewards"])
+    _, returns = compute_gae(
+        rewards=micro_batch["value_rewards"],
+        dones=micro_batch["value_dones"],
+        values=values,
+        mask=micro_batch["loss_mask"],
+        sequence_lengths=micro_batch["sequence_lengths"],
+        gamma=1.0,
+        gae_lambda=1.0,
     )
 
-    assert [len(batch) for batch in capped] == [1, 1, 1]
-    assert [len(batch) for batch in expanded] == [3]
+    assert returns[micro_batch["loss_mask"]].tolist() == pytest.approx([0.0] * 5 + [1.0] * 5)
