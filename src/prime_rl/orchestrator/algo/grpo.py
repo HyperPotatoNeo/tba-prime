@@ -20,12 +20,23 @@ class GRPOAlgorithm(Algorithm):
     def __init__(self, config: GRPOAlgoConfig, policy_pool: InferencePool):
         super().__init__(config, policy_pool)
         self.length_penalty = config.length_penalty
+        self.baseline = config.baseline
+
+    def _baseline(self, rewards: torch.Tensor) -> torch.Tensor:
+        """Per-rollout group baseline: the group mean, or the leave-one-out mean
+        ``B_i = (sum_{j!=i} R_j) / (G-1)`` which excludes the rollout's own reward."""
+        if self.baseline == "loo":
+            group_size = rewards.numel()
+            if group_size < 2:
+                return rewards.mean()
+            return (rewards.sum() - rewards) / (group_size - 1)
+        return rewards.mean()
 
     async def score_group(self, group: list[Rollout]) -> None:
         rewards = torch.tensor([rollout.reward for rollout in group], dtype=torch.float32)
         length_penalty = self.length_penalty
         if length_penalty is None:
-            advantages = rewards - rewards.mean()
+            advantages = rewards - self._baseline(rewards)
         else:
             output = torch.tensor([rollout.num_output_tokens for rollout in group], dtype=rewards.dtype)
             total = torch.tensor([rollout.num_total_tokens for rollout in group], dtype=rewards.dtype)
@@ -38,6 +49,6 @@ class GRPOAlgorithm(Algorithm):
             )
             penalty = rewards.mean() * penalty_frac
             shaped_rewards = rewards - penalty
-            advantages = shaped_rewards - shaped_rewards.mean()
+            advantages = shaped_rewards - self._baseline(shaped_rewards)
         for rollout, advantage in zip(group, advantages.tolist(), strict=True):
             rollout.assign_advantages(advantage)
