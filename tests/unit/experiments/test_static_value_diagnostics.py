@@ -110,7 +110,7 @@ def test_forward_record_aligns_generated_tokens_to_previous_prefix(monkeypatch):
         return input_ids.float().unsqueeze(-1)
 
     monkeypatch.setattr(train_static_value, "predict_value", fake_predict_value)
-    logits, targets, mask, mask_idxs = train_static_value.forward_record(None, record, 16, torch.device("cpu"))
+    logits, targets, mask, mask_idxs = train_static_value.forward_record(None, record, 16, torch.device("cpu"), None)
 
     assert mask_idxs == [2, 3]
     assert mask.tolist() == [[False, False, True, True]]
@@ -156,9 +156,39 @@ def test_forward_records_packs_microbatch_with_sequence_resets(monkeypatch):
         return input_ids.float().unsqueeze(-1)
 
     monkeypatch.setattr(train_static_value, "predict_value", fake_predict_value)
-    logits, targets, mask = train_static_value.forward_records(None, records, 16, torch.device("cpu"))
+    logits, targets, mask = train_static_value.forward_records(None, records, 16, torch.device("cpu"), None)
 
     assert mask.tolist() == [[False, False, True, True, False, True, True]]
     assert targets[0, mask[0]].tolist() == pytest.approx([1.0, 1.0, 0.0, 0.0])
     assert logits[0, 5, 0].item() == pytest.approx(55.0)
     assert logits[0, 6, 0].item() == pytest.approx(66.0)
+
+
+def test_microbatch_token_budget_can_exceed_sequence_length():
+    pytest.importorskip("torchtitan")
+    from experiments.static_value_diagnostics import train_static_value
+
+    records = [
+        RolloutRecord(
+            split="train",
+            prompt_id=i,
+            rollout_id=0,
+            group_id=f"train:{i}",
+            reward=0.0,
+            token_ids=list(range(6)),
+            mask=[False, True, True, True, True, True],
+            logprobs=[0.0] * 6,
+            num_output_tokens=5,
+        )
+        for i in range(3)
+    ]
+
+    capped = list(
+        train_static_value.iter_record_microbatches(records, seq_len=8, max_records=8, max_tokens=8)
+    )
+    expanded = list(
+        train_static_value.iter_record_microbatches(records, seq_len=8, max_records=8, max_tokens=24)
+    )
+
+    assert [len(batch) for batch in capped] == [1, 1, 1]
+    assert [len(batch) for batch in expanded] == [3]

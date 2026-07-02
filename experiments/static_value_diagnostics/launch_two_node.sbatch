@@ -34,9 +34,13 @@ MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-$((SEQ_LEN - 512))}"
 VALUE_STEPS="${VALUE_STEPS:-300}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-256}"
 VALUE_MICRO_BATCH_SIZE="${VALUE_MICRO_BATCH_SIZE:-8}"
+VALUE_MICRO_BATCH_TOKEN_BUDGET="${VALUE_MICRO_BATCH_TOKEN_BUDGET:-32768}"
 VALUE_DISABLE_COMPILE="${VALUE_DISABLE_COMPILE:-1}"
 VALUE_DISABLE_OPTIM_CPU_OFFLOAD="${VALUE_DISABLE_OPTIM_CPU_OFFLOAD:-1}"
-VALUE_DISABLE_AC_OFFLOADING="${VALUE_DISABLE_AC_OFFLOADING:-0}"
+VALUE_DISABLE_AC_OFFLOADING="${VALUE_DISABLE_AC_OFFLOADING:-1}"
+VALUE_DISABLE_RESHARD_AFTER_FORWARD="${VALUE_DISABLE_RESHARD_AFTER_FORWARD:-1}"
+VALUE_DP_REPLICATE="${VALUE_DP_REPLICATE:-4}"
+VALUE_LOG_EVERY="${VALUE_LOG_EVERY:-1}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-50}"
 VALUE_LR="${VALUE_LR:-5e-5}"
 VALUE_RELOAD_RECORDS_INTERVAL="${VALUE_RELOAD_RECORDS_INTERVAL:-1}"
@@ -154,8 +158,11 @@ fi
 if [[ "$VALUE_DISABLE_AC_OFFLOADING" == "1" || "$VALUE_DISABLE_AC_OFFLOADING" == "true" ]]; then
   value_args+=(--disable-ac-offloading)
 fi
+if [[ "$VALUE_DISABLE_RESHARD_AFTER_FORWARD" == "1" || "$VALUE_DISABLE_RESHARD_AFTER_FORWARD" == "true" ]]; then
+  value_args+=(--disable-reshard-after-forward)
+fi
 
-ssh "$TRAIN_NODE" "cd '$REPO_DIR' && export HOME='$HOME' PATH='$PATH' UV_CACHE_DIR='$UV_CACHE_DIR' WANDB_API_KEY='$WANDB_API_KEY' PYTHONPATH='$PYTHONPATH' PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC='${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}'; uv run torchrun --standalone --nproc-per-node 4 -m experiments.static_value_diagnostics.train_static_value --rollouts '$RUN_DIR/data/rollouts.jsonl' --output-dir '$RUN_DIR/value' --model '$MODEL' --seq-len '$SEQ_LEN' --steps '$VALUE_STEPS' --global-batch-size '$GLOBAL_BATCH_SIZE' --micro-batch-size '$VALUE_MICRO_BATCH_SIZE' --lr '$VALUE_LR' --warmup-steps '$VALUE_WARMUP_STEPS' --reward-range 0 1 --n-bins 1 ${value_args[*]} --stream --reload-records-interval '$VALUE_RELOAD_RECORDS_INTERVAL' --min-train-records '$GLOBAL_BATCH_SIZE' --expected-val-records '$((NUM_VAL_PROMPTS * GROUP_SIZE))' --expected-test-records '$((NUM_TEST_PROMPTS * GROUP_SIZE))' --wandb-project '$WANDB_PROJECT' --wandb-run-name '$EXPERIMENT_NAME-value-4gpu-$SLURM_JOB_ID'" \
+ssh "$TRAIN_NODE" "cd '$REPO_DIR' && export HOME='$HOME' PATH='$PATH' UV_CACHE_DIR='$UV_CACHE_DIR' WANDB_API_KEY='$WANDB_API_KEY' PYTHONPATH='$PYTHONPATH' PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0,1,2,3 TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC='${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}'; uv run torchrun --standalone --nproc-per-node 4 -m experiments.static_value_diagnostics.train_static_value --rollouts '$RUN_DIR/data/rollouts.jsonl' --output-dir '$RUN_DIR/value' --model '$MODEL' --seq-len '$SEQ_LEN' --steps '$VALUE_STEPS' --global-batch-size '$GLOBAL_BATCH_SIZE' --micro-batch-size '$VALUE_MICRO_BATCH_SIZE' --micro-batch-token-budget '$VALUE_MICRO_BATCH_TOKEN_BUDGET' --lr '$VALUE_LR' --warmup-steps '$VALUE_WARMUP_STEPS' --dp-replicate '$VALUE_DP_REPLICATE' --reward-range 0 1 --n-bins 1 ${value_args[*]} --log-every '$VALUE_LOG_EVERY' --stream --reload-records-interval '$VALUE_RELOAD_RECORDS_INTERVAL' --min-train-records '$GLOBAL_BATCH_SIZE' --expected-val-records '$((NUM_VAL_PROMPTS * GROUP_SIZE))' --expected-test-records '$((NUM_TEST_PROMPTS * GROUP_SIZE))' --wandb-project '$WANDB_PROJECT' --wandb-run-name '$EXPERIMENT_NAME-value-4gpu-$SLURM_JOB_ID'" \
   > "$RUN_DIR/value_train.log" 2>&1 &
 TRAIN_PID=$!
 

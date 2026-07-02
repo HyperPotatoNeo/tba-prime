@@ -30,6 +30,7 @@ from prime_rl.trainer.scheduler import setup_scheduler
 from prime_rl.trainer.utils import get_zero_gradient_ratio, setup_torch_distributed
 from prime_rl.trainer.value import align_value_logits, compute_value_loss, predict_values, value_head_output_size
 from prime_rl.trainer.world import get_world
+from prime_rl.utils.act_offloading import maybe_activation_offloading
 from prime_rl.utils.logger import setup_logger
 
 
@@ -42,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument("--micro-batch-token-budget", type=int, default=None)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
@@ -54,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-compile", action="store_true")
     parser.add_argument("--disable-ac", action="store_true")
     parser.add_argument("--disable-ac-offloading", action="store_true")
+    parser.add_argument("--disable-reshard-after-forward", action="store_true")
     parser.add_argument("--disable-optim-cpu-offload", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--dp-replicate", type=int, default=1)
@@ -70,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-val-records", type=int, default=0)
     parser.add_argument("--expected-test-records", type=int, default=0)
     parser.add_argument("--wait-timeout-seconds", type=int, default=7200)
+    parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--mfu-model-params", type=float, default=4.0e9)
     parser.add_argument("--mfu-peak-tflops-per-gpu", type=float, default=312.0)
     return parser.parse_args()
@@ -88,6 +92,7 @@ def model_config(args: argparse.Namespace) -> ModelConfig:
             "compile": None if args.disable_compile else {},
             "ac": None if args.disable_ac else {},
             "ac_offloading": None if args.disable_ac_offloading else {},
+            "reshard_after_forward": not args.disable_reshard_after_forward,
             "optim_cpu_offload": not args.disable_optim_cpu_offload,
             "trust_remote_code": args.trust_remote_code,
             "dp_replicate": args.dp_replicate,
@@ -163,6 +168,7 @@ def forward_records(
     records: list[RolloutRecord],
     seq_len: int,
     device: torch.device,
+    ac_offloading: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     clipped = [clipped_record_arrays(record, seq_len) for record in records]
     total_len = sum(len(ids) for ids, _, _ in clipped)
@@ -187,7 +193,9 @@ def forward_records(
     position_tensor = torch.tensor(position_ids, dtype=torch.long, device=device).unsqueeze(0)
     target_tensor = torch.tensor(targets, dtype=torch.float32, device=device).unsqueeze(0)
     mask_tensor = torch.tensor(mask, dtype=torch.bool, device=device).unsqueeze(0)
-    return align_value_logits(predict_value(model, input_tensor, position_tensor)), target_tensor, mask_tensor
+    with maybe_activation_offloading(ac_offloading):
+        logits = align_value_logits(predict_value(model, input_tensor, position_tensor))
+    return logits, target_tensor, mask_tensor
 
 
 def forward_record(
@@ -195,8 +203,9 @@ def forward_record(
     record: RolloutRecord,
     seq_len: int,
     device: torch.device,
+    ac_offloading: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]:
-    logits, targets, mask = forward_records(model, [record], seq_len, device)
+    logits, targets, mask = forward_records(model, [record], seq_len, device, ac_offloading)
     mask_idxs = mask[0].nonzero(as_tuple=False).flatten().tolist()
     return logits, targets, mask, mask_idxs
 
@@ -215,12 +224,13 @@ def iter_record_microbatches(
     *,
     seq_len: int,
     max_records: int,
+    max_tokens: int,
 ) -> Iterable[list[RolloutRecord]]:
     chunk: list[RolloutRecord] = []
     chunk_tokens = 0
     for record in records:
         record_tokens = len(clipped_record_arrays(record, seq_len)[0])
-        if chunk and (len(chunk) >= max_records or chunk_tokens + record_tokens > seq_len):
+        if chunk and (len(chunk) >= max_records or chunk_tokens + record_tokens > max_tokens):
             yield chunk
             chunk = []
             chunk_tokens = 0
@@ -243,8 +253,13 @@ def train(args: argparse.Namespace) -> None:
         )
     if args.micro_batch_size < 1:
         raise ValueError(f"micro_batch_size must be >= 1, got {args.micro_batch_size}")
+    if args.micro_batch_token_budget is not None and args.micro_batch_token_budget < 1:
+        raise ValueError(f"micro_batch_token_budget must be >= 1, got {args.micro_batch_token_budget}")
+    if args.log_every < 1:
+        raise ValueError(f"log_every must be >= 1, got {args.log_every}")
 
     mconfig = model_config(args)
+    micro_batch_token_budget = args.micro_batch_token_budget or args.seq_len
     vconfig = value_config(args)
     resolve_ep(mconfig)
     parallel_dims = get_parallel_dims(mconfig, seq_len=args.seq_len)
@@ -333,16 +348,40 @@ def train(args: argparse.Namespace) -> None:
         metric_tokens = torch.zeros((), dtype=torch.float32, device=device)
 
         local_records = [train_records[idx] for idx in local_indices]
-        for micro_records in iter_record_microbatches(
-            local_records,
-            seq_len=args.seq_len,
-            max_records=args.micro_batch_size,
-        ):
+        local_micro_batches = list(
+            iter_record_microbatches(
+                local_records,
+                seq_len=args.seq_len,
+                max_records=args.micro_batch_size,
+                max_tokens=micro_batch_token_budget,
+            )
+        )
+        if world.is_master and step == 0:
+            micro_batch_tokens = [
+                sum(len(clipped_record_arrays(record, args.seq_len)[0]) for record in micro_records)
+                for micro_records in local_micro_batches
+            ]
+            logger.info(
+                json.dumps(
+                    {
+                        "value_train/local_records": len(local_records),
+                        "value_train/local_micro_batches": len(local_micro_batches),
+                        "value_train/local_microbatch_max_tokens": max(micro_batch_tokens, default=0),
+                        "value_train/local_microbatch_mean_tokens": sum(micro_batch_tokens)
+                        / max(len(micro_batch_tokens), 1),
+                        "value_train/mean_records_per_local_microbatch": len(local_records)
+                        / max(len(local_micro_batches), 1),
+                    },
+                    sort_keys=True,
+                )
+            )
+        for micro_records in local_micro_batches:
             logits, targets, mask = forward_records(
                 value_model,
                 micro_records,
                 args.seq_len,
                 device,
+                mconfig.ac_offloading,
             )
             loss, metrics = compute_value_loss(logits, targets, mask, vconfig, scale=global_scale)
             loss.backward()
@@ -370,7 +409,7 @@ def train(args: argparse.Namespace) -> None:
 
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=parallel_dims.get_mesh("dp_cp").get_group())
         dist.all_reduce(metric_tokens, op=dist.ReduceOp.SUM, group=parallel_dims.get_mesh("dp_cp").get_group())
-        if world.is_master and (step == 0 or (step + 1) % 10 == 0 or step + 1 == args.steps):
+        if world.is_master and (step == 0 or (step + 1) % args.log_every == 0 or step + 1 == args.steps):
             step_seconds = time.perf_counter() - step_start
             forward_tokens = float(forward_tokens_tensor.item())
             peak_flops = args.mfu_peak_tflops_per_gpu * 1e12 * world.world_size

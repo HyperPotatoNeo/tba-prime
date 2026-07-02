@@ -35,14 +35,18 @@ MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-$((SEQ_LEN - 512))}"
 VALUE_STEPS="${VALUE_STEPS:-300}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-256}"
 VALUE_MICRO_BATCH_SIZE="${VALUE_MICRO_BATCH_SIZE:-4}"
+VALUE_MICRO_BATCH_TOKEN_BUDGET="${VALUE_MICRO_BATCH_TOKEN_BUDGET:-16384}"
 VALUE_DISABLE_COMPILE="${VALUE_DISABLE_COMPILE:-1}"
 VALUE_DISABLE_OPTIM_CPU_OFFLOAD="${VALUE_DISABLE_OPTIM_CPU_OFFLOAD:-0}"
-VALUE_DISABLE_AC_OFFLOADING="${VALUE_DISABLE_AC_OFFLOADING:-0}"
+VALUE_DISABLE_AC_OFFLOADING="${VALUE_DISABLE_AC_OFFLOADING:-1}"
+VALUE_DISABLE_RESHARD_AFTER_FORWARD="${VALUE_DISABLE_RESHARD_AFTER_FORWARD:-1}"
+VALUE_LOG_EVERY="${VALUE_LOG_EVERY:-1}"
 VALUE_WARMUP_STEPS="${VALUE_WARMUP_STEPS:-50}"
 VALUE_LR="${VALUE_LR:-5e-5}"
 VALUE_RELOAD_RECORDS_INTERVAL="${VALUE_RELOAD_RECORDS_INTERVAL:-1}"
 INFER_GPUS="${INFER_GPUS:-2}"
 VALUE_GPUS="${VALUE_GPUS:-2}"
+VALUE_DP_REPLICATE="${VALUE_DP_REPLICATE:-$VALUE_GPUS}"
 STAGE="${STAGE:-all}"
 MAX_DATASET_PROMPTS="${MAX_DATASET_PROMPTS:-7500}"
 
@@ -185,6 +189,9 @@ train_value() {
   if [[ "$VALUE_DISABLE_AC_OFFLOADING" == "1" || "$VALUE_DISABLE_AC_OFFLOADING" == "true" ]]; then
     compile_args+=(--disable-ac-offloading)
   fi
+  if [[ "$VALUE_DISABLE_RESHARD_AFTER_FORWARD" == "1" || "$VALUE_DISABLE_RESHARD_AFTER_FORWARD" == "true" ]]; then
+    compile_args+=(--disable-reshard-after-forward)
+  fi
   CUDA_VISIBLE_DEVICES="$VALUE_CUDA" uv run torchrun --standalone --nproc-per-node "$VALUE_GPUS" \
     -m experiments.static_value_diagnostics.train_static_value \
     --rollouts "$RUN_DIR/data/rollouts.jsonl" \
@@ -194,11 +201,14 @@ train_value() {
     --steps "$VALUE_STEPS" \
     --global-batch-size "$GLOBAL_BATCH_SIZE" \
     --micro-batch-size "$VALUE_MICRO_BATCH_SIZE" \
+    --micro-batch-token-budget "$VALUE_MICRO_BATCH_TOKEN_BUDGET" \
     --lr "$VALUE_LR" \
     --warmup-steps "$VALUE_WARMUP_STEPS" \
+    --dp-replicate "$VALUE_DP_REPLICATE" \
     --reward-range 0 1 \
     --n-bins 1 \
     "${compile_args[@]}" \
+    --log-every "$VALUE_LOG_EVERY" \
     --stream \
     --reload-records-interval "$VALUE_RELOAD_RECORDS_INTERVAL" \
     --min-train-records "$GLOBAL_BATCH_SIZE" \
