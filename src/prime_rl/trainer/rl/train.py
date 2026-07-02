@@ -396,16 +396,83 @@ def train(config: TrainerConfig):
             value_logits = gather_for_cp(value_logits, cp_group)
         return align_value_logits(value_logits)
 
-    def build_value_targets(micro_batches) -> dict[int, ValueTargets]:
+    def target_values_required() -> bool:
+        assert value_config is not None
+        return value_config.use_gae or value_config.gae_lambda != 1.0
+
+    def backward_value_loss(
+        value_logits: torch.Tensor,
+        targets: ValueTargets,
+        value_scale: int,
+        tensors: Tensors,
+    ) -> None:
+        assert value_config is not None
+        value_loss, value_tensors = compute_value_loss(
+            value_logits,
+            targets=targets.returns,
+            mask=targets.mask,
+            config=value_config,
+            scale=value_scale,
+        )
+        with maybe_record_function("value_backward"):
+            value_loss.backward()
+        tensors["value/scaled_loss"].append(value_loss.detach().to("cpu").unsqueeze(0))
+        for key, value_tensor in value_tensors.items():
+            tensors[key].append(value_tensor.detach().to("cpu"))
+
+    def finish_value_update() -> ValueUpdateStats:
+        assert (
+            value_model is not None
+            and value_config is not None
+            and value_optimizer is not None
+            and value_scheduler is not None
+        )
+        for param in value_model.parameters():
+            if param.grad is not None:
+                param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
+
+        value_grad_norm: torch.Tensor | None = None
+        if value_config.optim.max_norm is not None:
+            value_grad_norm = clip_grad_norm_(
+                value_model.parameters(), max_norm=value_config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
+            )
+            if value_grad_norm.device.type == "cpu":
+                value_grad_norm = value_grad_norm.to(torch.device("cuda"))
+
+        value_zero_grad_ratio = get_zero_gradient_ratio(value_model.parameters(), parallel_dims.dp_replicate)
+        value_optimizer.step()
+        value_scheduler.step()
+        value_optimizer.zero_grad()
+        return ValueUpdateStats(grad_norm=value_grad_norm, zero_grad_ratio=value_zero_grad_ratio)
+
+    def build_value_targets(
+        micro_batches,
+        *,
+        first_value_update: bool,
+        value_scale: int,
+        tensors: Tensors,
+    ) -> tuple[dict[int, ValueTargets], bool]:
         if value_model is None or value_config is None:
-            return {}
+            return {}, False
+        if first_value_update and (value_optimizer is None or value_scheduler is None):
+            first_value_update = False
 
         targets = {}
+        if first_value_update:
+            value_optimizer.zero_grad()
+        needs_target_values = target_values_required()
         for micro_step, micro_batch in enumerate(micro_batches):
             value_inputs = prepare_value_inputs(micro_batch)
-            with torch.no_grad():
+            value_logits = None
+            if first_value_update:
                 value_logits = forward_value_logits(value_inputs)
-                values = predict_values(value_logits, value_config.loss)
+            with torch.no_grad():
+                if needs_target_values:
+                    if value_logits is None:
+                        value_logits = forward_value_logits(value_inputs)
+                    values = predict_values(value_logits.detach(), value_config.loss)
+                else:
+                    values = torch.zeros_like(value_inputs["rewards"], dtype=torch.float32)
                 advantages, returns = compute_gae(
                     rewards=value_inputs["rewards"],
                     dones=value_inputs["dones"],
@@ -415,12 +482,16 @@ def train(config: TrainerConfig):
                     gamma=value_config.gamma,
                     gae_lambda=value_config.gae_lambda,
                 )
-            targets[micro_step] = ValueTargets(
+            target = ValueTargets(
                 advantages=advantages.detach(),
                 returns=returns.detach(),
                 mask=value_inputs["mask"].detach(),
             )
-        return targets
+            targets[micro_step] = target
+            if first_value_update:
+                assert value_logits is not None
+                backward_value_loss(value_logits, target, value_scale, tensors)
+        return targets, first_value_update
 
     def run_value_updates(
         micro_batches,
@@ -432,43 +503,17 @@ def train(config: TrainerConfig):
         if value_model is None or value_config is None or value_optimizer is None or value_scheduler is None:
             return ValueUpdateStats(grad_norm=None, zero_grad_ratio=None)
 
-        value_grad_norm: torch.Tensor | None = None
-        value_zero_grad_ratio: float | None = None
+        value_update_stats = ValueUpdateStats(grad_norm=None, zero_grad_ratio=None)
         for _ in range(update_count):
             value_optimizer.zero_grad()
             for micro_step, micro_batch in enumerate(micro_batches):
                 value_inputs = prepare_value_inputs(micro_batch)
                 value_logits = forward_value_logits(value_inputs)
-                value_loss, value_tensors = compute_value_loss(
-                    value_logits,
-                    targets=value_targets[micro_step].returns,
-                    mask=value_targets[micro_step].mask,
-                    config=value_config,
-                    scale=value_scale,
-                )
-                with maybe_record_function("value_backward"):
-                    value_loss.backward()
-                tensors["value/scaled_loss"].append(value_loss.detach().to("cpu").unsqueeze(0))
-                for key, value_tensor in value_tensors.items():
-                    tensors[key].append(value_tensor.detach().to("cpu"))
+                backward_value_loss(value_logits, value_targets[micro_step], value_scale, tensors)
 
-            for param in value_model.parameters():
-                if param.grad is not None:
-                    param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
+            value_update_stats = finish_value_update()
 
-            if value_config.optim.max_norm is not None:
-                value_grad_norm = clip_grad_norm_(
-                    value_model.parameters(), max_norm=value_config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
-                )
-                if value_grad_norm.device.type == "cpu":
-                    value_grad_norm = value_grad_norm.to(torch.device("cuda"))
-
-            value_zero_grad_ratio = get_zero_gradient_ratio(value_model.parameters(), parallel_dims.dp_replicate)
-            value_optimizer.step()
-            value_scheduler.step()
-
-        value_optimizer.zero_grad()
-        return ValueUpdateStats(grad_norm=value_grad_norm, zero_grad_ratio=value_zero_grad_ratio)
+        return value_update_stats
 
     while True:
         # Reset peak memory stats
@@ -618,17 +663,32 @@ def train(config: TrainerConfig):
 
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
-        value_targets = build_value_targets(micro_batches)
+        value_update_count = 0
+        if value_config is not None:
+            value_update_count = (
+                value_config.warmup_updates_per_batch if is_value_warmup else value_config.updates_per_step
+            )
+        value_targets, first_value_update_done = build_value_targets(
+            micro_batches,
+            first_value_update=value_update_count > 0,
+            value_scale=value_scale,
+            tensors=tensors,
+        )
+        value_update_stats = ValueUpdateStats(grad_norm=None, zero_grad_ratio=None)
+        if first_value_update_done:
+            value_update_stats = finish_value_update()
+            value_update_count -= 1
 
         if is_value_warmup:
             assert value_config is not None
-            value_update_stats = run_value_updates(
-                micro_batches,
-                value_targets,
-                value_config.warmup_updates_per_batch,
-                value_scale,
-                tensors,
-            )
+            if value_update_count > 0:
+                value_update_stats = run_value_updates(
+                    micro_batches,
+                    value_targets,
+                    value_update_count,
+                    value_scale,
+                    tensors,
+                )
             forward_backward_time = time.perf_counter() - forward_backward_start_time
             if memory_profiler is not None:
                 memory_profiler.step()
@@ -916,12 +976,11 @@ def train(config: TrainerConfig):
 
         # Update learning rate scheduler
         scheduler.step()
-        value_update_stats = ValueUpdateStats(grad_norm=None, zero_grad_ratio=None)
-        if value_config is not None:
+        if value_config is not None and value_update_count > 0:
             value_update_stats = run_value_updates(
                 micro_batches,
                 value_targets,
-                value_config.updates_per_step,
+                value_update_count,
                 value_scale,
                 tensors,
             )
