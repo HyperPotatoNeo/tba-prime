@@ -235,6 +235,8 @@ class StaticValueConfig(BaseConfig):
             raise ValueError("value_function.resolved_warmup_batches is managed only by RL training")
         if self.model.lora is not None:
             raise ValueError("static value diagnostics do not support LoRA value functions")
+        if self.model.vlm is not None:
+            raise ValueError("static value diagnostics do not support VLM training")
         if self.model.compile is not None:
             raise ValueError("static value diagnostics currently require model.compile=null")
         if self.model.ac_offloading is not None:

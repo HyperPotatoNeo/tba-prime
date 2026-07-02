@@ -86,6 +86,11 @@ def test_static_value_config_rejects_prompt_overlap_and_bad_inference_layout():
     with pytest.raises(ValueError, match="model.compile"):
         StaticValueConfig.model_validate({"model": {"compile": {}}})
 
+    with pytest.raises(ValueError, match="VLM"):
+        StaticValueConfig.model_validate(
+            {"model": {"vlm": {"vision_encoder_attr": "model.visual", "language_model_attr": "model.model"}}}
+        )
+
 
 def test_loo_and_group_mean_baselines_are_distinct():
     table = build_token_table(_prediction_set(), group_size=2)
