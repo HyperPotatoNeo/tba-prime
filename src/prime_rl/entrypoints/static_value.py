@@ -673,9 +673,13 @@ class StaticValueRunner:
 
     def _base_env(self) -> dict[str, str]:
         home = os.environ.get("HOME", str(Path.home()))
+        path = os.environ.get("PATH", "")
+        home_bin = str(Path(home) / ".local" / "bin")
+        if home_bin not in path.split(":"):
+            path = f"{home_bin}:{path}" if path else home_bin
         env = {
             "HOME": home,
-            "PATH": os.environ.get("PATH", ""),
+            "PATH": path,
             "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(Path(home) / ".cache" / "uv")),
             "VLLM_API_KEY": os.environ.get("VLLM_API_KEY", "EMPTY"),
             "PYTHONPATH": str(self.config.repo_dir),
