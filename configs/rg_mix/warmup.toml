@@ -1,0 +1,36 @@
+# Value warmup: train the value function for 100 value-only steps on the base
+# policy over the fixed RG-Mix dataset, then reuse the resulting value checkpoint
+# for all value-function experiments. The policy is not updated during warmup.
+#
+#   uv run rl @ configs/rg_mix/rl.toml @ configs/rg_mix/warmup.toml \
+#     --output-dir outputs/rgmix-warmup
+
+max_steps = 1                # minimal; we only want the post-warmup value checkpoint
+
+[orchestrator]
+group_size = 8
+
+[orchestrator.value_warmup]
+steps = 100                  # batch_size defaults to orchestrator.batch_size (128)
+
+[trainer.value_function]
+use_gae = false
+gamma = 1.0
+gae_lambda = 1.0
+warmup_updates_per_batch = 1
+updates_per_step = 1
+
+[trainer.value_function.loss]
+type = "mse"
+
+[trainer.value_function.optim]
+type = "adamw"
+lr = 5e-5
+weight_decay = 0.01
+max_norm = 1.0
+
+[trainer.value_function.scheduler]
+type = "linear"
+warmup_steps = 50
+decay_steps = 0
+min_lr = 0.0

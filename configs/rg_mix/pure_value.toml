@@ -1,0 +1,24 @@
+# Baseline 2: pure value function (GAE with gamma=lambda=1, i.e. A_{i,t}=R_i-V(s_{i,t})).
+# Load the warmed value checkpoint at launch:
+#   --trainer.value-function.init-checkpoint /path/to/value_checkpoint
+
+[trainer.value_function]
+use_gae = true
+gamma = 1.0
+gae_lambda = 1.0
+updates_per_step = 1
+
+[trainer.value_function.loss]
+type = "mse"                 # scalar regression, suited to fractional [0,1] rewards
+
+[trainer.value_function.optim]
+type = "adamw"
+lr = 5e-5
+weight_decay = 0.01
+max_norm = 1.0
+
+[trainer.value_function.scheduler]
+type = "linear"
+warmup_steps = 0             # already warmed via init_checkpoint
+decay_steps = 0
+min_lr = 0.0

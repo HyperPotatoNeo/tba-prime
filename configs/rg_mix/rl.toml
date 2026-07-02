@@ -1,0 +1,50 @@
+# RG-Mix value-corrected GRPO — shared base config.
+#
+# Compose with one baseline overlay and set K (group_size) + seed per run, e.g.:
+#   uv run rl @ configs/rg_mix/rl.toml @ configs/rg_mix/loo.toml \
+#     --orchestrator.group-size 8 --inference.seed 1 \
+#     --wandb.name loo-k8-s1 --wandb.group k8 --output-dir outputs/loo-k8-s1
+#
+# Value overlays additionally take a warmed value checkpoint:
+#   --trainer.value-function.init-checkpoint /path/to/value_checkpoint
+
+max_steps = 500
+seq_len = 8192
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+attn = "flash_attention_2"
+
+[wandb]
+project = "rgmix-value-grpo"
+
+[ckpt]
+interval = 50                # checkpoint every 50 steps
+
+[orchestrator]
+batch_size = 128
+group_size = 8               # K; override per run with --orchestrator.group-size
+
+# Ancestral sampling: temperature 1.0, top_p 1.0 (hardcoded), top_k disabled, min_p 0.
+[orchestrator.train.sampling]
+temperature = 1.0
+max_completion_tokens = 6144
+extra_body = { top_k = -1, min_p = 0.0 }
+
+[[orchestrator.train.env]]
+id = "rg-mix"
+name = "rg-mix"
+args = { dataset_path = "/mnt/vast/home/siddarth.venkatraman/datasets/rg_mix_10k", num_train_examples = 10000, num_eval_examples = 500, seed = 42 }
+
+[orchestrator.renderer]
+name = "default"
+
+[trainer.optim]
+lr = 3e-6                    # policy LR; full fine-tuning (no LoRA)
+
+[deployment]
+gpus_per_node = 8           # H100 node = 8 GPUs; value function is co-located on the trainer GPUs
+num_infer_gpus = 4
+num_train_gpus = 4
+
+[inference]

@@ -1,0 +1,34 @@
+# Baseline 3: linear value/LOO mixture, constant rho=0.5.
+# A_{i,t} = (1-rho) (R_i - B_i^loo) + rho (R_i - V(s_{i,t}))
+#         = R_i - [(1-rho) B_i^loo + rho V(s_{i,t})]
+# Load the warmed value checkpoint at launch:
+#   --trainer.value-function.init-checkpoint /path/to/value_checkpoint
+
+[orchestrator.algo]
+type = "grpo"
+baseline = "loo"
+
+[trainer.value_function]
+use_gae = false              # blend, do not replace
+gamma = 1.0
+gae_lambda = 1.0
+updates_per_step = 1
+
+[trainer.value_function.loss]
+type = "mse"
+
+[trainer.value_function.optim]
+type = "adamw"
+lr = 5e-5
+weight_decay = 0.01
+max_norm = 1.0
+
+[trainer.value_function.scheduler]
+type = "linear"
+warmup_steps = 0
+decay_steps = 0
+min_lr = 0.0
+
+[trainer.value_function.mixture]
+rho = 0.5
+schedule = "constant"

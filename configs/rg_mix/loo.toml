@@ -1,0 +1,6 @@
+# Baseline 1: leave-one-out GRPO (no value function).
+# A_{i,t} = R_i - B_i^loo,  B_i^loo = (sum_{j!=i} R_j) / (G-1)
+
+[orchestrator.algo]
+type = "grpo"
+baseline = "loo"
