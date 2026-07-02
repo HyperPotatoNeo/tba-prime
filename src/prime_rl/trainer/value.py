@@ -10,6 +10,7 @@ from prime_rl.configs.trainer import (
     MSEValueLossConfig,
     ValueFunctionConfig,
     ValueLossConfig,
+    ValueMixtureConfig,
 )
 
 
@@ -18,6 +19,7 @@ class ValueTargets:
     advantages: Float[Tensor, "batch seq"]
     returns: Float[Tensor, "batch seq"]
     mask: Bool[Tensor, "batch seq"]
+    position_fraction: Float[Tensor, "batch seq"]
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,51 @@ def compute_gae(
         offset += seq_len
 
     return flat_advantages.reshape_as(values), flat_returns.reshape_as(values)
+
+
+def response_position_fraction(
+    mask: Bool[Tensor, "batch seq"],
+    sequence_lengths: list[int],
+) -> Float[Tensor, "batch seq"]:
+    """Per-token position fraction along the response (action tokens) of each
+    packed sequence: 0.0 at the first action token, 1.0 at the last. Non-action
+    tokens and single-action responses are 0.0. Used to schedule the mixture
+    weight rho(t) from the response start to its end."""
+    flat_mask = mask.reshape(-1)
+    frac = torch.zeros(flat_mask.numel(), dtype=torch.float32, device=mask.device)
+    offset = 0
+    for seq_len in sequence_lengths:
+        seq_slice = slice(offset, offset + seq_len)
+        action_idxs = flat_mask[seq_slice].nonzero(as_tuple=False).flatten() + offset
+        n = action_idxs.numel()
+        if n > 1:
+            frac[action_idxs] = torch.linspace(0.0, 1.0, n, dtype=torch.float32, device=frac.device)
+        offset += seq_len
+    return frac.reshape_as(mask)
+
+
+def mixture_rho(
+    position_fraction: Float[Tensor, "batch seq"],
+    config: ValueMixtureConfig,
+) -> Float[Tensor, "batch seq"]:
+    """Per-token mixture weight rho(t) in [0, 1]. ``constant`` uses ``rho``
+    everywhere; ``linear`` ramps ``rho_start`` -> ``rho_end`` along the response
+    by ``position_fraction``."""
+    if config.schedule == "constant":
+        return torch.full_like(position_fraction, config.rho)
+    return config.rho_start + (config.rho_end - config.rho_start) * position_fraction
+
+
+def mix_advantages(
+    group_advantages: Float[Tensor, "batch seq"],
+    value_advantages: Float[Tensor, "batch seq"],
+    rho: Float[Tensor, "batch seq"],
+) -> Float[Tensor, "batch seq"]:
+    """Convex blend ``A = (1 - rho) * A_group + rho * A_value``. With the GRPO
+    leave-one-out group advantage ``A_group = R - B_loo`` and the Monte Carlo
+    value advantage ``A_value = R - V_t`` (GAE with gamma=lambda=1), this equals
+    ``R - [(1 - rho) B_loo + rho V_t]`` — the linear value-corrected baseline."""
+    return (1.0 - rho) * group_advantages + rho * value_advantages
 
 
 def compute_value_loss(

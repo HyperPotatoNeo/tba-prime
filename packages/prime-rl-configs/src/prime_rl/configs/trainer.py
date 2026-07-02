@@ -477,6 +477,29 @@ class ClassificationValueLossConfig(BaseConfig):
 ValueLossConfig: TypeAlias = Annotated[MSEValueLossConfig | ClassificationValueLossConfig, Field(discriminator="type")]
 
 
+class ValueMixtureConfig(BaseConfig):
+    """Value-corrected group baseline. Blends the orchestrator group advantage
+    (e.g. GRPO leave-one-out, ``A_group = R - B_loo``) with the trainer GAE
+    advantage (``A_value = R - V_t`` for gamma=lambda=1) per token:
+
+        ``A = (1 - rho_t) * A_group + rho_t * A_value``
+
+    equivalently the linear baseline ``b = (1 - rho) B_loo + rho V_t``. Pair with
+    an orchestrator group baseline such as GRPO ``baseline='loo'``."""
+
+    rho: float = Field(0.5, ge=0, le=1)
+    """Constant mixture weight (``schedule='constant'``). 0 = pure group baseline, 1 = pure value."""
+
+    schedule: Literal["constant", "linear"] = "constant"
+    """``constant`` applies ``rho`` at every token; ``linear`` ramps the weight from ``rho_start`` at the first response token to ``rho_end`` at the last, by response-token position fraction (interpolating LOO -> pure value along the response)."""
+
+    rho_start: float = Field(0.0, ge=0, le=1)
+    """Linear schedule: mixture weight at the first response token."""
+
+    rho_end: float = Field(1.0, ge=0, le=1)
+    """Linear schedule: mixture weight at the last response token."""
+
+
 class ValueFunctionConfig(BaseConfig):
     loss: ValueLossConfig = MSEValueLossConfig()
     """Value-function training loss."""
@@ -495,6 +518,9 @@ class ValueFunctionConfig(BaseConfig):
 
     use_gae: bool = True
     """When true, replace orchestrator advantages with trainer-computed GAE advantages for the RL loss."""
+
+    mixture: ValueMixtureConfig | None = None
+    """Optional value-corrected group baseline (see ``ValueMixtureConfig``). When set, the policy advantage is a per-token blend of the orchestrator group advantage and the trainer GAE advantage. Mutually exclusive with ``use_gae``; pair with a group baseline such as GRPO ``baseline='loo'``."""
 
     gamma: float = Field(1.0, ge=0, le=1)
     """Discount factor for value targets and GAE."""
@@ -523,6 +549,18 @@ class ValueFunctionConfig(BaseConfig):
             data = dict(data)
             data["scheduler"] = {**scheduler, "decay_steps": 0}
         return data
+
+    @model_validator(mode="after")
+    def validate_mixture_excludes_gae(self):
+        """The mixture blends the orchestrator group advantage with the GAE
+        advantage, so ``use_gae`` (which fully replaces the orchestrator
+        advantage) must be off. Set ``use_gae = false`` when using a mixture."""
+        if self.mixture is not None and self.use_gae:
+            raise ValueError(
+                "value_function.mixture cannot be combined with use_gae=true; "
+                "set use_gae=false so the group advantage is blended, not replaced."
+            )
+        return self
 
 
 class FakeDataLoaderConfig(BaseConfig):

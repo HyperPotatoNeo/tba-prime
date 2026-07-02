@@ -51,7 +51,10 @@ from prime_rl.trainer.value import (
     align_value_logits,
     compute_gae,
     compute_value_loss,
+    mix_advantages,
+    mixture_rho,
     predict_values,
+    response_position_fraction,
     ValueTargets,
     ValueUpdateStats,
     value_head_output_size,
@@ -398,7 +401,7 @@ def train(config: TrainerConfig):
 
     def target_values_required() -> bool:
         assert value_config is not None
-        return value_config.use_gae or value_config.gae_lambda != 1.0
+        return value_config.use_gae or value_config.gae_lambda != 1.0 or value_config.mixture is not None
 
     def backward_value_loss(
         value_logits: torch.Tensor,
@@ -482,10 +485,14 @@ def train(config: TrainerConfig):
                     gamma=value_config.gamma,
                     gae_lambda=value_config.gae_lambda,
                 )
+            position_fraction = response_position_fraction(
+                value_inputs["mask"], micro_batch["sequence_lengths"]
+            )
             target = ValueTargets(
                 advantages=advantages.detach(),
                 returns=returns.detach(),
                 mask=value_inputs["mask"].detach(),
+                position_fraction=position_fraction.detach(),
             )
             targets[micro_step] = target
             if first_value_update:
@@ -751,6 +758,10 @@ def train(config: TrainerConfig):
             advantages = micro_batch["advantages"].to("cuda")
             if value_config is not None and value_config.use_gae:
                 advantages = value_targets[micro_step].advantages
+            elif value_config is not None and value_config.mixture is not None:
+                value_target = value_targets[micro_step]
+                rho = mixture_rho(value_target.position_fraction, value_config.mixture)
+                advantages = mix_advantages(advantages, value_target.advantages, rho)
             loss_mask = micro_batch["loss_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             ref_logprobs = micro_batch["ref_logprobs"].to("cuda") if micro_batch["ref_logprobs"] is not None else None
