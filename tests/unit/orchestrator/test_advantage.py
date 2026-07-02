@@ -10,6 +10,7 @@ from prime_rl.configs.algorithm import (
 )
 from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.max_rl import MaxRLAlgorithm
+from prime_rl.orchestrator.algo.routing import stamp_value_returns
 from prime_rl.orchestrator.trajectories import trace_to_samples
 from prime_rl.orchestrator.types import Rollout
 
@@ -243,3 +244,18 @@ def test_assign_advantages_rejects_misaligned():
     # full length is 3 (prompt + 2 sampled); a 1-element list must be rejected
     with pytest.raises(ValueError, match="align"):
         rollout.assign_advantages([0.5])
+
+
+def test_stamp_value_returns_uses_raw_terminal_reward():
+    rollout = _build_rollout(0.8, sampled_lengths=[2], obs_lengths=[1])
+
+    stamp_value_returns(rollout)
+
+    rewards = [reward for sample in rollout.samples for reward in sample.value_rewards]
+    dones = [done for sample in rollout.samples for done in sample.value_dones]
+    masks = [mask for sample in rollout.samples for mask in sample.mask]
+    terminal = max(i for i, mask in enumerate(masks) if mask)
+
+    assert rewards == [0.0, 0.0, 0.8, 0.0]
+    assert dones == [False, False, True, False]
+    assert terminal == 2

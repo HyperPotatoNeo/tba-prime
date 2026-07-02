@@ -180,6 +180,57 @@ def test_pad_micro_batch_preserves_explicit_sequence_lengths():
     assert padded.loss_mask[-2:] == [False, False]
 
 
+def test_prepare_batch_preserves_value_streams_through_packing_and_padding():
+    example = TrainingSample(
+        token_ids=[1, 2, 3],
+        mask=[False, True, True],
+        logprobs=[0.0, -0.1, -0.2],
+        temperatures=[1.0, 1.0, 1.0],
+        advantages=[0.0, 0.5, 0.5],
+        env_name="test-env",
+        value_rewards=[0.0, 0.0, 1.0],
+        value_dones=[False, False, True],
+    )
+
+    batches_per_gpu = prepare_batch(
+        rollouts=[example],
+        seq_len=8,
+        num_train_workers=1,
+        idxs=[0],
+        num_loras=1,
+        bin_cost=build_bin_cost(None),
+        pad_to_multiple_of=4,
+        phase="value_warmup",
+        save_checkpoint=True,
+    )
+
+    [micro_batch] = _flatten_batches(batches_per_gpu)
+    assert micro_batch.value_rewards == [0.0, 0.0, 1.0, 0.0]
+    assert micro_batch.value_dones == [False, False, True, False]
+    assert micro_batch.loss_mask == [False, True, True, False]
+    assert micro_batch.phase == "value_warmup"
+    assert micro_batch.save_checkpoint
+
+
+def test_prepare_sample_moves_truncated_terminal_value_return_to_last_retained_action():
+    example = TrainingSample(
+        token_ids=[1, 2, 3, 4, 5],
+        mask=[False, True, True, True, True],
+        logprobs=[0.0, -0.1, -0.2, -0.3, -0.4],
+        temperatures=[1.0] * 5,
+        advantages=[0.0, 0.5, 0.5, 0.5, 0.5],
+        env_name="test-env",
+        value_rewards=[0.0, 0.0, 0.0, 0.0, 1.0],
+        value_dones=[False, False, False, False, True],
+    )
+
+    micro_batch = prepare_sample(example, seq_len=3)
+
+    assert micro_batch.loss_mask == [False, True, True]
+    assert micro_batch.value_rewards == [0.0, 0.0, 1.0]
+    assert micro_batch.value_dones == [False, False, True]
+
+
 def test_split_to_align_avoids_dummy_micro_batches():
     examples = [make_sized_training_example(length) for length in [6, 6, 5, 5, 4, 4]]
 

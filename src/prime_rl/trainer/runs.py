@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 @dataclass
 class Progress:
     step: int = 0
+    data_step: int = 0
     total_tokens: int = 0
     total_samples: int = 0
 

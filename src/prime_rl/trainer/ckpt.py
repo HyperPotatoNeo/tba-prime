@@ -57,38 +57,55 @@ class AppState(Stateful):
         optimizers: list[Optimizer],
         scheduler: LRScheduler | None,
         progress: Progress | None,
+        value_model: Module | None = None,
+        value_optimizers: list[Optimizer] | None = None,
+        value_scheduler: LRScheduler | None = None,
     ):
         self.model = model
         self.optimizers = optimizers
         self.scheduler = scheduler
         self.progress = progress
+        self.value_model = value_model
+        self.value_optimizers = value_optimizers or []
+        self.value_scheduler = value_scheduler
 
-    def _get_base_optimizers(self) -> list[Optimizer]:
+    def _all_optimizers(self) -> list[Optimizer]:
+        return self.optimizers + self.value_optimizers
+
+    def _get_base_optimizers(self, optimizers: list[Optimizer]) -> list[Optimizer]:
         """Extract base optimizers from wrappers like CPUOffloadOptimizer."""
-        return [opt.base_optimizer if isinstance(opt, CPUOffloadOptimizer) else opt for opt in self.optimizers]
+        return [opt.base_optimizer if isinstance(opt, CPUOffloadOptimizer) else opt for opt in optimizers]
 
     def _has_cpu_offload(self) -> bool:
-        return any(isinstance(opt, CPUOffloadOptimizer) for opt in self.optimizers)
+        return any(isinstance(opt, CPUOffloadOptimizer) for opt in self._all_optimizers())
 
     def state_dict(self) -> dict[str, Any]:
         # get_state_dict requires optimizer states to live on param.device. For an
         # already-initialized CPU-offload optimizer that means staging back to GPU
         # before the call; the matching offload happens after the dict is built.
-        for opt in self.optimizers:
+        for opt in self._all_optimizers():
             if isinstance(opt, CPUOffloadOptimizer) and opt._initialized:
                 opt._move_states("cuda")
                 torch.cuda.synchronize()
 
         # Automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
-        base_optimizers = self._get_base_optimizers()
+        base_optimizers = self._get_base_optimizers(self.optimizers)
         model_state_dict, optimizer_state_dict = get_state_dict(self.model, base_optimizers)
         state_dict = {
             "model": model_state_dict,
             "optimizers": optimizer_state_dict,
         }
+        if self.value_model is not None:
+            value_base_optimizers = self._get_base_optimizers(self.value_optimizers)
+            value_model_state_dict, value_optimizer_state_dict = get_state_dict(self.value_model, value_base_optimizers)
+            state_dict["value_model"] = value_model_state_dict
+            state_dict["value_optimizers"] = value_optimizer_state_dict
         if self.scheduler is not None:
             scheduler_state_dict = self.scheduler.state_dict()
             state_dict["scheduler"] = scheduler_state_dict
+        if self.value_scheduler is not None:
+            value_scheduler_state_dict = self.value_scheduler.state_dict()
+            state_dict["value_scheduler"] = value_scheduler_state_dict
         if self.progress is not None:
             progress_state_dict = asdict(self.progress)
             state_dict["progress"] = progress_state_dict
@@ -104,9 +121,11 @@ class AppState(Stateful):
         # returns, without GPU optimizer state ever existing for the duration of the
         # read.
         has_cpu_offload = self._has_cpu_offload()
-        for opt in self.optimizers:
+        for opt in self._all_optimizers():
             if isinstance(opt, CPUOffloadOptimizer):
                 opt._move_states("cpu")
+                if opt.state:
+                    opt._initialized = True
         if has_cpu_offload:
             gc.collect()
             torch.cuda.empty_cache()
@@ -114,7 +133,8 @@ class AppState(Stateful):
         return state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]):
-        base_optimizers = self._get_base_optimizers()
+        base_optimizers = self._get_base_optimizers(self.optimizers)
+        value_base_optimizers = self._get_base_optimizers(self.value_optimizers)
         has_cpu_offload = self._has_cpu_offload()
 
         if has_cpu_offload:
@@ -130,7 +150,9 @@ class AppState(Stateful):
             # apply the model side here and flip the wrappers to initialized so
             # subsequent steps take the steady-state path.
             set_model_state_dict(self.model, model_state_dict=state_dict["model"])
-            for opt in self.optimizers:
+            if self.value_model is not None:
+                set_model_state_dict(self.value_model, model_state_dict=state_dict["value_model"])
+            for opt in self._all_optimizers():
                 if isinstance(opt, CPUOffloadOptimizer):
                     opt._initialized = True
         else:
@@ -140,9 +162,18 @@ class AppState(Stateful):
                 model_state_dict=state_dict["model"],
                 optim_state_dict=state_dict["optimizers"],
             )
+            if self.value_model is not None:
+                set_state_dict(
+                    self.value_model,
+                    value_base_optimizers,
+                    model_state_dict=state_dict["value_model"],
+                    optim_state_dict=state_dict["value_optimizers"],
+                )
 
         if self.scheduler is not None:
             self.scheduler.load_state_dict(state_dict["scheduler"])
+        if self.value_scheduler is not None:
+            self.value_scheduler.load_state_dict(state_dict["value_scheduler"])
         if self.progress is not None:
             for key, value in state_dict["progress"].items():
                 setattr(self.progress, key, value)
@@ -190,13 +221,26 @@ class CheckpointManager:
         scheduler: LRScheduler,
         progress: Progress,
         dataloader: StatefulDataLoader | None = None,
+        value_model: nn.Module | None = None,
+        value_optimizers: list[Optimizer] | None = None,
+        value_scheduler: LRScheduler | None = None,
     ):
         """Save the trainer checkpoint to a given path."""
         self.logger.debug(f"Saving training checkpoint to {path}")
         start_time = time.perf_counter()
 
         # Create checkpoint state
-        state_dict = {"app": AppState(model, optimizers, scheduler, progress)}
+        state_dict = {
+            "app": AppState(
+                model,
+                optimizers,
+                scheduler,
+                progress,
+                value_model=value_model,
+                value_optimizers=value_optimizers,
+                value_scheduler=value_scheduler,
+            )
+        }
 
         # Checkpoint the local dataloader
         if dataloader is not None:
@@ -222,13 +266,24 @@ class CheckpointManager:
         scheduler: LRScheduler | None,
         progress: Progress | None,
         dataloader: StatefulDataLoader | None = None,
+        value_model: nn.Module | None = None,
+        value_optimizers: list[Optimizer] | None = None,
+        value_scheduler: LRScheduler | None = None,
     ):
         """Load the trainer checkpoint from a given path (in-place)."""
         self.logger.debug(f"Loading training checkpoint from {path}")
         start_time = time.perf_counter()
 
         # Load sharded state
-        app_state = AppState(model, optimizers if not self.skip_optimizer else [], scheduler, progress)
+        app_state = AppState(
+            model,
+            optimizers if not self.skip_optimizer else [],
+            scheduler,
+            progress,
+            value_model=value_model,
+            value_optimizers=(value_optimizers if not self.skip_optimizer else []),
+            value_scheduler=value_scheduler,
+        )
         state_dict = {"app": app_state}
         dcp_load(state_dict=state_dict, checkpoint_id=path)
 
@@ -256,12 +311,25 @@ class CheckpointManager:
         scheduler: LRScheduler | None,
         progress: Progress | None,
         dataloader: StatefulDataLoader | None = None,
+        value_model: nn.Module | None = None,
+        value_optimizers: list[Optimizer] | None = None,
+        value_scheduler: LRScheduler | None = None,
     ) -> None:
         """Load the trainer checkpoint for a given step (in-place)."""
         ckpt_path = self.get_ckpt_path(step)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
-        self.load_from_path(ckpt_path, model, optimizers, scheduler, progress, dataloader)
+        self.load_from_path(
+            ckpt_path,
+            model,
+            optimizers,
+            scheduler,
+            progress,
+            dataloader,
+            value_model=value_model,
+            value_optimizers=value_optimizers,
+            value_scheduler=value_scheduler,
+        )
 
     def save(
         self,
@@ -271,6 +339,9 @@ class CheckpointManager:
         scheduler: LRScheduler,
         progress: Progress,
         dataloader: StatefulDataLoader | None = None,
+        value_model: nn.Module | None = None,
+        value_optimizers: list[Optimizer] | None = None,
+        value_scheduler: LRScheduler | None = None,
     ) -> None:
         """Save the full checkpoint state for a specified step."""
         ckpt_path = self.get_ckpt_path(step)
@@ -280,7 +351,18 @@ class CheckpointManager:
             ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         torch.distributed.barrier()
 
-        self.save_to_path(ckpt_path, model, optimizers, scheduler, progress, dataloader)
+        self.save_to_path(
+            ckpt_path,
+            model,
+            optimizers,
+            scheduler,
+            progress,
+            dataloader,
+            value_model=value_model,
+            value_optimizers=value_optimizers,
+            value_scheduler=value_scheduler,
+        )
+        self.mark_stable(step)
         bisect.insort(self.ckpt_steps, step)
 
     def maybe_clean(self) -> None:

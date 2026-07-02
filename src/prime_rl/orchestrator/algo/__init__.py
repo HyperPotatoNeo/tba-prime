@@ -34,7 +34,7 @@ from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.max_rl import MaxRLAlgorithm
 from prime_rl.orchestrator.algo.opd import OPDAlgorithm
 from prime_rl.orchestrator.algo.opsd import OPSDAlgorithm
-from prime_rl.orchestrator.algo.routing import stamp_advantages, stamp_loss_routing
+from prime_rl.orchestrator.algo.routing import stamp_advantages, stamp_loss_routing, stamp_value_returns
 from prime_rl.orchestrator.algo.sft import SFTDistillAlgorithm
 from prime_rl.orchestrator.types import Rollout
 
@@ -78,4 +78,5 @@ __all__ = [
     "connect_frozen_pool",
     "stamp_advantages",
     "stamp_loss_routing",
+    "stamp_value_returns",
 ]

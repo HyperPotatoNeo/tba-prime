@@ -451,6 +451,77 @@ class CustomLossConfig(BaseConfig):
 LossConfig: TypeAlias = Annotated[DefaultLossConfig | IPOLossConfig | CustomLossConfig, Field(discriminator="type")]
 
 
+class MSEValueLossConfig(BaseConfig):
+    type: Literal["mse"] = "mse"
+    """Regress scalar value targets with mean-squared error."""
+
+
+class ClassificationValueLossConfig(BaseConfig):
+    type: Literal["classification"] = "classification"
+    """Predict a categorical reward distribution and use its expectation as the scalar value."""
+
+    reward_range: tuple[float, float] = (0.0, 1.0)
+    """Closed value range represented by the classification bins. Targets outside this range raise."""
+
+    n_bins: int = Field(1, ge=1)
+    """Number of value bins. ``1`` selects binary classification split at the reward-range midpoint."""
+
+    @model_validator(mode="after")
+    def validate_reward_range(self):
+        low, high = self.reward_range
+        if high <= low:
+            raise ValueError("value_function.loss.reward_range must be increasing.")
+        return self
+
+
+ValueLossConfig: TypeAlias = Annotated[MSEValueLossConfig | ClassificationValueLossConfig, Field(discriminator="type")]
+
+
+class ValueFunctionConfig(BaseConfig):
+    loss: ValueLossConfig = MSEValueLossConfig()
+    """Value-function training loss."""
+
+    optim: OptimizerConfig = AdamWConfig(lr=5e-5)
+    """Optimizer for the value function. Defaults to AdamW with lr=5e-5."""
+
+    scheduler: SchedulerConfig = LinearSchedulerConfig(warmup_steps=50, decay_steps=0)
+    """Learning-rate scheduler for the value function. Defaults to 50-step linear warmup then constant LR."""
+
+    loss_weight: float = Field(1.0, ge=0)
+    """Multiplier applied to the normalized value loss before backpropagation."""
+
+    use_gae: bool = True
+    """When true, replace orchestrator advantages with trainer-computed GAE advantages for the RL loss."""
+
+    gamma: float = Field(1.0, ge=0, le=1)
+    """Discount factor for value targets and GAE."""
+
+    gae_lambda: float = Field(1.0, ge=0, le=1)
+    """GAE lambda. The default of 1.0 is unbiased Monte Carlo advantage estimation."""
+
+    updates_per_step: int = Field(1, ge=1)
+    """Value-function optimizer updates to run after each policy trainer update."""
+
+    warmup_updates_per_batch: int = Field(1, ge=1)
+    """Value-function optimizer updates to run for each value warmup batch."""
+
+    resolved_warmup_batches: int = Field(0, ge=0)
+    """Internal scheduler count populated by the combined RL config from orchestrator.value_warmup.steps."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def preserve_value_scheduler_decay_default(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        scheduler = data.get("scheduler")
+        if not isinstance(scheduler, dict):
+            return data
+        if scheduler.get("type", "linear") == "linear" and "decay_steps" not in scheduler:
+            data = dict(data)
+            data["scheduler"] = {**scheduler, "decay_steps": 0}
+        return data
+
+
 class FakeDataLoaderConfig(BaseConfig):
     batch_size: int = Field(2, ge=1)
     """Batch size of the fake data loader."""
@@ -516,6 +587,9 @@ class TrainerConfig(BaseConfig):
     optim: OptimizerConfig = AdamWConfig()
 
     scheduler: SchedulerConfig = ConstantSchedulerConfig()
+
+    value_function: ValueFunctionConfig | None = None
+    """Optional trainer-local value function. Currently single-run, non-LoRA text-model training only."""
 
     ckpt: CheckpointConfig | None = None
     """Full training-state checkpoint configuration (model + optimizer + scheduler). If None, no resume-capable checkpoints are written."""
@@ -651,6 +725,20 @@ class TrainerConfig(BaseConfig):
         if self.model.lora is not None and self.weight_broadcast.type == "nccl":
             # TODO: Support this
             raise ValueError("NCCL weight broadcast does not support LoRA yet.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_value_function_support(self):
+        if self.value_function is None:
+            return self
+        if self.model.lora is not None:
+            raise ValueError("Value functions do not support LoRA yet.")
+        if self.max_concurrent_runs > 1:
+            raise ValueError("Value functions do not support max_concurrent_runs > 1 yet.")
+        if self.model.vlm is not None:
+            raise ValueError("Value functions do not support VLM training yet.")
+        if self.ckpt and self.ckpt.weights_only:
+            raise ValueError("Value functions require full trainer checkpoints; ckpt.weights_only is not supported.")
         return self
 
     @model_validator(mode="after")

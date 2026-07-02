@@ -1,6 +1,7 @@
 import copy
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -100,6 +101,25 @@ def _truncate_mm(
     return cut, sliced
 
 
+def _preserve_truncated_value_returns(
+    value_rewards: list[float] | None,
+    value_dones: list[bool] | None,
+    loss_mask: list[bool],
+    cut: int,
+) -> None:
+    retained_actions = [idx for idx, trainable in enumerate(loss_mask[:cut]) if trainable]
+    if not retained_actions:
+        return
+
+    last_retained_action = retained_actions[-1]
+    if value_rewards is not None:
+        truncated_reward = sum(value_rewards[cut:])
+        if truncated_reward:
+            value_rewards[last_retained_action] += truncated_reward
+    if value_dones is not None and any(value_dones[cut:]):
+        value_dones[last_retained_action] = True
+
+
 def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch:
     """
     Prepare a problem for sequence packing training.
@@ -124,6 +144,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     rl_weights = list(training_example.rl_weights) if training_example.rl_weights is not None else None
     ce_weights = list(training_example.ce_weights) if training_example.ce_weights is not None else None
     ref_kl_weights = list(training_example.ref_kl_weights) if training_example.ref_kl_weights is not None else None
+    value_rewards = list(training_example.value_rewards) if training_example.value_rewards is not None else None
+    value_dones = list(training_example.value_dones) if training_example.value_dones is not None else None
     position_ids = list(range(len(input_ids)))
     mm_token_type_ids = training_example.mm_token_type_ids
     mm_kwargs = training_example.mm_kwargs
@@ -146,6 +168,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         cut = seq_len
         if mm_token_type_ids is not None and mm_kwargs is not None:
             cut, mm_kwargs = _truncate_mm(mm_token_type_ids, mm_kwargs, seq_len)
+        if cut < len(input_ids):
+            _preserve_truncated_value_returns(value_rewards, value_dones, loss_mask, cut)
         input_ids = input_ids[:cut]
         loss_mask = loss_mask[:cut]
         inference_logprobs = inference_logprobs[:cut]
@@ -160,6 +184,10 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             ce_weights = ce_weights[:cut]
         if ref_kl_weights is not None:
             ref_kl_weights = ref_kl_weights[:cut]
+        if value_rewards is not None:
+            value_rewards = value_rewards[:cut]
+        if value_dones is not None:
+            value_dones = value_dones[:cut]
         if routed_experts is not None:
             routed_experts = _slice_routed_experts(routed_experts, cut)
         if mm_token_type_ids is not None:
@@ -182,6 +210,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         ("rl_weights", rl_weights),
         ("ce_weights", ce_weights),
         ("ref_kl_weights", ref_kl_weights),
+        ("value_rewards", value_rewards),
+        ("value_dones", value_dones),
     ):
         if stream is not None:
             assert len(stream) == len(input_ids), f"{stream_name}: {len(stream)}"
@@ -214,6 +244,8 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         rl_weights=rl_weights,
         ce_weights=ce_weights,
         ref_kl_weights=ref_kl_weights,
+        value_rewards=value_rewards,
+        value_dones=value_dones,
     )
 
 
@@ -277,6 +309,8 @@ class _MicroBatchBin:
 def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     has_ref_logprobs = any(sample.ref_logprobs is not None for _, sample in bin_content.samples)
     has_mm_token_type_ids = any(sample.mm_token_type_ids is not None for _, sample in bin_content.samples)
+    has_value_rewards = any(sample.value_rewards is not None for _, sample in bin_content.samples)
+    has_value_dones = any(sample.value_dones is not None for _, sample in bin_content.samples)
     # A weight stream materializes as soon as one packed sample carries it; the
     # samples that lack it get the stream's identity fill (STREAM_FILL).
     has_stream = {name: any(getattr(s, name) is not None for _, s in bin_content.samples) for name in STREAM_FILL}
@@ -291,6 +325,8 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     ref_logprobs: list[float] | None = [] if has_ref_logprobs else None
     mm_token_type_ids: list[int] | None = [] if has_mm_token_type_ids else None
     streams: dict[str, list[float] | None] = {name: ([] if has_stream[name] else None) for name in STREAM_FILL}
+    value_rewards: list[float] | None = [] if has_value_rewards else None
+    value_dones: list[bool] | None = [] if has_value_dones else None
     routed_experts: RoutedExperts | None = None
     lora_num_tokens = [0] * num_loras
 
@@ -310,6 +346,10 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
             if stream is not None:
                 sample_stream = getattr(sample, name)
                 stream.extend(sample_stream if sample_stream is not None else [fill] * sample_len)
+        if value_rewards is not None:
+            value_rewards.extend(sample.value_rewards if sample.value_rewards is not None else [0.0] * sample_len)
+        if value_dones is not None:
+            value_dones.extend(sample.value_dones if sample.value_dones is not None else [False] * sample_len)
         if mm_token_type_ids is not None:
             mm_token_type_ids.extend(
                 sample.mm_token_type_ids if sample.mm_token_type_ids is not None else [0] * sample_len
@@ -345,6 +385,8 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         rl_weights=streams["rl_weights"],
         ce_weights=streams["ce_weights"],
         ref_kl_weights=streams["ref_kl_weights"],
+        value_rewards=value_rewards,
+        value_dones=value_dones,
     )
 
 
@@ -458,6 +500,10 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
         stream = getattr(micro_batch, stream_name)
         if stream is not None:
             stream.extend([0.0] * padding_size)
+    if micro_batch.value_rewards is not None:
+        micro_batch.value_rewards.extend([0.0] * padding_size)
+    if micro_batch.value_dones is not None:
+        micro_batch.value_dones.extend([False] * padding_size)
     if micro_batch.lora_num_tokens is not None:
         micro_batch.lora_num_tokens[-1] += (
             padding_size  # We send padding to the last lora so that tokens have ascending lora idx
@@ -487,6 +533,8 @@ def _assert_token_arrays_aligned(micro_batch: MicroBatch) -> None:
         "rl_weights",
         "ce_weights",
         "ref_kl_weights",
+        "value_rewards",
+        "value_dones",
         "mm_token_type_ids",
     )
     for name in per_token_fields:
@@ -513,6 +561,8 @@ def _make_dummy_batch(source: MicroBatch) -> MicroBatch:
     dummy.rl_weights = None
     dummy.ce_weights = None
     dummy.ref_kl_weights = None
+    dummy.value_rewards = None
+    dummy.value_dones = None
     return dummy
 
 
@@ -533,6 +583,8 @@ def prepare_batch(
     num_loras: int,
     bin_cost: Callable[[Sequence[int]], int],
     pad_to_multiple_of: int = 1,
+    phase: Literal["train", "value_warmup"] = "train",
+    save_checkpoint: bool = False,
 ) -> list[list[MicroBatch]]:
     """
     Prepare a batch of problems for each GPU. Each batch is a list of micro batches.
@@ -565,5 +617,10 @@ def prepare_batch(
         group_batches_per_gpu = _distribute_group(group, num_train_workers, bin_cost)
         for worker_idx, worker_batches in enumerate(group_batches_per_gpu):
             batches_per_gpu[worker_idx].extend(worker_batches)
+
+    for worker_batches in batches_per_gpu:
+        for micro_batch in worker_batches:
+            micro_batch.phase = phase
+            micro_batch.save_checkpoint = save_checkpoint
 
     return batches_per_gpu

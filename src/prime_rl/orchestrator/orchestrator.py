@@ -75,7 +75,7 @@ from prime_rl.utils.client import init_nccl_broadcast
 from prime_rl.utils.heartbeat import Heartbeat
 from prime_rl.utils.logger import format_time, get_logger, setup_logger
 from prime_rl.utils.monitor import setup_monitor
-from prime_rl.utils.pathing import get_log_dir, get_rollout_dir, get_step_path
+from prime_rl.utils.pathing import get_ckpt_dir, get_log_dir, get_rollout_dir, get_step_path, wait_for_path
 from prime_rl.utils.usage_reporter import UsageReporter
 from prime_rl.utils.utils import (
     clean_exit,
@@ -180,6 +180,23 @@ class Orchestrator:
         self.lora_name = None
         self.resume_step = None
         self.lag_task = None
+
+    def value_warmup_active(self) -> bool:
+        warmup = self.config.value_warmup
+        return warmup is not None and self.progress.value_warmup_step < warmup.steps
+
+    def current_train_batching(self) -> tuple[int | None, int | None]:
+        if self.value_warmup_active():
+            assert self.config.value_warmup is not None
+            return self.config.value_warmup.batch_size, self.config.value_warmup.token_batch_size
+        return self.config.batch_size, self.config.token_batch_size
+
+    async def wait_for_trainer_checkpoint(self, step: int) -> None:
+        assert self.config.ckpt is not None
+        trainer_output_dir = self.config.ckpt.trainer_output_dir or self.config.output_dir.parent
+        stable_path = get_step_path(get_ckpt_dir(trainer_output_dir), step) / "STABLE"
+        get_logger().info(f"Waiting for trainer checkpoint after value warmup ({stable_path})")
+        await wait_for_path(stable_path)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -306,15 +323,23 @@ class Orchestrator:
         if self.resume_step is not None and self.ckpt_manager is not None:
             self.ckpt_manager.load(self.progress, step=self.resume_step)
             get_logger().info(f"Resuming orchestrator from checkpoint step {self.resume_step}")
-            check_exists = config.weight_broadcast.type != "nccl"
-            wait_timeout = config.ckpt.wait_for_weights_timeout if config.ckpt else None
-            weights_path = get_weight_dir(
-                config.output_dir, self.progress.step, check_exists=check_exists, wait_timeout=wait_timeout
-            )
-            await self.policy_inference.update_weights(weights_path, lora_name=self.lora_name, step=self.progress.step)
-            if self.lora_name is not None:
-                self.policy_inference.update_model_name(self.lora_name)
-                self.policy.model_name = self.lora_name
+            if self.progress.data_step == 0 and self.progress.step > 0:
+                self.progress.data_step = self.progress.step
+            resume_after_value_warmup = self.progress.step == 0 and self.progress.value_warmup_step > 0
+            if resume_after_value_warmup:
+                get_logger().info("Skipping policy weight reload for post-value-warmup step 0 checkpoint")
+            else:
+                check_exists = config.weight_broadcast.type != "nccl"
+                wait_timeout = config.ckpt.wait_for_weights_timeout if config.ckpt else None
+                weights_path = get_weight_dir(
+                    config.output_dir, self.progress.step, check_exists=check_exists, wait_timeout=wait_timeout
+                )
+                await self.policy_inference.update_weights(
+                    weights_path, lora_name=self.lora_name, step=self.progress.step
+                )
+                if self.lora_name is not None:
+                    self.policy_inference.update_model_name(self.lora_name)
+                    self.policy.model_name = self.lora_name
             self.policy.version = self.progress.step
         else:
             get_logger().info("Training from scratch")
@@ -344,13 +369,14 @@ class Orchestrator:
             tasks_per_minute=config.tasks_per_minute,
             max_off_policy_steps=config.max_off_policy_steps,
         )
+        batch_size, token_batch_size = self.current_train_batching()
         self.train_sink = TrainSink(
             config,
             tokenizer=self.tokenizer,
             train_envs=self.train_envs,
             mm_token_type_ids_mapping=self.mm_token_type_ids_mapping,
-            batch_size=config.batch_size,
-            token_batch_size=config.token_batch_size,
+            batch_size=batch_size,
+            token_batch_size=token_batch_size,
             pre_filters=pre_filters,
             post_filters=post_filters,
         )
@@ -481,6 +507,10 @@ class Orchestrator:
         step_time = (now - self.last_batch_at) if self.last_batch_at is not None else 0.0
         self.last_batch_at = now
 
+        if self.value_warmup_active():
+            await self.finalize_value_warmup_batch(batch, step_time=step_time)
+            return
+
         save_ckpt_time = await self.maybe_save_ckpt(step)
 
         if config.max_steps is not None and step >= config.max_steps:
@@ -521,7 +551,8 @@ class Orchestrator:
         step_path = get_step_path(get_rollout_dir(config.output_dir), step)
         await asyncio.to_thread(save_rollouts, rollout_dicts, step_path / "train_rollouts.jsonl")
 
-        await self.sender.send(TrainingBatch(examples=batch.samples, step=step))
+        await self.sender.send(TrainingBatch(examples=batch.samples, step=step, data_step=self.progress.data_step))
+        self.progress.data_step += 1
         self.update_dispatch_gate()
         trim_process_memory()
 
@@ -594,6 +625,79 @@ class Orchestrator:
         self.train_sink.reset_pre_filter_stats()
         self.progress.step += 1
         self.maybe_trigger_eval(self.progress.step)
+        trim_process_memory()
+
+    async def finalize_value_warmup_batch(self, batch: TrainBatch, *, step_time: float) -> None:
+        """Ship a value-only warmup batch without advancing trainer policy progress."""
+        config = self.config
+        step = self.progress.step
+        warmup_step = self.progress.value_warmup_step
+        assert config.value_warmup is not None
+
+        if not batch.samples:
+            self.consecutive_empty_batches += 1
+            get_logger().warning(
+                f"Value warmup {warmup_step}: empty batch (0 of {len(batch.rollouts)} generated rollouts shipped) "
+                f"(consecutive empty batches: {self.consecutive_empty_batches}/{MAX_CONSECUTIVE_EMPTY_BATCHES})"
+            )
+            if self.consecutive_empty_batches >= MAX_CONSECUTIVE_EMPTY_BATCHES:
+                raise RuntimeError(f"{self.consecutive_empty_batches} consecutive empty value warmup batches.")
+            return
+        self.consecutive_empty_batches = 0
+
+        rollout_dicts = [r.to_record() for r in batch.rollouts]
+        step_path = get_step_path(get_rollout_dir(config.output_dir), step)
+        await asyncio.to_thread(
+            save_rollouts,
+            rollout_dicts,
+            step_path / f"value_warmup_rollouts_{warmup_step}.jsonl",
+        )
+
+        is_last_warmup_batch = warmup_step + 1 >= config.value_warmup.steps
+        await self.sender.send(
+            TrainingBatch(
+                examples=batch.samples,
+                step=step,
+                data_step=self.progress.data_step,
+                phase="value_warmup",
+                save_checkpoint=is_last_warmup_batch,
+            )
+        )
+        if is_last_warmup_batch and self.ckpt_manager is not None:
+            await self.wait_for_trainer_checkpoint(step)
+
+        self.progress.data_step += 1
+        trim_process_memory()
+
+        effective = batch.rollouts.effective
+        metrics: dict[str, float] = {
+            "value_warmup/step": float(warmup_step),
+            "time/value_warmup_step": step_time,
+            "step": float(step),
+        }
+        for subset, pool in (("all", batch.rollouts), ("effective", effective)):
+            metrics |= pool.metrics.to_wandb(prefix="value_warmup/agg", subset=subset)
+            for env_name, env_pool in pool.by_env().items():
+                metrics |= env_pool.metrics.to_wandb(prefix=f"value_warmup/{env_name}", subset=subset)
+        self.monitor.log(metrics, step=step)
+        self.monitor.log_samples(effective.rollouts, step=step)
+
+        self.progress.value_warmup_step += 1
+        self.train_sink.reset_pre_filter_stats()
+        get_logger().success(
+            f"Value warmup {self.progress.value_warmup_step}/{config.value_warmup.steps} | "
+            f"{format_time(step_time):>7} | Rollouts {len(batch.rollouts)}"
+        )
+
+        if is_last_warmup_batch:
+            get_logger().info("Value warmup complete; switching to policy training batches")
+            self.train_sink.set_batching(batch_size=config.batch_size, token_batch_size=config.token_batch_size)
+            self.last_batch_at = time.perf_counter()
+            if self.ckpt_manager is not None:
+                get_logger().info("Saving orchestrator checkpoint after value warmup")
+                await asyncio.to_thread(self.ckpt_manager.save, self.progress, step)
+            elif config.ckpt is None:
+                get_logger().warning("Value warmup completed but orchestrator checkpointing is disabled.")
         trim_process_memory()
 
     def maybe_trigger_eval(self, step: int) -> None:

@@ -43,7 +43,8 @@ class BasePacker(ABC):
         self.pad_to_multiple_of = pad_to_multiple_of
         self.tokenizer = tokenizer
         self.bin_cost = bin_cost
-        self.receiver = setup_training_batch_receiver(config)
+        receiver_start_step = start_step if self.multi_run_manager.max_runs == 1 else None
+        self.receiver = setup_training_batch_receiver(config, receiver_start_step)
         shutil.rmtree(get_rollout_dir(self.multi_run_manager.output_dir), ignore_errors=True)
         self.sender: MicroBatchSender = setup_micro_batch_sender(
             self.multi_run_manager.output_dir, dp_world_size, start_step, config
@@ -105,8 +106,9 @@ class SinglePacker(BasePacker):
         assert len(batches) == 1, "SinglePacker only supports one batch per step"
         batch = batches[0]
 
-        self.multi_run_manager.ready_to_update[0] = True
-        self.multi_run_manager.progress[0].step += 1
+        if batch.phase == "train":
+            self.multi_run_manager.ready_to_update[0] = True
+            self.multi_run_manager.progress[0].step += 1
         micro_batch_grid = prepare_batch(
             rollouts=batch.examples,
             seq_len=self.seq_len,
@@ -115,6 +117,8 @@ class SinglePacker(BasePacker):
             idxs=[0] * len(batch.examples),
             num_loras=self.multi_run_manager.max_runs,
             bin_cost=self.bin_cost,
+            phase=batch.phase,
+            save_checkpoint=batch.save_checkpoint,
         )
         # The receiver always stamps run_idx from used_idxs (a key of idx_2_id).
         run_id = self.multi_run_manager.idx_2_id[batch.run_idx]
@@ -182,6 +186,18 @@ class MultiPacker(BasePacker):
             return (
                 False,
                 f"Run wrote a sample with ref logprobs length != sample length ({len(sample.ref_logprobs)} != {sample_length})",
+            )
+        if sample.value_rewards is not None and len(sample.value_rewards) != sample_length:
+            return (
+                False,
+                "Run wrote a sample with value_rewards length != sample length "
+                f"({len(sample.value_rewards)} != {sample_length})",
+            )
+        if sample.value_dones is not None and len(sample.value_dones) != sample_length:
+            return (
+                False,
+                "Run wrote a sample with value_dones length != sample length "
+                f"({len(sample.value_dones)} != {sample_length})",
             )
         return True, None
 

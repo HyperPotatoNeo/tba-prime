@@ -31,9 +31,9 @@ def setup_training_batch_sender(output_dir: Path, transport: TransportConfig) ->
         raise ValueError(f"Invalid transport type: {transport.type}")
 
 
-def setup_training_batch_receiver(transport: TransportConfig) -> TrainingBatchReceiver:
+def setup_training_batch_receiver(transport: TransportConfig, current_step: int | None = None) -> TrainingBatchReceiver:
     if transport.type == "filesystem":
-        return FileSystemTrainingBatchReceiver()
+        return FileSystemTrainingBatchReceiver(current_step)
     elif transport.type == "zmq":
         return ZMQTrainingBatchReceiver(transport)
     else:

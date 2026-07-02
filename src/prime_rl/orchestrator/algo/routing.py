@@ -72,3 +72,38 @@ def stamp_advantages(rollout: Rollout) -> None:
         num_tokens = len(sample.token_ids)
         sample.advantages = list(advantages[offset : offset + num_tokens])
         offset += num_tokens
+
+
+def stamp_value_returns(rollout: Rollout) -> None:
+    """Stamp terminal environment reward for trainer-local value learning.
+
+    The value function trains on environment reward, not algorithm-shaped
+    advantages. For today's scalar env reward, every sampled token has zero
+    immediate reward except the last sampled token of the rollout, which gets
+    ``rollout.reward`` and a done marker. This shape leaves room for future
+    process rewards without changing the trainer interface.
+    """
+    total = sum(len(sample.token_ids) for sample in rollout.samples)
+    if total == 0:
+        return
+
+    rewards = [0.0] * total
+    dones = [False] * total
+    sampled_offsets = []
+    offset = 0
+    for sample in rollout.samples:
+        sampled_offsets.extend(offset + i for i, sampled in enumerate(sample.mask) if sampled)
+        offset += len(sample.token_ids)
+    if not sampled_offsets:
+        return
+
+    terminal = sampled_offsets[-1]
+    rewards[terminal] = float(rollout.reward)
+    dones[terminal] = True
+
+    offset = 0
+    for sample in rollout.samples:
+        num_tokens = len(sample.token_ids)
+        sample.value_rewards = rewards[offset : offset + num_tokens]
+        sample.value_dones = dones[offset : offset + num_tokens]
+        offset += num_tokens

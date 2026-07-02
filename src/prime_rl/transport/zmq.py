@@ -37,7 +37,7 @@ class ZMQTrainingBatchSender(TrainingBatchSender):
 
     async def send(self, batch: TrainingBatch) -> None:
         payload = self.encoder.encode(batch)
-        self.logger.debug(f"Sending batch {batch.step} to {self.sender_id}")
+        self.logger.debug(f"Sending batch {batch.step} (data_step={batch.data_step}) to {self.sender_id}")
         await self.socket.send_multipart([self.sender_id, payload], copy=False)
 
     def close(self) -> None:
@@ -73,8 +73,8 @@ class ZMQTrainingBatchReceiver(TrainingBatchReceiver):
         self.poller = zmq.Poller()
         self.poller.register(self.socket, zmq.POLLIN)
 
-        # Pending batches per run_id, keyed by step -> batch.
-        # We return the smallest step first; newer steps remain buffered.
+        # Pending batches per run_id, keyed by data_step -> batch.
+        # We return the smallest data_step first; newer steps remain buffered.
         self._pending: dict[bytes, dict[int, TrainingBatch]] = {}
 
         self.logger.info(
@@ -104,10 +104,11 @@ class ZMQTrainingBatchReceiver(TrainingBatchReceiver):
                 continue
 
             per_id_batches = self._pending.setdefault(sender_id, {})
-            assert batch.step not in per_id_batches, (
-                f"Step {batch.step} already in pending for {sender_id!r}, this should not happen: {per_id_batches.keys()}"
+            assert batch.data_step not in per_id_batches, (
+                f"Data step {batch.data_step} already in pending for {sender_id!r}, "
+                f"this should not happen: {per_id_batches.keys()}"
             )
-            per_id_batches[batch.step] = batch
+            per_id_batches[batch.data_step] = batch
 
     def receive(self) -> list[TrainingBatch]:
         """Return at most one (oldest) pending batch per run idx; buffer newer ones for later calls."""
@@ -160,7 +161,7 @@ class ZMQTrainingBatchReceiver(TrainingBatchReceiver):
                 self._pending.pop(run_id, None)
 
             batch.run_idx = idx
-            self.logger.debug(f"Received batch {batch.step} from {run_id!r}")
+            self.logger.debug(f"Received batch {batch.step} (data_step={batch.data_step}) from {run_id!r}")
             batches.append(batch)
 
         return batches

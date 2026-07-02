@@ -38,13 +38,25 @@ from prime_rl.trainer.rl.loss import (
 from prime_rl.trainer.rl.token_export import setup_token_exporter
 from prime_rl.trainer.model import (
     forward,
+    predict_value,
     setup_tokenizer,
     setup_model,
+    setup_value_model,
     is_tt_moe_model,
     get_load_balance_stats,
 )
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
+from prime_rl.trainer.value import (
+    align_value_logits,
+    compute_gae,
+    compute_value_loss,
+    predict_values,
+    ValueTargets,
+    ValueUpdateStats,
+    value_head_output_size,
+    value_scheduler_max_steps,
+)
 from prime_rl.trainer.utils import (
     build_bin_cost,
     GarbageCollection,
@@ -148,6 +160,18 @@ def train(config: TrainerConfig):
     logger.info(f"Initializing model ({config.model})")
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
+    value_model = None
+    value_optimizer = None
+    value_scheduler = None
+    value_config = config.value_function
+    if value_config is not None:
+        logger.info(f"Initializing value function ({value_config})")
+        value_model = setup_value_model(
+            config.model,
+            parallel_dims,
+            loading_from_ckpt_later,
+            value_head_output_size(value_config.loss),
+        )
 
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
@@ -168,6 +192,20 @@ def train(config: TrainerConfig):
             cpu_offload=config.model.optim_cpu_offload,
         )
         scheduler = setup_scheduler(optimizer, config.scheduler, config.max_steps, config.optim.lr)
+        if value_model is not None and value_config is not None:
+            logger.info(f"Initializing value optimizer ({value_config.optim})")
+            value_optimizer = setup_optimizer(
+                value_config.optim,
+                list(value_model.named_parameters()),
+                parallel_dims,
+                cpu_offload=config.model.optim_cpu_offload,
+            )
+            value_scheduler = setup_scheduler(
+                value_optimizer,
+                value_config.scheduler,
+                value_scheduler_max_steps(config.max_steps, value_config),
+                value_config.optim.lr,
+            )
     else:
         optimizer = setup_multi_optimizer(config.optim, parallel_dims)
         scheduler = setup_multi_scheduler(optimizer, config.scheduler, config.max_steps)
@@ -179,6 +217,8 @@ def train(config: TrainerConfig):
         optimizer.register_post_creation_callback(load_run_checkpoint, index=1)
 
     logger.info(f"Using `{config.scheduler.type}` scheduler ({config.scheduler})")
+    if value_config is not None:
+        logger.info(f"Using `{value_config.scheduler.type}` value scheduler ({value_config.scheduler})")
 
     # Set up weight broadcast (skip when using fake data since there's no inference server)
     if config.data.fake:
@@ -210,22 +250,46 @@ def train(config: TrainerConfig):
         )
 
         assert_cp_style_supports_model(config.model.cp_style, model)
+        if value_model is not None:
+            assert_cp_style_supports_model(config.model.cp_style, value_model)
         # sparse MLA is softmax (works with both ring and ulysses).
         setup_sparse_mla_cp(model, cp_group, cp_rank, parallel_dims.cp)
+        if value_model is not None:
+            setup_sparse_mla_cp(value_model, cp_group, cp_rank, parallel_dims.cp)
         # Linear-attn / Mamba layers are only configured under ulysses; with ring
         # we'd have already raised above.
         if config.model.cp_style == "ulysses":
             setup_hybrid_cp(model, cp_group, cp_rank, parallel_dims.cp)
             setup_nemotron_h_cp(model, cp_group, cp_rank, parallel_dims.cp)
+            if value_model is not None:
+                setup_hybrid_cp(value_model, cp_group, cp_rank, parallel_dims.cp)
+                setup_nemotron_h_cp(value_model, cp_group, cp_rank, parallel_dims.cp)
+
+    def value_ckpt_kwargs() -> dict:
+        return {
+            "value_model": value_model,
+            "value_optimizers": [value_optimizer] if value_optimizer is not None else None,
+            "value_scheduler": value_scheduler,
+        }
 
     # Optionally, resume training from a checkpoint
     progress = Progress()
     if checkpoint_step is not None:
-        ckpt_manager.load(checkpoint_step, model, [optimizer], scheduler, progress)
+        ckpt_manager.load(
+            checkpoint_step,
+            model,
+            [optimizer],
+            scheduler,
+            progress,
+            **value_ckpt_kwargs(),
+        )
         logger.info(f"Resuming training from checkpoint step {checkpoint_step}")
+        if progress.data_step == 0 and progress.step > 0:
+            progress.data_step = progress.step
 
     logger.info(
-        f"Starting from step {progress.step} (total_tokens={progress.total_tokens}, total_samples={progress.total_samples})"
+        f"Starting from step {progress.step}, data_step {progress.data_step} "
+        f"(total_tokens={progress.total_tokens}, total_samples={progress.total_samples})"
     )
 
     # Set up the data loader (Optionally, use a fake data loader for debugging)
@@ -235,7 +299,7 @@ def train(config: TrainerConfig):
     else:
         dataloader = DataLoader(
             config.output_dir,
-            progress.step,
+            progress.data_step,
             parallel_dims.get_mesh("dp").size(),
             config.model.seq_len,
             config.model.cp,
@@ -255,6 +319,149 @@ def train(config: TrainerConfig):
         logger.info(f"Tracing to {config.trace_path}")
         prof = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True).__enter__()
         maybe_record_function = record_function
+
+    cp_enabled = parallel_dims.cp_enabled
+    cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
+    cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
+    cp_size = parallel_dims.cp
+
+    def prepare_value_inputs(micro_batch):
+        if value_model is None or value_config is None:
+            raise RuntimeError("prepare_value_inputs requires trainer.value_function")
+        if micro_batch["value_rewards"] is None or micro_batch["value_dones"] is None:
+            raise ValueError("Value functions require value_rewards and value_dones in every training batch.")
+
+        input_ids = micro_batch["input_ids"].to("cuda")
+        position_ids = micro_batch["position_ids"].to("cuda")
+        loss_mask = micro_batch["loss_mask"].to("cuda")
+        rewards = micro_batch["value_rewards"].to("cuda")
+        dones = micro_batch["value_dones"].to("cuda")
+        routed_experts = micro_batch["routed_experts"].to("cuda") if micro_batch["routed_experts"] is not None else None
+
+        if routed_experts is None and config.enable_router_replay:
+            raise ValueError(
+                "You must set `enable_return_routed_experts=True` in the inference config or pass "
+                "`--enable-return-routed-experts` to vLLM server to use router replay."
+            )
+        if routed_experts is not None and not config.enable_router_replay:
+            routed_experts = None
+
+        mm_kwargs_raw = micro_batch.get("mm_kwargs")
+        mm_kwargs = {k: v.to("cuda") for k, v in mm_kwargs_raw.items()} if mm_kwargs_raw else None
+        mm_token_type_ids = (
+            micro_batch["mm_token_type_ids"].to("cuda") if micro_batch.get("mm_token_type_ids") is not None else None
+        )
+        if cp_enabled and mm_kwargs is not None:
+            raise NotImplementedError("Context parallelism is not supported with VLM/multimodal training")
+
+        if cp_enabled:
+            input_ids, forward_position_ids = setup_cp_params(
+                input_ids, position_ids, cp_rank, cp_size, cp_group, cp_style=config.model.cp_style
+            )
+            if routed_experts is not None:
+                routed_experts = shard_for_cp(routed_experts, cp_rank=cp_rank, cp_world_size=cp_size)
+        else:
+            forward_position_ids = position_ids
+
+        return {
+            "input_ids": input_ids,
+            "position_ids": forward_position_ids,
+            "routed_experts": routed_experts,
+            "mm_kwargs": mm_kwargs,
+            "mm_token_type_ids": mm_token_type_ids,
+            "mask": loss_mask,
+            "rewards": rewards,
+            "dones": dones,
+        }
+
+    def forward_value_logits(value_inputs: dict[str, torch.Tensor | dict[str, torch.Tensor] | None]) -> torch.Tensor:
+        with maybe_record_function("value_forward"), maybe_activation_offloading(config.model.ac_offloading):
+            value_logits = predict_value(
+                value_model,
+                value_inputs["input_ids"],
+                value_inputs["position_ids"],
+                mm_kwargs=value_inputs["mm_kwargs"],
+                mm_token_type_ids=value_inputs["mm_token_type_ids"],
+                routed_experts=value_inputs["routed_experts"],
+            )
+        if cp_enabled:
+            value_logits = gather_for_cp(value_logits, cp_group)
+        return align_value_logits(value_logits)
+
+    def build_value_targets(micro_batches) -> dict[int, ValueTargets]:
+        if value_model is None or value_config is None:
+            return {}
+
+        targets = {}
+        for micro_step, micro_batch in enumerate(micro_batches):
+            value_inputs = prepare_value_inputs(micro_batch)
+            with torch.no_grad():
+                value_logits = forward_value_logits(value_inputs)
+                values = predict_values(value_logits, value_config.loss)
+                advantages, returns = compute_gae(
+                    rewards=value_inputs["rewards"],
+                    dones=value_inputs["dones"],
+                    values=values,
+                    mask=value_inputs["mask"],
+                    sequence_lengths=micro_batch["sequence_lengths"],
+                    gamma=value_config.gamma,
+                    gae_lambda=value_config.gae_lambda,
+                )
+            targets[micro_step] = ValueTargets(
+                advantages=advantages.detach(),
+                returns=returns.detach(),
+                mask=value_inputs["mask"].detach(),
+            )
+        return targets
+
+    def run_value_updates(
+        micro_batches,
+        value_targets: dict[int, ValueTargets],
+        update_count: int,
+        value_scale: int,
+        tensors: Tensors,
+    ) -> ValueUpdateStats:
+        if value_model is None or value_config is None or value_optimizer is None or value_scheduler is None:
+            return ValueUpdateStats(grad_norm=None, zero_grad_ratio=None)
+
+        value_grad_norm: torch.Tensor | None = None
+        value_zero_grad_ratio: float | None = None
+        for _ in range(update_count):
+            value_optimizer.zero_grad()
+            for micro_step, micro_batch in enumerate(micro_batches):
+                value_inputs = prepare_value_inputs(micro_batch)
+                value_logits = forward_value_logits(value_inputs)
+                value_loss, value_tensors = compute_value_loss(
+                    value_logits,
+                    targets=value_targets[micro_step].returns,
+                    mask=value_targets[micro_step].mask,
+                    config=value_config,
+                    scale=value_scale,
+                )
+                with maybe_record_function("value_backward"):
+                    value_loss.backward()
+                tensors["value/scaled_loss"].append(value_loss.detach().to("cpu").unsqueeze(0))
+                for key, value_tensor in value_tensors.items():
+                    tensors[key].append(value_tensor.detach().to("cpu"))
+
+            for param in value_model.parameters():
+                if param.grad is not None:
+                    param.grad.mul_(parallel_dims.fsdp_gradient_divide_factor)
+
+            if value_config.optim.max_norm is not None:
+                value_grad_norm = clip_grad_norm_(
+                    value_model.parameters(), max_norm=value_config.optim.max_norm, ep_enabled=parallel_dims.ep_enabled
+                )
+                if value_grad_norm.device.type == "cpu":
+                    value_grad_norm = value_grad_norm.to(torch.device("cuda"))
+
+            value_zero_grad_ratio = get_zero_gradient_ratio(value_model.parameters(), parallel_dims.dp_replicate)
+            value_optimizer.step()
+            value_scheduler.step()
+
+        value_optimizer.zero_grad()
+        return ValueUpdateStats(grad_norm=value_grad_norm, zero_grad_ratio=value_zero_grad_ratio)
+
     while True:
         # Reset peak memory stats
         torch.cuda.reset_peak_memory_stats()
@@ -290,6 +497,12 @@ def train(config: TrainerConfig):
                 for idx in multi_run_manager.used_idxs:
                     multi_run_manager.ready_to_update[idx] = False
 
+        interval_ckpt_due = (
+            ckpt_manager is not None
+            and (config.ckpt and config.ckpt.interval)
+            and not (is_first_step or is_last_step)
+            and progress.step % config.ckpt.interval == 0
+        )
         if config.max_concurrent_runs > 1:
             # Multi-run: Save per-run checkpoints using each run's orchestrator config.
             # Trainer-level ckpt config can be set by the combined rl entrypoint,
@@ -298,19 +511,21 @@ def train(config: TrainerConfig):
             ckpt_manager.save(optimizer, scheduler)
             save_ckpt_time = time.perf_counter() - save_ckpt_start_time
             ckpt_manager.maybe_clean()
-        elif (
-            ckpt_manager is not None
-            and (config.ckpt and config.ckpt.interval)
-            and not (is_first_step or is_last_step)
-            and progress.step % config.ckpt.interval == 0
-        ):
+        elif ckpt_manager is not None and interval_ckpt_due:
             save_ckpt_time = 0
 
-            if not config.ckpt.weights_only:
+            if not (config.ckpt and config.ckpt.weights_only):
                 # Single-run: Save full checkpoint
-                logger.info(f"Saving checkpoint at step {progress.step}")
+                logger.info(f"Saving checkpoint at step {progress.step} (interval)")
                 save_ckpt_start_time = time.perf_counter()
-                ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
+                ckpt_manager.save(
+                    progress.step,
+                    model,
+                    [optimizer],
+                    scheduler,
+                    progress,
+                    **value_ckpt_kwargs(),
+                )
                 save_ckpt_time += time.perf_counter() - save_ckpt_start_time
 
             ckpt_manager.maybe_clean()
@@ -345,6 +560,16 @@ def train(config: TrainerConfig):
         micro_batches = dataloader.get_batch()
         load_data_time = time.perf_counter() - load_data_start_time
         logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
+        batch_phases = {micro_batch["phase"] for micro_batch in micro_batches}
+        if len(batch_phases) != 1:
+            raise ValueError(f"Expected all micro-batches to have the same phase, got {batch_phases}")
+        batch_phase = next(iter(batch_phases))
+        if batch_phase not in ("train", "value_warmup"):
+            raise ValueError(f"Unknown training batch phase: {batch_phase}")
+        is_value_warmup = batch_phase == "value_warmup"
+        if is_value_warmup and value_model is None:
+            raise ValueError("Received a value_warmup batch but trainer.value_function is not configured.")
+        save_after_batch = any(micro_batch["save_checkpoint"] for micro_batch in micro_batches)
 
         batch_size = len(micro_batches)
         memory_profiler = None
@@ -363,32 +588,101 @@ def train(config: TrainerConfig):
         local_rl_scale = 0
         local_ce_scale = 0
         local_ref_kl_scale = 0
+        local_value_scale = 0
         for micro_batch in micro_batches:
             mask = micro_batch["loss_mask"]
             rl_w = micro_batch["rl_weights"]
             local_rl_scale += int((mask & (rl_w != 0)).sum()) if rl_w is not None else int(mask.sum())
+            if value_config is not None:
+                local_value_scale += int(mask.sum())
             if micro_batch["ce_weights"] is not None:
                 local_ce_scale += int((micro_batch["ce_weights"] != 0).sum())
             if micro_batch["ref_kl_weights"] is not None:
                 local_ref_kl_scale += int((micro_batch["ref_kl_weights"] != 0).sum())
         global_scales = torch.tensor(
-            [local_rl_scale, local_ce_scale, local_ref_kl_scale], dtype=torch.int64, device="cuda"
+            [local_rl_scale, local_ce_scale, local_ref_kl_scale, local_value_scale],
+            dtype=torch.int64,
+            device="cuda",
         )
         dp_cp_group = parallel_dims.get_mesh("dp_cp").get_group()
         dist.all_reduce(global_scales, op=dist.ReduceOp.SUM, group=dp_cp_group)
-        rl_scale, ce_scale, ref_kl_scale = (max(scale, 1) for scale in global_scales.tolist())
+        rl_scale, ce_scale, ref_kl_scale, value_scale = (max(scale, 1) for scale in global_scales.tolist())
 
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
-        cp_enabled = parallel_dims.cp_enabled
-        cp_rank = parallel_dims.world_mesh["cp"].get_local_rank() if cp_enabled else 0
-        cp_group = parallel_dims.world_mesh["cp"].get_group() if cp_enabled else None
-        cp_size = parallel_dims.cp
+        value_targets = build_value_targets(micro_batches)
+
+        if is_value_warmup:
+            assert value_config is not None
+            value_update_stats = run_value_updates(
+                micro_batches,
+                value_targets,
+                value_config.warmup_updates_per_batch,
+                value_scale,
+                tensors,
+            )
+            forward_backward_time = time.perf_counter() - forward_backward_start_time
+            if memory_profiler is not None:
+                memory_profiler.step()
+            tensor_stats = tensors.compute_stats()
+            progress.data_step += 1
+
+            if save_after_batch:
+                if ckpt_manager is None:
+                    raise RuntimeError("Value warmup requested a checkpoint, but trainer.ckpt is not configured.")
+                logger.info(f"Saving checkpoint after value warmup at step {progress.step}")
+                save_ckpt_start_time = time.perf_counter()
+                ckpt_manager.save(
+                    progress.step,
+                    model,
+                    [optimizer],
+                    scheduler,
+                    progress,
+                    **value_ckpt_kwargs(),
+                )
+                save_ckpt_time += time.perf_counter() - save_ckpt_start_time
+                ckpt_manager.maybe_clean()
+
+            step_time = time.perf_counter() - step_start_time
+            peak_memory = torch.cuda.max_memory_reserved() / 1024**3
+            current_value_lr = value_optimizer.param_groups[0]["lr"] if value_optimizer is not None else None
+            step_message = (
+                f"Value Warmup {progress.data_step} | {format_time(step_time):>7} | "
+                f"Value Loss {tensor_stats.get('value/loss/mean', 0.0):.4f} | "
+                f"Peak Mem. {peak_memory:.1f} GiB"
+            )
+            if value_update_stats.grad_norm is not None:
+                step_message += f" | Value Grad. Norm {value_update_stats.grad_norm:.4f}"
+            if current_value_lr is not None:
+                step_message += f" | Value LR {current_value_lr:.2e}"
+            logger.success(step_message)
+
+            warmup_metrics = {
+                "value_warmup/value_loss": tensor_stats.get("value/loss/mean", 0.0),
+                "value_warmup/step_time": step_time,
+                "value_warmup/forward_backward": forward_backward_time,
+                "value_warmup/peak_memory": peak_memory,
+                "value_warmup/data_step": progress.data_step,
+                "step": progress.step,
+            }
+            if current_value_lr is not None:
+                warmup_metrics["value_warmup/lr"] = current_value_lr
+            if value_update_stats.zero_grad_ratio is not None:
+                warmup_metrics["value_warmup/zero_grad_ratio"] = value_update_stats.zero_grad_ratio
+            if value_update_stats.grad_norm is not None:
+                warmup_metrics["value_warmup/grad_norm"] = value_update_stats.grad_norm.item()
+            monitor.log(warmup_metrics, step=progress.data_step)
+
+            if heart is not None:
+                heart.beat()
+            continue
 
         for micro_step, micro_batch in enumerate(micro_batches):
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")
+            if value_config is not None and value_config.use_gae:
+                advantages = value_targets[micro_step].advantages
             loss_mask = micro_batch["loss_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             ref_logprobs = micro_batch["ref_logprobs"].to("cuda") if micro_batch["ref_logprobs"] is not None else None
@@ -614,11 +908,21 @@ def train(config: TrainerConfig):
 
         # Update learning rate scheduler
         scheduler.step()
+        value_update_stats = ValueUpdateStats(grad_norm=None, zero_grad_ratio=None)
+        if value_config is not None:
+            value_update_stats = run_value_updates(
+                micro_batches,
+                value_targets,
+                value_config.updates_per_step,
+                value_scale,
+                tensors,
+            )
 
         if config.max_concurrent_runs == 1:
             current_lr = optimizer.param_groups[0]["lr"]
         else:
             current_lr = optimizer.get_current_lr()
+        current_value_lr = value_optimizer.param_groups[0]["lr"] if value_optimizer is not None else None
         forward_backward_time = time.perf_counter() - forward_backward_start_time
 
         # Optionally, dump memory snapshot
@@ -643,9 +947,15 @@ def train(config: TrainerConfig):
         step_message = f"Step {progress.step} | {format_time(step_time):>7} | Loss {tensor_stats['loss/mean']:.4f} | Entropy {tensor_stats['entropy/all/mean']:.4f}"
         if "mismatch_kl/all/mean" in tensor_stats:
             step_message += f" | Mismatch KL {tensor_stats['mismatch_kl/all/mean']:.4f}"
+        if "value/loss/mean" in tensor_stats:
+            step_message += f" | Value Loss {tensor_stats['value/loss/mean']:.4f}"
         if grad_norm is not None:
             step_message += f" | Grad. Norm {grad_norm:.4f}"
+        if value_update_stats.grad_norm is not None:
+            step_message += f" | Value Grad. Norm {value_update_stats.grad_norm:.4f}"
         step_message += f" | LR {current_lr:.2e} | Throughput {throughput:.0f} tokens/s | MFU {mfu:.1f}% | Peak Mem. {peak_memory:.1f} GiB"
+        if current_value_lr is not None:
+            step_message += f" | Value LR {current_value_lr:.2e}"
         if "max_vio/mean" in tensor_stats:
             step_message += f" | Max Vio {tensor_stats['max_vio/mean']:.4f}"
         if "routing_confidence/mean" in tensor_stats:
@@ -670,6 +980,12 @@ def train(config: TrainerConfig):
         }
         if grad_norm is not None:
             optim_metrics["optim/grad_norm"] = grad_norm.item()
+        if current_value_lr is not None:
+            optim_metrics["optim/value_lr"] = current_value_lr
+        if value_update_stats.zero_grad_ratio is not None:
+            optim_metrics["optim/value_zero_grad_ratio"] = value_update_stats.zero_grad_ratio
+        if value_update_stats.grad_norm is not None:
+            optim_metrics["optim/value_grad_norm"] = value_update_stats.grad_norm.item()
         monitor.log(optim_metrics, step=progress.step)
 
         # Compute derived metrics
@@ -738,6 +1054,7 @@ def train(config: TrainerConfig):
                 run_stats=run_stats,
             )
 
+        progress.data_step += 1
         progress.step += 1
         is_first_step = False
 
@@ -759,7 +1076,14 @@ def train(config: TrainerConfig):
     if config.max_concurrent_runs == 1 and ckpt_manager is not None:
         if not (config.ckpt and config.ckpt.weights_only):
             logger.info("Writing final checkpoint")
-            ckpt_manager.save(progress.step, model, [optimizer], scheduler, progress)
+            ckpt_manager.save(
+                progress.step,
+                model,
+                [optimizer],
+                scheduler,
+                progress,
+                **value_ckpt_kwargs(),
+            )
         ckpt_manager.maybe_clean()
 
     if config.max_concurrent_runs == 1 and weight_ckpt_manager is not None:

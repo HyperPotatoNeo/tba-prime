@@ -7,6 +7,9 @@ from pydantic import Field, model_validator
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
 from prime_rl.configs.orchestrator import (
+    CheckpointConfig as OrchestratorCheckpointConfig,
+)
+from prime_rl.configs.orchestrator import (
     FileSystemWeightBroadcastConfig as OrchestratorFileSystemWeightBroadcastConfig,
 )
 from prime_rl.configs.orchestrator import (
@@ -14,6 +17,7 @@ from prime_rl.configs.orchestrator import (
 )
 from prime_rl.configs.orchestrator import (
     OrchestratorConfig,
+    ValueWarmupConfig,
 )
 from prime_rl.configs.shared import (
     EnvVars,
@@ -25,6 +29,9 @@ from prime_rl.configs.trainer import (
     FakeDataLoaderConfig,
     TokenizerConfig,
     TrainerConfig,
+)
+from prime_rl.configs.trainer import (
+    CheckpointConfig as TrainerCheckpointConfig,
 )
 from prime_rl.configs.trainer import (
     FileSystemWeightBroadcastConfig as TrainerFileSystemWeightBroadcastConfig,
@@ -286,6 +293,26 @@ class RLConfig(BaseConfig):
         are constructed. See ``validation.propagate_shared_fields`` for the full
         propagation table, transforms, and the mutex rule.
         """
+        if isinstance(data, dict):
+            trainer = data.get("trainer")
+            orchestrator = data.get("orchestrator")
+            if (
+                isinstance(trainer, dict)
+                and isinstance(orchestrator, dict)
+                and trainer.get("value_function") is not None
+            ):
+                if orchestrator.get("value_function") is False:
+                    raise ValueError("trainer.value_function requires orchestrator.value_function=true or unset")
+                orchestrator.setdefault("value_function", True)
+                value_warmup = orchestrator.get("value_warmup")
+                warmup_disabled = isinstance(value_warmup, dict) and value_warmup.get("steps") == 0
+                if not warmup_disabled and data.get("ckpt") is None:
+                    if trainer.get("ckpt") is None and orchestrator.get("ckpt") is None:
+                        data["ckpt"] = {}
+                    elif trainer.get("ckpt") is not None and orchestrator.get("ckpt") is None:
+                        orchestrator["ckpt"] = {}
+                    elif orchestrator.get("ckpt") is not None and trainer.get("ckpt") is None:
+                        trainer["ckpt"] = {}
         return propagate_shared_fields(data)
 
     ### Validate shared configs (after sub-config construction)
@@ -363,6 +390,51 @@ class RLConfig(BaseConfig):
                 f"({self.orchestrator.bench}) must match. Use the top-level bench = true to set both."
             )
 
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_value_function(self):
+        if self.trainer.value_function is None:
+            if self.orchestrator.value_warmup is not None and self.orchestrator.value_warmup.steps > 0:
+                raise ValueError("orchestrator.value_warmup requires trainer.value_function")
+            return self
+
+        if "value_function" in self.orchestrator.model_fields_set and not self.orchestrator.value_function:
+            raise ValueError("trainer.value_function requires orchestrator.value_function=true or unset")
+        self.orchestrator.value_function = True
+        if self.orchestrator.value_warmup is None:
+            self.orchestrator.value_warmup = ValueWarmupConfig()
+        if (
+            self.orchestrator.value_warmup.batch_size is None
+            and self.orchestrator.value_warmup.token_batch_size is None
+        ):
+            self.orchestrator.value_warmup.batch_size = self.orchestrator.batch_size
+            self.orchestrator.value_warmup.token_batch_size = self.orchestrator.token_batch_size
+        if (
+            self.orchestrator.value_warmup.batch_size is not None
+            and self.orchestrator.value_warmup.batch_size % self.orchestrator.group_size != 0
+        ):
+            raise ValueError("orchestrator.value_warmup.batch_size must be divisible by orchestrator.group_size")
+        self.trainer.value_function.resolved_warmup_batches = self.orchestrator.value_warmup.steps
+        if self.orchestrator.value_warmup.steps > 0:
+            if self.trainer.ckpt is None:
+                self.trainer.ckpt = TrainerCheckpointConfig()
+            if self.orchestrator.ckpt is None:
+                self.orchestrator.ckpt = OrchestratorCheckpointConfig()
+            if self.orchestrator.ckpt.trainer_output_dir is None:
+                self.orchestrator.ckpt.trainer_output_dir = self.trainer.ckpt.output_dir or self.trainer.output_dir
+
+        # OrchestratorConfig's own validator runs before RLConfig flips this
+        # flag from the trainer setting, so mirror the same compatibility fix.
+        for slot_name in ("pre_batch_filters", "post_batch_filters"):
+            for filter_config in getattr(self.orchestrator, slot_name):
+                if filter_config.type == "zero_advantage" and filter_config.enforce:
+                    warnings.warn(
+                        f"orchestrator.{slot_name}.zero_advantage.enforce is incompatible with "
+                        "trainer-computed value/GAE advantages; setting enforce=false.",
+                        stacklevel=1,
+                    )
+                    filter_config.enforce = False
         return self
 
     @model_validator(mode="after")

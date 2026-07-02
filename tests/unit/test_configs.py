@@ -191,6 +191,49 @@ def test_trainer_enable_token_export_cli_flag():
     assert cli(TrainerConfig, args=["--enable-token-export"]).enable_token_export
 
 
+def test_value_function_config_defaults_and_guards():
+    config = RLConfig.model_validate(
+        {
+            "trainer": {"value_function": {}},
+            "orchestrator": {},
+        }
+    )
+
+    assert config.trainer.value_function is not None
+    assert config.trainer.value_function.optim.lr == 5e-5
+    assert config.trainer.value_function.scheduler.type == "linear"
+    assert config.trainer.value_function.scheduler.warmup_steps == 50
+    assert config.orchestrator.value_function
+    assert config.orchestrator.value_warmup is not None
+    assert config.orchestrator.value_warmup.steps == 50
+    assert config.trainer.value_function.resolved_warmup_batches == 50
+    assert config.trainer.ckpt is not None
+    assert config.orchestrator.ckpt is not None
+    assert config.orchestrator.ckpt.trainer_output_dir == config.trainer.output_dir
+
+    partial_scheduler = TrainerConfig.model_validate(
+        {"value_function": {"scheduler": {"warmup_steps": 2}}}
+    ).value_function.scheduler
+    assert partial_scheduler.warmup_steps == 2
+    assert partial_scheduler.decay_steps == 0
+    explicit_decay = TrainerConfig.model_validate(
+        {"value_function": {"scheduler": {"warmup_steps": 2, "decay_steps": 10}}}
+    ).value_function.scheduler
+    assert explicit_decay.decay_steps == 10
+
+    with pytest.raises(ValidationError, match="max_concurrent_runs"):
+        TrainerConfig.model_validate({"value_function": {}, "max_concurrent_runs": 2})
+    with pytest.raises(ValidationError, match="LoRA"):
+        RLConfig.model_validate({"trainer": {"value_function": {}, "model": {"lora": {}}}, "orchestrator": {}})
+    with pytest.raises(ValidationError, match="weights_only"):
+        RLConfig.model_validate(
+            {
+                "trainer": {"value_function": {}, "ckpt": {"weights_only": True}},
+                "orchestrator": {},
+            }
+        )
+
+
 def test_single_node_auto_inference_client_dp_rank_count_matches_local_dp():
     config = RLConfig.model_validate(
         {

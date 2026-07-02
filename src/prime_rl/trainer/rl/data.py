@@ -53,10 +53,14 @@ class TensorMicroBatch(TypedDict):
     rl_weights: Float[Tensor, "batch seq"] | None
     ce_weights: Float[Tensor, "batch seq"] | None
     ref_kl_weights: Float[Tensor, "batch seq"] | None
+    value_rewards: Float[Tensor, "batch seq"] | None
+    value_dones: Bool[Tensor, "batch seq"] | None
 
     # Packer-derived metadata used for run-local debug exports.
     run_id: str | None
     run_step: int | None
+    phase: str
+    save_checkpoint: bool
 
 
 class FakeDataLoader:
@@ -116,6 +120,10 @@ class FakeDataLoader:
         loss_mask = torch.ones(input_ids.shape[0], dtype=torch.bool)
         advantages = torch.randn(input_ids.shape[0], generator=generator)
         inference_logprobs = torch.randn(input_ids.shape[0], generator=generator)
+        value_rewards = torch.zeros(input_ids.shape[0])
+        value_dones = torch.zeros(input_ids.shape[0], dtype=torch.bool)
+        value_rewards[-1] = 1.0
+        value_dones[-1] = True
         lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
         lora_num_tokens[0] = input_ids.shape[0]
 
@@ -136,8 +144,12 @@ class FakeDataLoader:
             "rl_weights": None,
             "ce_weights": None,
             "ref_kl_weights": None,
+            "value_rewards": value_rewards.unsqueeze(0),
+            "value_dones": value_dones.unsqueeze(0),
             "run_id": None,
             "run_step": None,
+            "phase": "train",
+            "save_checkpoint": False,
         }
 
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
@@ -168,8 +180,12 @@ class FakeDataLoader:
             "rl_weights": None,
             "ce_weights": None,
             "ref_kl_weights": None,
+            "value_rewards": torch.zeros(self.seq_len, dtype=torch.float).unsqueeze(0),
+            "value_dones": (torch.arange(self.seq_len) == self.seq_len - 1).unsqueeze(0),
             "run_id": None,
             "run_step": None,
+            "phase": "train",
+            "save_checkpoint": False,
         }
 
 
@@ -273,8 +289,16 @@ class DataLoader:
             ref_kl_weights=torch.tensor(micro_batch.ref_kl_weights, dtype=torch.float).unsqueeze(0)
             if micro_batch.ref_kl_weights is not None
             else None,
+            value_rewards=torch.tensor(micro_batch.value_rewards, dtype=torch.float).unsqueeze(0)
+            if micro_batch.value_rewards is not None
+            else None,
+            value_dones=torch.tensor(micro_batch.value_dones, dtype=torch.bool).unsqueeze(0)
+            if micro_batch.value_dones is not None
+            else None,
             run_id=micro_batch.run_id,
             run_step=micro_batch.run_step,
+            phase=micro_batch.phase,
+            save_checkpoint=micro_batch.save_checkpoint,
         )
 
 

@@ -22,7 +22,7 @@ class FileSystemTrainingBatchSender(TrainingBatchSender):
     async def send(self, batch: TrainingBatch) -> None:
         """Send a batch by writing it to disk. Encode + write run in a worker
         thread so the orch event loop stays responsive during step transitions."""
-        step_path = get_step_path(self.rollout_dir, batch.step)
+        step_path = get_step_path(self.rollout_dir, batch.data_step)
         step_path.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(self._encode_and_write, batch, step_path)
 
@@ -37,9 +37,10 @@ class FileSystemTrainingBatchSender(TrainingBatchSender):
 class FileSystemTrainingBatchReceiver(TrainingBatchReceiver):
     """Filesystem-based training batch receiver that reads batches from multiple run directories."""
 
-    def __init__(self) -> None:
+    def __init__(self, current_step: int | None = None) -> None:
         super().__init__()
         self.multi_run_manager = get_multi_run_manager()
+        self.current_step = current_step
         self._last_logged_paths: list[Path] | None = None
         self._last_logged_time = time()
         self._waiting_since: float | None = None
@@ -51,7 +52,9 @@ class FileSystemTrainingBatchReceiver(TrainingBatchReceiver):
         """Get the next step to receive for a run, initializing from progress if needed."""
         if idx not in self._received_steps:
             # Initialize from multi_run_manager.progress on first access (for checkpoint resume)
-            self._received_steps[idx] = self.multi_run_manager.progress[idx].step
+            self._received_steps[idx] = (
+                self.current_step if self.current_step is not None else self.multi_run_manager.progress[idx].step
+            )
         return self._received_steps[idx]
 
     def _get_batch_path(self, idx: int) -> Path:

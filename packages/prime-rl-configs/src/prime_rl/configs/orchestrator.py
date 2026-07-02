@@ -355,6 +355,9 @@ class CheckpointConfig(BaseConfig):
     interval: int | None = Field(None, ge=1)
     """Step interval at which to save the orchestrator checkpoint."""
 
+    trainer_output_dir: Path | None = None
+    """Trainer checkpoint output directory used for cross-process checkpoint synchronization."""
+
     resume_step: int | None = Field(None, ge=-1)
     """Step to resume the orchestrator from. None starts from scratch; ``-1`` resumes from the latest checkpoint available."""
 
@@ -441,6 +444,23 @@ class NCCLWeightBroadcastConfig(BaseConfig):
 WeightBroadcastConfig: TypeAlias = Annotated[
     FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig, Field(discriminator="type")
 ]
+
+
+class ValueWarmupConfig(BaseConfig):
+    steps: int = Field(50, ge=0)
+    """Number of trainer-local value warmup batches to send before policy training steps."""
+
+    batch_size: int | None = Field(None, ge=1)
+    """Warmup rollout batch size. Defaults to orchestrator.batch_size when unset."""
+
+    token_batch_size: int | None = Field(None, ge=1)
+    """Warmup token batch size. Defaults to orchestrator.token_batch_size when unset."""
+
+    @model_validator(mode="after")
+    def validate_batching(self):
+        if self.batch_size is not None and self.token_batch_size is not None:
+            raise ValueError("Set at most one of value_warmup.batch_size or value_warmup.token_batch_size")
+        return self
 
 
 class OrchestratorConfig(BaseConfig):
@@ -553,6 +573,12 @@ class OrchestratorConfig(BaseConfig):
     max_off_policy_steps: int = Field(8, ge=0)
     """Maximum policies allowed to generate a single rollout. Rollouts generated more than ``max_off_policy_steps`` ahead of training are discarded. Higher values yield better throughput at the cost of off-policy noise."""
 
+    value_function: bool = False
+    """Ship value reward/done streams for a trainer-local value function."""
+
+    value_warmup: ValueWarmupConfig | None = None
+    """Optional trainer-local value warmup phase. Warmup batches do not advance policy progress or async lag."""
+
     bench: bool = False
     """Benchmark mode. Sets ``max_steps`` to 5 and disables W&B."""
 
@@ -618,6 +644,29 @@ class OrchestratorConfig(BaseConfig):
                 raise ValueError(
                     f"Duplicate filter types in {slot_name}: {types}. Each filter type may only appear once per slot."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def value_function_disables_enforced_zero_advantage_filter(self):
+        if not self.value_function:
+            return self
+        for slot_name in ("pre_batch_filters", "post_batch_filters"):
+            for filter_config in getattr(self, slot_name):
+                if filter_config.type == "zero_advantage" and filter_config.enforce:
+                    warnings.warn(
+                        f"{slot_name}.zero_advantage.enforce is incompatible with trainer-computed "
+                        "value/GAE advantages; setting enforce=false.",
+                        stacklevel=1,
+                    )
+                    filter_config.enforce = False
+        return self
+
+    @model_validator(mode="after")
+    def validate_value_warmup_requires_value_function(self):
+        if self.value_warmup is not None and self.value_warmup.steps > 0 and not self.value_function:
+            raise ValueError("orchestrator.value_warmup requires orchestrator.value_function = true")
+        if self.value_warmup is not None and self.value_warmup.steps > 0 and self.ckpt is None:
+            self.ckpt = CheckpointConfig()
         return self
 
     @model_validator(mode="after")
@@ -718,6 +767,13 @@ class OrchestratorConfig(BaseConfig):
 
         if self.max_inflight_rollouts is not None and self.max_inflight_rollouts < self.group_size:
             raise ValueError("max_inflight_rollouts must be at least the number of rollouts per example")
+
+        if self.value_warmup is not None:
+            if self.value_warmup.batch_size is None and self.value_warmup.token_batch_size is None:
+                self.value_warmup.batch_size = self.batch_size
+                self.value_warmup.token_batch_size = self.token_batch_size
+            if self.value_warmup.batch_size is not None and self.value_warmup.batch_size % self.group_size != 0:
+                raise ValueError("value_warmup.batch_size must be divisible by the number of samples per problem")
 
         # Propagate the top-level ``group_size`` into each train env that didn't set its own.
         for env_cfg in self.train.env:

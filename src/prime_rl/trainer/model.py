@@ -13,7 +13,7 @@ import torch
 import torch._dynamo
 import torch.nn as nn
 from huggingface_hub import snapshot_download
-from jaxtyping import Int
+from jaxtyping import Float, Int
 from torch import Tensor
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
@@ -446,6 +446,49 @@ def get_load_balance_stats(
     }
 
 
+class ValueFunctionModel(nn.Module):
+    """Text-only value model built from the configured LM backbone plus a scalar/bin head."""
+
+    def __init__(self, causal_lm: nn.Module, output_size: int):
+        super().__init__()
+        self.config = causal_lm.config
+        self._prime_conversion_cls = type(causal_lm) if isinstance(causal_lm, PreTrainedModelPrimeRL) else None
+        self.model = get_language_model(causal_lm)
+        text_config = self.config.get_text_config() if hasattr(self.config, "get_text_config") else self.config
+        old_head = causal_lm.lm_head
+        self.value_head = nn.Linear(
+            text_config.hidden_size,
+            output_size,
+            device=old_head.weight.device,
+            dtype=old_head.weight.dtype,
+        )
+
+    def init_value_head(self) -> None:
+        self.value_head.reset_parameters()
+
+    def forward(
+        self,
+        input_ids: Int[Tensor, "batch seq"],
+        position_ids: Int[Tensor, "batch seq"],
+        routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
+        mm_kwargs: dict[str, Tensor] | None = None,
+        mm_token_type_ids: Int[Tensor, "batch seq"] | None = None,
+    ) -> Float[Tensor, "batch seq output"]:
+        if mm_kwargs is not None or mm_token_type_ids is not None:
+            raise ValueError("ValueFunctionModel only supports text-only batches.")
+
+        kwargs = {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+        }
+        if routed_experts is not None:
+            kwargs["routed_experts"] = routed_experts
+
+        outputs = self.model(**kwargs)
+        hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+        return self.value_head(hidden_states).float()
+
+
 def get_model(
     config: ModelConfig, device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.bfloat16
 ) -> nn.Module:
@@ -687,10 +730,15 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             **fsdp_config,
         )
 
-    shard_norm_and_lm_head = hasattr(model, "config") and not model.config.tie_word_embeddings
+    head_module = getattr(model, "value_head", getattr(model, "lm_head", None))
+    shard_norm_and_head = (
+        hasattr(model, "config")
+        and head_module is not None
+        and (isinstance(model, ValueFunctionModel) or not model.config.tie_word_embeddings)
+    )
 
-    if shard_norm_and_lm_head:
-        # This optimization breaks weight tying
+    if shard_norm_and_head:
+        # This optimization breaks weight tying for policy LM heads, but value heads are never tied.
         embed_module = getattr(language_model, "embed_tokens", None) or getattr(language_model, "embeddings", None)
         fully_shard(
             embed_module,
@@ -699,14 +747,14 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         )
         norm_module = getattr(language_model, "norm", None) or language_model.norm_f
         fully_shard(
-            [model.lm_head, norm_module],
+            [head_module, norm_module],
             mesh=hsdp_mesh,
             mp_policy=mp_policy,
             offload_policy=offload_policy,
             reshard_after_forward=False,
         )
     else:
-        get_logger().warning("Model uses tied word embeddings, so skipping the last-layer no-reshard optimization.")
+        get_logger().warning("Skipping the last-layer no-reshard optimization.")
 
     fully_shard(
         model,
@@ -727,7 +775,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
 
     embed_module = getattr(language_model, "embed_tokens", None) or getattr(language_model, "embeddings", None)
     if embed_module is not None and len(language_model.layers) > 0:
-        if shard_norm_and_lm_head:
+        if shard_norm_and_head:
             embed_module.set_modules_to_forward_prefetch([transformer_blocks[0]])
 
     for transformer_block, next_transformer_block in zip(transformer_blocks, next_transformer_blocks):
@@ -737,17 +785,17 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
                 transformer_block.set_modules_to_forward_prefetch([next_transformer_block, next_mlp.experts])
             else:
                 transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
-        elif language_model.norm is not None and model.lm_head is not None:
-            if shard_norm_and_lm_head:
-                transformer_block.set_modules_to_forward_prefetch([language_model.norm, model.lm_head])
+        elif language_model.norm is not None and head_module is not None:
+            if shard_norm_and_head:
+                transformer_block.set_modules_to_forward_prefetch([language_model.norm, head_module])
 
     # backward
     reversed_transformer_blocks = list(reversed(language_model.layers))
     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
-    if language_model.norm is not None and model.lm_head is not None and len(language_model.layers) > 0:
-        if shard_norm_and_lm_head:
-            model.lm_head.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+    if language_model.norm is not None and head_module is not None and len(language_model.layers) > 0:
+        if shard_norm_and_head:
+            head_module.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
         else:
             model.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
 
@@ -759,7 +807,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             else:
                 transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
         elif embed_module is not None:
-            if shard_norm_and_lm_head:
+            if shard_norm_and_head:
                 transformer_block.set_modules_to_backward_prefetch([embed_module])
 
 
@@ -769,7 +817,10 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     torch.distributed.barrier()
 
     def _init_buffers_post_meta():
-        if isinstance(model, PreTrainedModelPrimeRL):
+        if isinstance(model, ValueFunctionModel):
+            fix_model_post_empty(model)
+            model.init_value_head()
+        elif isinstance(model, PreTrainedModelPrimeRL):
             model.init_buffers_post_meta()
         else:
             fix_model_post_empty(model)
@@ -792,11 +843,19 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     # Dynamically convert between different weight formats if needed.
     # All ranks read just the key names (cheap) to determine the path independently.
     # Only master loads the full state dict when conversion is actually needed.
+    prime_conversion_cls = None
     if isinstance(model, PreTrainedModelPrimeRL):
-        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
-        model_keys = dict.fromkeys(model.state_dict().keys())
+        prime_conversion_cls = type(model)
+    elif isinstance(model, ValueFunctionModel):
+        prime_conversion_cls = model._prime_conversion_cls
 
-        if model.is_hf_state_dict(snapshot_keys) and model.is_prime_state_dict(model_keys):
+    if prime_conversion_cls is not None:
+        snapshot_keys = dict.fromkeys(load_state_dict_keys(snapshot_path))
+        model_keys = dict.fromkeys(k for k in model.state_dict().keys() if not k.startswith("value_head."))
+
+        if prime_conversion_cls.is_hf_state_dict(snapshot_keys) and prime_conversion_cls.is_prime_state_dict(
+            model_keys
+        ):
             logger.warning(
                 "Found HF weight format in snapshot state dict and PrimeRL weight format in model state dict. Trying to auto-convert..."
             )
@@ -806,11 +865,13 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     f"Converting snapshot state dict to PrimeRL format and saving to {snapshot_path} on master rank. This is a one-time operation."
                 )
                 snapshot_state_dict = load_state_dict(snapshot_path.parent)
-                model.convert_to_prime(snapshot_state_dict)
+                prime_conversion_cls.convert_to_prime(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
                 del snapshot_state_dict
 
-        elif model.is_prime_state_dict(snapshot_keys) and model.is_hf_state_dict(model_keys):
+        elif prime_conversion_cls.is_prime_state_dict(snapshot_keys) and prime_conversion_cls.is_hf_state_dict(
+            model_keys
+        ):
             logger.warning(
                 "Found PrimeRL weight format in snapshot state dict and HF weight format in model state dict. Trying to auto-convert..."
             )
@@ -820,7 +881,7 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
                     f"Converting snapshot state dict to HF format and saving to {snapshot_path} on master rank. This is a one-time operation."
                 )
                 snapshot_state_dict = load_state_dict(snapshot_path.parent)
-                model.convert_to_hf(snapshot_state_dict)
+                prime_conversion_cls.convert_to_hf(snapshot_state_dict)
                 save_state_dict(snapshot_state_dict, snapshot_path)
                 del snapshot_state_dict
 
@@ -831,14 +892,22 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
     load_dcp_start_time = time.perf_counter()
     state_dict = model.state_dict()
     state_dict = strip_lora_from_state_dict(state_dict)
+    if isinstance(model, ValueFunctionModel):
+        for key in list(state_dict):
+            if key.startswith("value_head."):
+                del state_dict[key]
     if model.config.tie_word_embeddings:
-        del state_dict["lm_head.weight"]
+        state_dict.pop("lm_head.weight", None)
     dcp_load(
         state_dict,
         storage_reader=HuggingFaceStorageReader(path=snapshot_path.as_posix()),
     )
     # Restore weight tying broken by to_empty() for HF models
-    if not isinstance(model, PreTrainedModelPrimeRL) and model.config.tie_word_embeddings:
+    if (
+        not isinstance(model, (PreTrainedModelPrimeRL, ValueFunctionModel))
+        and model.config.tie_word_embeddings
+        and hasattr(model, "tie_weights")
+    ):
         model.tie_weights()
     _init_buffers_post_meta()
 
@@ -1066,7 +1135,11 @@ def setup_model(
     parallel_dims: ParallelDims,
     loading_from_checkpoint_later: bool = False,
     fused_cross_entropy: bool | str = False,
+    value_head_output_size: int | None = None,
 ) -> nn.Module:
+    if value_head_output_size is not None and config.lora is not None:
+        raise ValueError("Value functions do not support LoRA yet.")
+
     if config.attn == "flash_attention_3" and not is_flash_attn_3_available():
         raise ValueError(
             "Flash attention 3 is only supported if the flash_attn_3 package is installed. Install with `uv pip install 'flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git@main#subdirectory=hopper' --no-build-isolation`"
@@ -1080,6 +1153,8 @@ def setup_model(
 
     # 1. We load to meta device by default
     model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
+    if value_head_output_size is not None:
+        model = ValueFunctionModel(model, value_head_output_size)
     configure_moe_ep_backend(model, config)
 
     possible_to_load_to_meta = can_reinit_empty_buffers(model)
@@ -1093,19 +1168,22 @@ def setup_model(
     if not possible_to_load_to_meta:
         logger.warning("Cannot load model to meta device only, loading to CPU instead.")
         model = get_model(config, device=torch.device("cpu"), dtype=DTYPE_MAP[config.optimization_dtype])
+        if value_head_output_size is not None:
+            model = ValueFunctionModel(model, value_head_output_size)
         configure_moe_ep_backend(model, config)
 
     lm_head_chunk_size: int | None = None
     if isinstance(config.fused_lm_head_token_chunk_size, int):
         lm_head_chunk_size = config.fused_lm_head_token_chunk_size
 
-    inject_prime_lm_head(model, chunk_size=lm_head_chunk_size, fused_cross_entropy=fused_cross_entropy)
+    if value_head_output_size is None:
+        inject_prime_lm_head(model, chunk_size=lm_head_chunk_size, fused_cross_entropy=fused_cross_entropy)
 
     if config.fp8:
         replace_linear_with_fp8_blockwise_linear(model)
 
     # Apply LoRA before FSDP setup
-    if config.lora is not None:
+    if config.lora is not None and value_head_output_size is None:
         apply_lora_to_model(model, config.lora)
 
     if config.freeze_moe_router:
@@ -1149,6 +1227,9 @@ def setup_model(
             torch.distributed.barrier()
             if isinstance(model, PreTrainedModelPrimeRL):
                 model.init_buffers_post_meta()
+            elif isinstance(model, ValueFunctionModel):
+                fix_model_post_empty(model)
+                model.init_value_head()
             else:
                 fix_model_post_empty(model)
                 # Restore weight tying broken by to_empty() for HF models
@@ -1162,6 +1243,20 @@ def setup_model(
 
     _reset_runtime_moe_buffers(model)
     return model
+
+
+def setup_value_model(
+    config: ModelConfig,
+    parallel_dims: ParallelDims,
+    loading_from_checkpoint_later: bool,
+    head_output_size: int,
+) -> nn.Module:
+    return setup_model(
+        config,
+        parallel_dims,
+        loading_from_checkpoint_later,
+        value_head_output_size=head_output_size,
+    )
 
 
 def forward(
@@ -1213,3 +1308,22 @@ def forward(
         return cast_float_and_contiguous(out)
 
     return cast_float_and_contiguous(PrimeLmOutput(logits=out.logits))
+
+
+def predict_value(
+    model: nn.Module,
+    input_ids: Int[Tensor, "batch seq"],
+    position_ids: Int[Tensor, "batch seq"],
+    routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
+    mm_kwargs: dict[str, Tensor] | None = None,
+    mm_token_type_ids: Int[Tensor, "batch seq"] | None = None,
+) -> Float[Tensor, "batch seq output"]:
+    if not isinstance(model, ValueFunctionModel):
+        raise TypeError(f"Expected ValueFunctionModel, got {type(model).__name__}")
+    return model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        routed_experts=routed_experts,
+        mm_kwargs=mm_kwargs,
+        mm_token_type_ids=mm_token_type_ids,
+    )

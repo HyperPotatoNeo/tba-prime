@@ -21,6 +21,7 @@ import uuid
 from collections import defaultdict
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
+from prime_rl.orchestrator.algo.routing import stamp_value_returns
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.filters import RolloutFilter, apply_filters
 from prime_rl.orchestrator.metrics import TrainRollouts
@@ -72,6 +73,13 @@ class TrainSink:
         self.pre_filter_seen = 0
         self.pre_filter_dropped = 0
         self.pre_filter_dropped_by_name: dict[str, int] = {}
+
+    def set_batching(self, *, batch_size: int | None, token_batch_size: int | None) -> None:
+        assert (batch_size is None) != (token_batch_size is None), (
+            "Exactly one of batch_size / token_batch_size must be set"
+        )
+        self.batch_size = batch_size
+        self.token_batch_size = token_batch_size
 
     def group_size_for(self, env_name: str) -> int:
         return self.train_envs.get(env_name).config.group_size
@@ -184,6 +192,9 @@ class TrainSink:
         # routing) are the algorithm's job (finalize_group); the sink only
         # owns the grouping mechanics.
         await env.algorithm.finalize_group(survivors)
+        if self.config.value_function:
+            for rollout in survivors:
+                stamp_value_returns(rollout)
 
         # The env has a single sampling temperature; fan it out per token
         # (context tokens are masked out, so their temperature is don't-care).

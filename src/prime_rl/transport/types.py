@@ -1,3 +1,5 @@
+from typing import Literal
+
 import msgspec
 
 
@@ -68,6 +70,11 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # samples without live rl member tokens (the trainer raises otherwise).
     advantages: list[float] | None = None
 
+    # Per-token environment reward and done streams for trainer-local value
+    # learning. These are raw env rewards, not KL-shaped policy advantages.
+    value_rewards: list[float] | None = None
+    value_dones: list[bool] | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""
@@ -75,6 +82,9 @@ class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tru
     examples: list[TrainingSample]
     step: int
     run_idx: int | None = None
+    data_step: int = 0
+    phase: Literal["train", "value_warmup"] = "train"
+    save_checkpoint: bool = False
 
 
 # Packer -> Trainer
@@ -105,6 +115,12 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     ce_weights: list[float] | None = None
     ref_kl_weights: list[float] | None = None
 
+    # Per-token value targets (see TrainingSample).
+    value_rewards: list[float] | None = None
+    value_dones: list[bool] | None = None
+
     # Packer-derived metadata used for run-local token exports.
     run_id: str | None = None
     run_step: int | None = None
+    phase: Literal["train", "value_warmup"] = "train"
+    save_checkpoint: bool = False
