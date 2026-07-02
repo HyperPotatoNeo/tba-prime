@@ -105,7 +105,7 @@ def rho_methods(include_odds: bool) -> list[str]:
 
 
 def mixed_methods(include_odds: bool) -> list[str]:
-    methods = ["mixed_add"]
+    methods = ["mixed_add", "mixed_add_clipped"]
     if include_odds:
         methods.append("mixed_odds")
     return methods
@@ -231,6 +231,8 @@ def method_prediction(table: TokenTable, method: str, rho: float, alpha: float =
         return sigmoid(logit(table.odds_prior) + rho * (table.logit - table.logit0))
     if method == "mixed_add":
         return table.loo + alpha * (table.value0 - table.loo) + rho * (table.value - table.value0)
+    if method == "mixed_add_clipped":
+        return np.clip(table.loo + alpha * (table.value0 - table.loo) + rho * (table.value - table.value0), 0.0, 1.0)
     if method == "mixed_odds":
         prior_logit = logit(table.odds_prior)
         return sigmoid(prior_logit + alpha * (table.logit0 - prior_logit) + rho * (table.logit - table.logit0))
@@ -393,6 +395,9 @@ def summary_at_rhos(
             "rho": rho,
             "variance": variance_proxy(table, method, rho, alpha=alpha),
         }
+        if method == "mixed_add_clipped":
+            unclipped = method_prediction(table, "mixed_add", rho, alpha)
+            summary[method]["clip_fraction"] = float(((unclipped < 0.0) | (unclipped > 1.0)).mean())
     loo = summary["loo"]["variance"]
     for entry in summary.values():
         entry["delta_vs_loo"] = entry["variance"] - loo

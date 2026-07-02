@@ -206,6 +206,9 @@ def test_mixed_baselines_select_alpha_and_rho_on_validation_grid():
     assert selected_mixed["mixed_add"]["alpha"] == pytest.approx(1.0)
     assert selected_mixed["mixed_add"]["rho"] == pytest.approx(1.0)
     assert summary["mixed_add"]["variance"] == pytest.approx(0.0)
+    assert selected_mixed["mixed_add_clipped"]["alpha"] == pytest.approx(1.0)
+    assert selected_mixed["mixed_add_clipped"]["rho"] == pytest.approx(1.0)
+    assert summary["mixed_add_clipped"]["variance"] == pytest.approx(0.0)
     assert selected_mixed["mixed_odds"]["alpha"] == pytest.approx(1.0)
     assert selected_mixed["mixed_odds"]["rho"] == pytest.approx(1.0)
     assert summary["mixed_odds"]["variance"] < 1e-10
@@ -263,6 +266,7 @@ def test_fractional_rewards_skip_binary_odds_methods():
     assert "odds_prior" not in summary
     assert "anchored_add_clipped" in summary
     assert "mixed_add" in summary
+    assert "mixed_add_clipped" in summary
 
 
 def test_training_sample_from_record_stamps_terminal_value_reward():

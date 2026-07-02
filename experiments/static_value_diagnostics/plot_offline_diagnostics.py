@@ -8,6 +8,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 
+POSITION_METHODS = {
+    "linear": "linear_variance_overall_rho",
+    "mixed_add": "mixed_add_variance_overall_params",
+    "mixed_add_clipped": "mixed_add_clipped_variance_overall_params",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot static-policy value-baseline diagnostics.")
     parser.add_argument("--diagnostics-dir", type=Path, required=True)
@@ -50,13 +57,13 @@ def plot_curves(data: dict, output_dir: Path) -> None:
 
 def plot_summary(data: dict, output_dir: Path) -> None:
     rows = data["test_summary"]
-    names = list(rows.keys())
+    names = [name for name in rows if name != "group_mean"]
     values = [rows[name]["variance"] for name in names]
     plt.figure(figsize=(9, 4.5))
     plt.bar(names, values)
     plt.xticks(rotation=35, ha="right")
     plt.ylabel("mean squared advantage proxy")
-    plt.title("Test metrics at val-selected rho")
+    plt.title("Admissible test metrics at val-selected coefficients")
     plt.tight_layout()
     plt.savefig(output_dir / "summary.png", dpi=180)
     plt.close()
@@ -113,6 +120,33 @@ def plot_group_size(rows: list[dict[str, str]], output_dir: Path) -> None:
     plt.close()
 
 
+def plot_position_global_delta(rows: list[dict[str, str]], output_dir: Path) -> None:
+    absolute_rows = [row for row in rows if row["bucket"].startswith("pos_") and not row["bucket"].endswith("_plus")]
+    if not absolute_rows:
+        return
+
+    labels = [row["bucket"].removeprefix("pos_").replace("_", "-") for row in absolute_rows]
+    xs = list(range(len(labels)))
+    plt.figure(figsize=(9, 4.8))
+    plt.axhline(0.0, linestyle="--", linewidth=1, color="black", label="LOO")
+    for method, column in POSITION_METHODS.items():
+        if column not in absolute_rows[0]:
+            continue
+        ys = []
+        for row in absolute_rows:
+            loo = float(row["loo_variance"])
+            ys.append(100.0 * (float(row[column]) - loo) / loo)
+        plt.plot(xs, ys, marker="o", linewidth=1.8, markersize=4, label=method)
+    plt.xticks(xs, labels, rotation=25, ha="right")
+    plt.xlabel("generated-token bucket")
+    plt.ylabel("delta vs LOO (%)")
+    plt.title("Global-coefficient value baselines by token bucket")
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_dir / "position_global_delta.png", dpi=180)
+    plt.close()
+
+
 def main() -> None:
     args = parse_args()
     diagnostics_dir = args.diagnostics_dir
@@ -120,9 +154,11 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     data = _load_json(diagnostics_dir / "diagnostics.json")
     group_rows = _load_csv(diagnostics_dir / "group_size_sensitivity.csv")
+    position_rows = _load_csv(diagnostics_dir / "position_summary.csv")
     plot_curves(data, output_dir)
     plot_summary(data, output_dir)
     plot_mixed_heatmaps(data, output_dir)
+    plot_position_global_delta(position_rows, output_dir)
     plot_group_size(group_rows, output_dir)
     if args.wandb_project:
         import wandb
