@@ -26,6 +26,7 @@ The config defaults to:
 - classifier value loss with `reward_range = [0.0, 1.0]` and `n_bins = 1`;
 - `100` value-training steps with global batch size `256`;
 - two value-training nodes with `micro_batch_tokens = 32768`;
+- FlashAttention 3 on Perlmutter H100 nodes;
 - ancestral sampling: `temperature = 1.0`, `top_p = 1.0`, `top_k = -1`,
   `min_p = 0.0`.
 

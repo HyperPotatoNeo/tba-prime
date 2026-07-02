@@ -4,6 +4,7 @@ repo_dir = "/pscratch/sd/s/siddart2/value-functions-prime-rl/prime-rl"
 [model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
 seq_len = 8192
+attn = "flash_attention_3"
 
 [value_function]
 gamma = 1.0

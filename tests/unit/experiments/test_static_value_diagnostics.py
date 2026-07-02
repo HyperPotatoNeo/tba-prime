@@ -68,6 +68,7 @@ def test_static_value_example_toml_loads_with_static_model_defaults():
     config = StaticValueConfig.model_validate(data)
 
     assert config.model.name == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config.model.attn == "flash_attention_3"
     assert config.model.compile is None
     assert config.model.ac_offloading is None
     assert config.model.dp_replicate == 4

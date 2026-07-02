@@ -257,6 +257,7 @@ The default example uses:
 
 - `Qwen/Qwen3-4B-Instruct-2507`;
 - sequence length `8192`;
+- FlashAttention 3 on Perlmutter H100 nodes;
 - ancestral sampling: `temperature = 1.0`, `top_p = 1.0`, `top_k = -1`,
   `min_p = 0.0`;
 - `10_000` train episodes;
@@ -265,6 +266,11 @@ The default example uses:
 - classifier value loss with `reward_range = [0.0, 1.0]`, `n_bins = 1`;
 - `100` value-training steps with global batch size `256`;
 - two value-training nodes with `micro_batch_tokens = 32768`.
+
+This keeps default activation checkpointing and `model.dp_replicate = 4`.
+On Qwen3-4B with 8192-token rollouts, disabling activation checkpointing OOMs
+at useful packed-token budgets, and full replication (`dp_replicate = 8`) is no
+faster than the default 4x2 replicate/shard mesh.
 
 Train prompts start at dataset offset `0`. Held-out prompts start at offset
 `7000` in the saved RGMix dataset to avoid train/eval overlap.
