@@ -125,16 +125,7 @@ class StaticValueRunner:
             self.stop_inference()
 
     def train_value(self) -> None:
-        node = self._train_node()
-        cmd = [
-            "uv",
-            "run",
-            "torchrun",
-            "--standalone",
-            "--nproc-per-node",
-            str(self.config.inference.gpus_per_node),
-            "-m",
-            "experiments.static_value_diagnostics.train_static_value",
+        args = [
             *self._value_train_args(
                 rollouts=self.data_dir / "train_rollouts.jsonl",
                 output_dir=self.value_dir,
@@ -143,8 +134,8 @@ class StaticValueRunner:
             "--skip-predict",
         ]
         if self.config.value_function.init_checkpoint is not None:
-            cmd += ["--load-value-checkpoint", str(self.config.value_function.init_checkpoint)]
-        self._run_remote(node, cmd, self.log_dir / "value_train.log", cuda_visible_devices=self._all_gpus())
+            args += ["--load-value-checkpoint", str(self.config.value_function.init_checkpoint)]
+        self._run_value_torchrun(args, "value_train")
 
     def collect_eval(self) -> None:
         nodes = self._slurm_nodes()
@@ -184,16 +175,7 @@ class StaticValueRunner:
             self.stop_inference()
 
     def predict(self) -> None:
-        node = self._train_node()
-        cmd = [
-            "uv",
-            "run",
-            "torchrun",
-            "--standalone",
-            "--nproc-per-node",
-            str(self.config.inference.gpus_per_node),
-            "-m",
-            "experiments.static_value_diagnostics.train_static_value",
+        args = [
             "--predict-only",
             "--load-value-checkpoint",
             str(self.value_dir / "value_checkpoint"),
@@ -207,7 +189,7 @@ class StaticValueRunner:
             "val",
             "test",
         ]
-        self._run_remote(node, cmd, self.log_dir / "value_predict.log", cuda_visible_devices=self._all_gpus())
+        self._run_value_torchrun(args, "value_predict")
 
     def diagnostics(self) -> None:
         common = self._local_env()
@@ -497,6 +479,8 @@ class StaticValueRunner:
             str(self.config.train.mfu_peak_tflops_per_gpu),
             *self._wandb_args("value" if steps > 0 else "predict"),
         ]
+        if self.config.train.micro_batch_tokens is not None:
+            args += ["--micro-batch-tokens", str(self.config.train.micro_batch_tokens)]
         if predict_rollouts is not None:
             args += ["--predict-rollouts", str(predict_rollouts)]
         if self.config.model.compile is None:
@@ -512,6 +496,59 @@ class StaticValueRunner:
         if self.config.model.trust_remote_code:
             args.append("--trust-remote-code")
         return args
+
+    def _value_nodes(self) -> list[str]:
+        if self.config.train.num_nodes == 1:
+            return [self._train_node()]
+        return self._slurm_nodes()[: self.config.train.num_nodes]
+
+    def _rdzv_port(self) -> int:
+        job_id = os.environ.get("SLURM_JOB_ID")
+        return 20000 + (int(job_id) % 20000 if job_id and job_id.isdigit() else int(time.time()) % 20000)
+
+    def _run_value_torchrun(self, args: list[str], log_stem: str) -> None:
+        nodes = self._value_nodes()
+        common = [
+            "uv",
+            "run",
+            "torchrun",
+            "--nproc-per-node",
+            str(self.config.inference.gpus_per_node),
+        ]
+        if len(nodes) == 1:
+            cmd = [
+                *common,
+                "--standalone",
+                "-m",
+                "experiments.static_value_diagnostics.train_static_value",
+                *args,
+            ]
+            self._run_remote(nodes[0], cmd, self.log_dir / f"{log_stem}.log", cuda_visible_devices=self._all_gpus())
+            return
+
+        rdzv_id = f"static-value-{os.environ.get('SLURM_JOB_ID', int(time.time()))}-{log_stem}"
+        rdzv_endpoint = f"{nodes[0]}:{self._rdzv_port()}"
+        procs = []
+        for node_rank, node in enumerate(nodes):
+            cmd = [
+                *common,
+                "--nnodes",
+                str(len(nodes)),
+                "--node-rank",
+                str(node_rank),
+                "--rdzv-backend",
+                "c10d",
+                "--rdzv-endpoint",
+                rdzv_endpoint,
+                "--rdzv-id",
+                rdzv_id,
+                "-m",
+                "experiments.static_value_diagnostics.train_static_value",
+                *args,
+            ]
+            log_name = f"{log_stem}.log" if node_rank == 0 else f"{log_stem}_node{node_rank}.log"
+            procs.append(self._popen_remote(node, cmd, self.log_dir / log_name, cuda_visible_devices=self._all_gpus()))
+        self._wait_all(procs)
 
     def _wandb_args(self, suffix: str) -> list[str]:
         if self.config.wandb is None:

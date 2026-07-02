@@ -197,6 +197,20 @@ to `examples/static_value_rg_mix/static_value.toml`. The `static-value` runner
 itself writes the resolved config to `<output_dir>/configs/static_value.toml`
 and per-node inference configs to the same directory.
 
+The value-training stage can use one or more allocated nodes:
+
+```toml
+[train]
+global_batch_size = 256
+micro_batch_tokens = 16384  # optional; defaults to model.seq_len
+num_nodes = 2               # value trainer/predict nodes
+```
+
+`micro_batch_tokens` is the packed-token budget for each value
+forward/backward. Individual rollouts are still clipped by `model.seq_len`;
+larger values just pack multiple shorter sequences into one varlen forward when
+memory allows.
+
 ### Stages
 
 `static-value` runs these stages:
@@ -245,7 +259,8 @@ The default example uses:
 - `1_024` held-out episodes split equally into validation and test;
 - `group_size = 8`;
 - classifier value loss with `reward_range = [0.0, 1.0]`, `n_bins = 1`;
-- `100` value-training steps with global batch size `256`.
+- `100` value-training steps with global batch size `256`;
+- two value-training nodes with `micro_batch_tokens = 16384`.
 
 Train prompts start at dataset offset `0`. Held-out prompts start at offset
 `7000` in the saved RGMix dataset to avoid train/eval overlap.

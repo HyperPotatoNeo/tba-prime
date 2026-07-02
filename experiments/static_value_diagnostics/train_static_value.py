@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=400)
     parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--micro-batch-tokens", type=int, default=None)
     parser.add_argument("--group-size", type=int, default=None)
     parser.add_argument("--updates-per-batch", type=int, default=1)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -358,11 +359,13 @@ def prepare_value_micro_batches(
     dp_world_size: int,
     bin_cost,
     pad_to_multiple_of: int,
+    micro_batch_tokens: int | None = None,
 ) -> list[TensorMicroBatch]:
     samples = [training_sample_from_record(record) for record in records]
     micro_batch_grid = prepare_batch(
         rollouts=samples,
         seq_len=seq_len,
+        micro_batch_token_budget=micro_batch_tokens,
         num_train_workers=dp_world_size,
         idxs=[0] * len(samples),
         num_loras=1,
@@ -386,6 +389,8 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda", world.local_rank)
     if args.global_batch_size < 1:
         raise ValueError(f"global_batch_size must be >= 1, got {args.global_batch_size}")
+    if args.micro_batch_tokens is not None and args.micro_batch_tokens < args.seq_len:
+        raise ValueError("--micro-batch-tokens must be at least --seq-len")
     if args.updates_per_batch < 1:
         raise ValueError(f"updates_per_batch must be >= 1, got {args.updates_per_batch}")
     if args.steps < 0:
@@ -609,6 +614,7 @@ def train(args: argparse.Namespace) -> None:
         micro_batches = prepare_value_micro_batches(
             batch_records,
             seq_len=args.seq_len,
+            micro_batch_tokens=args.micro_batch_tokens,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             bin_cost=bin_cost,
@@ -630,6 +636,7 @@ def train(args: argparse.Namespace) -> None:
                 json.dumps(
                     {
                         "value_train/dp_world_size": dp_world_size,
+                        "value_train/micro_batch_tokens": args.micro_batch_tokens or args.seq_len,
                         "value_train/local_micro_batches": len(micro_batches),
                         "value_train/local_microbatch_max_tokens": max(micro_batch_tokens, default=0),
                         "value_train/local_microbatch_mean_tokens": sum(micro_batch_tokens)

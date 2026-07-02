@@ -145,6 +145,12 @@ class StaticInferenceConfig(BaseConfig):
 class StaticValueTrainConfig(BaseConfig):
     steps: int = Field(100, ge=0)
     global_batch_size: int = Field(256, ge=1)
+    micro_batch_tokens: int | None = Field(None, ge=1)
+    """Packed token budget for each value forward/backward. Defaults to model.seq_len."""
+
+    num_nodes: int = Field(1, ge=1)
+    """Number of allocated nodes used for value training and prediction."""
+
     log_every: int = Field(1, ge=1)
     dist_timeout_seconds: int = Field(1800, ge=1)
     mfu_model_params: float = Field(4.0e9, gt=0)
@@ -243,6 +249,10 @@ class StaticValueConfig(BaseConfig):
             raise ValueError("static value diagnostics currently require model.ac_offloading=null")
         if self.model.fsdp_cpu_offload:
             raise ValueError("static value diagnostics do not support model.fsdp_cpu_offload")
+        if self.train.num_nodes > self.deployment.num_nodes:
+            raise ValueError("train.num_nodes must be <= deployment.num_nodes")
+        if self.train.micro_batch_tokens is not None and self.train.micro_batch_tokens < self.model.seq_len:
+            raise ValueError("train.micro_batch_tokens must be >= model.seq_len")
         default_ac = default_static_value_model().ac
         if self.model.ac is not None and default_ac is not None:
             if self.model.ac.model_dump(mode="python") != default_ac.model_dump(mode="python"):

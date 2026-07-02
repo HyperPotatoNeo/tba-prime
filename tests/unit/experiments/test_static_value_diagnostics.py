@@ -18,6 +18,7 @@ from experiments.static_value_diagnostics.diagnostics import (
     variance_proxy,
 )
 from prime_rl.configs.static_value import StaticValueConfig
+from prime_rl.entrypoints.static_value import StaticValueRunner
 
 
 def _prediction_set() -> PredictionSet:
@@ -57,6 +58,8 @@ def test_static_value_default_config_preserves_staged_contract():
     assert config.value_function.optim.lr == pytest.approx(5e-5)
     assert config.value_function.scheduler.warmup_steps == 50
     assert config.value_function.loss.n_bins == 1
+    assert config.train.micro_batch_tokens is None
+    assert config.train.num_nodes == 1
 
 
 def test_static_value_example_toml_loads_with_static_model_defaults():
@@ -70,6 +73,8 @@ def test_static_value_example_toml_loads_with_static_model_defaults():
     assert config.model.dp_replicate == 4
     assert config.data.train_episodes == 10_000
     assert config.train.steps == 100
+    assert config.train.micro_batch_tokens == 16_384
+    assert config.train.num_nodes == 2
     assert config.diagnostics.group_sizes == [2, 4, 8]
 
 
@@ -90,6 +95,51 @@ def test_static_value_config_rejects_prompt_overlap_and_bad_inference_layout():
         StaticValueConfig.model_validate(
             {"model": {"vlm": {"vision_encoder_attr": "model.visual", "language_model_attr": "model.model"}}}
         )
+
+    with pytest.raises(ValueError, match="train.num_nodes"):
+        StaticValueConfig.model_validate({"train": {"num_nodes": 3}})
+
+    with pytest.raises(ValueError, match="micro_batch_tokens"):
+        StaticValueConfig.model_validate({"train": {"micro_batch_tokens": 1024}})
+
+
+def test_static_value_runner_builds_multinode_value_torchrun(tmp_path, monkeypatch):
+    config = StaticValueConfig.model_validate(
+        {
+            "output_dir": tmp_path / "out",
+            "repo_dir": Path(__file__).parents[3],
+            "train": {"num_nodes": 2, "micro_batch_tokens": 16_384},
+            "wandb": None,
+        }
+    )
+    runner = StaticValueRunner(config)
+    captured: list[tuple[str, list[str], Path, str | None]] = []
+
+    class DummyProc:
+        def wait(self):
+            return 0
+
+    def fake_slurm_nodes(*, required=True):
+        return ["node0", "node1"]
+
+    def fake_popen_remote(node, cmd, log_path, *, cuda_visible_devices=None):
+        captured.append((node, cmd, log_path, cuda_visible_devices))
+        return DummyProc()
+
+    monkeypatch.setattr(runner, "_slurm_nodes", fake_slurm_nodes)
+    monkeypatch.setattr(runner, "_popen_remote", fake_popen_remote)
+    monkeypatch.setattr(runner, "_wait_all", lambda procs: None)
+
+    args = runner._value_train_args(rollouts=Path("train.jsonl"), output_dir=Path("value"), steps=1)
+    assert args[args.index("--micro-batch-tokens") + 1] == "16384"
+    runner._run_value_torchrun(args, "value_train")
+
+    assert [item[0] for item in captured] == ["node0", "node1"]
+    assert all("--nnodes" in cmd and cmd[cmd.index("--nnodes") + 1] == "2" for _, cmd, _, _ in captured)
+    assert all("--standalone" not in cmd for _, cmd, _, _ in captured)
+    assert captured[0][1][captured[0][1].index("--node-rank") + 1] == "0"
+    assert captured[1][1][captured[1][1].index("--node-rank") + 1] == "1"
+    assert all(cuda_visible_devices == "0,1,2,3" for _, _, _, cuda_visible_devices in captured)
 
 
 def test_loo_and_group_mean_baselines_are_distinct():
@@ -210,11 +260,12 @@ def test_prepare_value_micro_batches_uses_prime_packer_sequence_resets():
 
     [micro_batch] = train_static_value.prepare_value_micro_batches(
         records,
-        seq_len=16,
+        seq_len=4,
         dp_rank=0,
         dp_world_size=1,
         bin_cost=lambda seqlens: sum(seqlens),
         pad_to_multiple_of=1,
+        micro_batch_tokens=8,
     )
 
     assert micro_batch["input_ids"].shape == (1, 7)
