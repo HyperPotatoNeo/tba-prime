@@ -403,7 +403,13 @@ class RLConfig(BaseConfig):
             raise ValueError("trainer.value_function requires orchestrator.value_function=true or unset")
         self.orchestrator.value_function = True
         if self.orchestrator.value_warmup is None:
-            self.orchestrator.value_warmup = ValueWarmupConfig()
+            warmup_steps = 0 if self.trainer.value_function.init_checkpoint is not None else 50
+            self.orchestrator.value_warmup = ValueWarmupConfig(steps=warmup_steps)
+        elif self.trainer.value_function.init_checkpoint is not None and self.orchestrator.value_warmup.steps > 0:
+            raise ValueError(
+                "trainer.value_function.init_checkpoint loads a warmed value function; "
+                "set orchestrator.value_warmup.steps=0 or remove the init checkpoint."
+            )
         if (
             self.orchestrator.value_warmup.batch_size is None
             and self.orchestrator.value_warmup.token_batch_size is None

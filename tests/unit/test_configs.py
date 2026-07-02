@@ -211,6 +211,24 @@ def test_value_function_config_defaults_and_guards():
     assert config.orchestrator.ckpt is not None
     assert config.orchestrator.ckpt.trainer_output_dir == config.trainer.output_dir
 
+    init_config = RLConfig.model_validate(
+        {
+            "trainer": {"value_function": {"init_checkpoint": "/tmp/value_checkpoint"}},
+            "orchestrator": {},
+        }
+    )
+    assert init_config.orchestrator.value_warmup is not None
+    assert init_config.orchestrator.value_warmup.steps == 0
+    assert init_config.trainer.value_function.resolved_warmup_batches == 0
+
+    with pytest.raises(ValidationError, match="init_checkpoint"):
+        RLConfig.model_validate(
+            {
+                "trainer": {"value_function": {"init_checkpoint": "/tmp/value_checkpoint"}},
+                "orchestrator": {"value_warmup": {"steps": 50}},
+            }
+        )
+
     partial_scheduler = TrainerConfig.model_validate(
         {"value_function": {"scheduler": {"warmup_steps": 2}}}
     ).value_function.scheduler
