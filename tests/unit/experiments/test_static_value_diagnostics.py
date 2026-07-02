@@ -152,6 +152,18 @@ def test_static_value_runner_builds_multinode_value_torchrun(tmp_path, monkeypat
     assert all(cuda_visible_devices == "0,1,2,3" for _, _, _, cuda_visible_devices in captured)
 
 
+def test_static_value_runner_writes_inference_config_without_model_chat_template(tmp_path):
+    config = StaticValueConfig.model_validate({"output_dir": tmp_path / "out", "wandb": None})
+    runner = StaticValueRunner(config)
+    runner._prepare_output()
+    path = runner._write_inference_config(0)
+    data = tomllib.loads(path.read_text())
+
+    assert data["model"]["name"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert data["model"]["max_model_len"] == 8192
+    assert "chat_template" not in data["model"]
+
+
 def test_loo_and_group_mean_baselines_are_distinct():
     table = build_token_table(_prediction_set(), group_size=2)
 

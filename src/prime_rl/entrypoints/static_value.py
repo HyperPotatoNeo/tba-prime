@@ -289,8 +289,8 @@ class StaticValueRunner:
         model = {"name": self.config.model.name, "max_model_len": self.config.model.seq_len}
         if self.config.model.trust_remote_code is not None:
             model["trust_remote_code"] = self.config.model.trust_remote_code
-        if self.config.model.chat_template is not None:
-            model["chat_template"] = self.config.model.chat_template
+        if (chat_template := getattr(self.config.model, "chat_template", None)) is not None:
+            model["chat_template"] = chat_template
         data = {
             "gpu_memory_utilization": self.config.inference.gpu_memory_utilization,
             "server": {"host": "0.0.0.0", "port": self.config.inference.port},
