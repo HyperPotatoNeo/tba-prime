@@ -13,6 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, default=16)
     parser.add_argument("--group-sizes", type=int, nargs="+", default=[2, 4, 8, 16])
     parser.add_argument("--rho-step", type=float, default=0.05)
+    parser.add_argument("--mixed-step", type=float, default=0.1)
     parser.add_argument("--sensitivity-draws", type=int, default=32)
     parser.add_argument("--position-bucket-edges", type=int, nargs="+", default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -29,6 +30,7 @@ def main() -> None:
         group_size=args.group_size,
         group_sizes=args.group_sizes,
         rho_step=args.rho_step,
+        mixed_step=args.mixed_step,
         sensitivity_draws=args.sensitivity_draws,
         seed=args.seed,
         position_bucket_edges=args.position_bucket_edges,
@@ -47,6 +49,8 @@ def main() -> None:
             log_data[f"diagnostics/{method}/delta_vs_loo"] = row["delta_vs_loo"]
             if "rho" in row:
                 log_data[f"diagnostics/{method}/rho"] = row["rho"]
+            if "alpha" in row:
+                log_data[f"diagnostics/{method}/alpha"] = row["alpha"]
         run.log(log_data)
         run.finish()
 

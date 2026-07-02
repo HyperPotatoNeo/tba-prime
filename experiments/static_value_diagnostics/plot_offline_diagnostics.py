@@ -62,6 +62,36 @@ def plot_summary(data: dict, output_dir: Path) -> None:
     plt.close()
 
 
+def plot_mixed_heatmaps(data: dict, output_dir: Path) -> None:
+    curves = data.get("val_mixed_curves", {})
+    selections = data.get("val_mixed_selection", {})
+    for method, alpha_rows in curves.items():
+        alpha_keys = sorted(alpha_rows.keys(), key=float)
+        if not alpha_keys:
+            continue
+        rho_keys = sorted(next(iter(alpha_rows.values())).keys(), key=float)
+        values = [[float(alpha_rows[alpha][rho]) for rho in rho_keys] for alpha in alpha_keys]
+        alpha_values = [float(alpha) for alpha in alpha_keys]
+        rho_values = [float(rho) for rho in rho_keys]
+        plt.figure(figsize=(7, 5))
+        plt.imshow(
+            values,
+            origin="lower",
+            aspect="auto",
+            extent=[min(rho_values), max(rho_values), min(alpha_values), max(alpha_values)],
+        )
+        selected = selections.get(method)
+        if selected is not None:
+            plt.scatter([selected["rho"]], [selected["alpha"]], color="white", marker="x", s=80)
+        plt.colorbar(label="validation mean squared advantage proxy")
+        plt.xlabel("rho: prefix progress")
+        plt.ylabel("alpha: prompt prior correction")
+        plt.title(f"Validation alpha/rho grid: {method}")
+        plt.tight_layout()
+        plt.savefig(output_dir / f"{method}_alpha_rho_heatmap.png", dpi=180)
+        plt.close()
+
+
 def plot_group_size(rows: list[dict[str, str]], output_dir: Path) -> None:
     if not rows:
         return
@@ -92,6 +122,7 @@ def main() -> None:
     group_rows = _load_csv(diagnostics_dir / "group_size_sensitivity.csv")
     plot_curves(data, output_dir)
     plot_summary(data, output_dir)
+    plot_mixed_heatmaps(data, output_dir)
     plot_group_size(group_rows, output_dir)
     if args.wandb_project:
         import wandb

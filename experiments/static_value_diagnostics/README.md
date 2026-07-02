@@ -4,7 +4,7 @@ Offline/static-policy diagnostics for value-function baselines on RGMix.
 
 The policy is fixed at `Qwen/Qwen3-4B-Instruct-2507`. Rollouts are collected from the saved RGMix dataset at `/pscratch/sd/s/siddart2/datasets/rg_mix_7500` with ancestral sampling (`temperature=1`, `top_p=1`, `top_k=-1`, `min_p=0`) while a classifier value model, initialized from the same base LM trunk, trains on terminal environment reward labels for generated tokens. The policy is never updated.
 
-Diagnostics are evaluated on held-out prompts. `rho` is selected on the validation split and reported on the test split; test rho curves are written separately as descriptive curves. The primary baseline comparison is leave-one-out group reward, not the self-including group mean.
+Diagnostics are evaluated on held-out prompts. `rho` is selected on the validation split and reported on the test split; test rho curves are written separately as descriptive curves. Mixed baselines jointly select `(alpha, rho)` on validation, where `alpha` controls prompt-prior correction from `V0` and `rho` controls prefix-progress correction from `Vt - V0`. The primary baseline comparison is leave-one-out group reward, not the self-including group mean.
 
 Outputs under each run directory:
 
@@ -15,7 +15,7 @@ Outputs under each run directory:
 - `diagnostics/diagnostics.json`: variance proxy summaries and rho selections.
 - `diagnostics/position_summary.csv`: early/middle/late and configured absolute-position buckets.
 - `diagnostics/group_size_sensitivity.csv`: rollout-count sensitivity with resampled groups.
-- `diagnostics/plots/*.png`: summary plots.
+- `diagnostics/plots/*.png`: summary plots, rho curves, group-size plots, and mixed alpha/rho validation heatmaps.
 
 The staged runner is exposed as a first-class entrypoint:
 

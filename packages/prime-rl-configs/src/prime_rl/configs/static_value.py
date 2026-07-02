@@ -160,6 +160,9 @@ class StaticValueTrainConfig(BaseConfig):
 class StaticDiagnosticsConfig(BaseConfig):
     group_sizes: list[int] = Field(default_factory=lambda: [2, 4, 8])
     rho_step: float = Field(0.05, gt=0, le=1)
+    mixed_step: float = Field(0.1, gt=0, le=1)
+    """Grid step for two-factor alpha/rho mixed-baseline diagnostics."""
+
     sensitivity_draws: int = Field(200, ge=1)
     position_bucket_edges: list[int] = Field(default_factory=lambda: [0, 512, 1024, 2048, 4096, 6144, 8192])
     """Absolute generated-token position bucket edges for position diagnostics."""

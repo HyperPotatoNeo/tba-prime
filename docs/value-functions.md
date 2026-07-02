@@ -207,6 +207,7 @@ num_nodes = 2               # value trainer/predict nodes
 
 [diagnostics]
 position_bucket_edges = [0, 512, 1024, 2048, 4096, 6144, 8192]
+mixed_step = 0.1
 ```
 
 `micro_batch_tokens` is the packed-token budget for each value
@@ -222,6 +223,14 @@ Position diagnostics always include fractional early/middle/late buckets. The
 absolute generated-token buckets are configurable through
 `diagnostics.position_bucket_edges`; the RGMix example uses 512-token and wider
 buckets because generated outputs are usually thousands of tokens long.
+
+The offline diagnostics include single-parameter `rho` baselines and
+two-factor mixed baselines. The mixed additive baseline is
+`LOO + alpha * (V0 - LOO) + rho * (Vt - V0)`, while the binary mixed-odds
+baseline applies the same decomposition in logit space. `alpha` measures prompt
+prior correction from the critic, and `rho` measures prefix-progress credit.
+Both are selected jointly on the validation split using `diagnostics.mixed_step`
+and evaluated once on the held-out test split.
 
 ### Stages
 

@@ -209,6 +209,8 @@ class StaticValueRunner:
             *[str(size) for size in self.config.diagnostics.group_sizes],
             "--rho-step",
             str(self.config.diagnostics.rho_step),
+            "--mixed-step",
+            str(self.config.diagnostics.mixed_step),
             "--sensitivity-draws",
             str(self.config.diagnostics.sensitivity_draws),
             "--position-bucket-edges",

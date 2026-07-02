@@ -12,8 +12,10 @@ from experiments.static_value_diagnostics.diagnostics import (
     build_token_table,
     has_binary_rewards,
     method_prediction,
+    mixed_methods,
     no_intercept_rho,
     rho_methods,
+    select_mixed_params,
     select_rhos,
     summary_at_rhos,
     variance_proxy,
@@ -61,6 +63,7 @@ def test_static_value_default_config_preserves_staged_contract():
     assert config.value_function.loss.n_bins == 1
     assert config.train.micro_batch_tokens is None
     assert config.train.num_nodes == 1
+    assert config.diagnostics.mixed_step == pytest.approx(0.1)
 
 
 def test_static_value_example_toml_loads_with_static_model_defaults():
@@ -79,6 +82,7 @@ def test_static_value_example_toml_loads_with_static_model_defaults():
     assert config.train.num_nodes == 2
     assert config.diagnostics.group_sizes == [2, 4, 8]
     assert config.diagnostics.position_bucket_edges == [0, 512, 1024, 2048, 4096, 6144, 8192]
+    assert config.diagnostics.mixed_step == pytest.approx(0.1)
 
 
 def test_static_value_config_rejects_prompt_overlap_and_bad_inference_layout():
@@ -178,6 +182,23 @@ def test_anchored_odds_uses_binary_logit_difference():
     assert pred1[2:4].mean() < 0.01
 
 
+def test_mixed_baselines_select_alpha_and_rho_on_validation_grid():
+    table = build_token_table(_prediction_set(), group_size=2)
+    methods = rho_methods(include_odds=True)
+    mixed = mixed_methods(include_odds=True)
+    grid = np.asarray([0.0, 1.0])
+    selected = select_rhos(table, grid, methods)
+    selected_mixed = select_mixed_params(table, grid, grid, mixed)
+    summary = summary_at_rhos(table, selected, methods, selected_mixed)
+
+    assert selected_mixed["mixed_add"]["alpha"] == pytest.approx(1.0)
+    assert selected_mixed["mixed_add"]["rho"] == pytest.approx(1.0)
+    assert summary["mixed_add"]["variance"] == pytest.approx(0.0)
+    assert selected_mixed["mixed_odds"]["alpha"] == pytest.approx(1.0)
+    assert selected_mixed["mixed_odds"]["rho"] == pytest.approx(1.0)
+    assert summary["mixed_odds"]["variance"] < 1e-10
+
+
 def test_position_buckets_scale_to_long_rollouts():
     table = build_token_table(_prediction_set(), group_size=2)
     table = table.__class__(
@@ -220,12 +241,16 @@ def test_fractional_rewards_skip_binary_odds_methods():
     )
     table = build_token_table(pred, group_size=2)
     methods = rho_methods(include_odds=has_binary_rewards(pred))
+    mixed = mixed_methods(include_odds=has_binary_rewards(pred))
     selected = select_rhos(table, np.asarray([0.0, 0.5, 1.0]), methods)
-    summary = summary_at_rhos(table, selected, methods)
+    selected_mixed = select_mixed_params(table, np.asarray([0.0, 0.5, 1.0]), np.asarray([0.0, 0.5, 1.0]), mixed)
+    summary = summary_at_rhos(table, selected, methods, selected_mixed)
 
     assert "anchored_odds" not in methods
+    assert "mixed_odds" not in mixed
     assert "odds_prior" not in summary
     assert "anchored_add_clipped" in summary
+    assert "mixed_add" in summary
 
 
 def test_training_sample_from_record_stamps_terminal_value_reward():

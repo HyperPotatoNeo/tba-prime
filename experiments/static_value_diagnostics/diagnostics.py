@@ -104,6 +104,13 @@ def rho_methods(include_odds: bool) -> list[str]:
     return methods
 
 
+def mixed_methods(include_odds: bool) -> list[str]:
+    methods = ["mixed_add"]
+    if include_odds:
+        methods.append("mixed_odds")
+    return methods
+
+
 def _reorder_prediction_set(pred: PredictionSet, order: np.ndarray) -> PredictionSet:
     if np.all(order == np.arange(pred.num_records)):
         return pred
@@ -135,8 +142,8 @@ def build_token_table(
     pred: PredictionSet,
     *,
     group_size: int,
-    alpha: float = 0.5,
-    beta: float = 0.5,
+    prior_alpha: float = 0.5,
+    prior_beta: float = 0.5,
     prompt_ids: np.ndarray | None = None,
     group_records: dict[int, list[int]] | None = None,
 ) -> TokenTable:
@@ -182,7 +189,7 @@ def build_token_table(
                 continue
             reward = float(rewards[local])
             loo = (reward_sum - reward) / (group_size - 1)
-            p_loo = ((reward_sum - reward) + alpha) / ((group_size - 1) + alpha + beta)
+            p_loo = ((reward_sum - reward) + prior_alpha) / ((group_size - 1) + prior_alpha + prior_beta)
             gen_len = max(int(pred.gen_lengths[idx]), 1)
             pos = pred.positions[sl].astype(np.float64)
             arrays["reward"].append(np.full(n, reward, dtype=np.float64))
@@ -205,7 +212,7 @@ def build_token_table(
     return TokenTable(**{k: np.concatenate(v) for k, v in arrays.items()})
 
 
-def method_prediction(table: TokenTable, method: str, rho: float) -> np.ndarray:
+def method_prediction(table: TokenTable, method: str, rho: float, alpha: float = 0.0) -> np.ndarray:
     if method == "group_mean":
         return table.group_mean
     if method == "loo":
@@ -222,11 +229,22 @@ def method_prediction(table: TokenTable, method: str, rho: float) -> np.ndarray:
         return table.odds_prior
     if method == "anchored_odds":
         return sigmoid(logit(table.odds_prior) + rho * (table.logit - table.logit0))
+    if method == "mixed_add":
+        return table.loo + alpha * (table.value0 - table.loo) + rho * (table.value - table.value0)
+    if method == "mixed_odds":
+        prior_logit = logit(table.odds_prior)
+        return sigmoid(prior_logit + alpha * (table.logit0 - prior_logit) + rho * (table.logit - table.logit0))
     raise ValueError(f"unknown method {method!r}")
 
 
-def variance_proxy(table: TokenTable, method: str, rho: float = 0.0, mask: np.ndarray | None = None) -> float:
-    pred = method_prediction(table, method, rho)
+def variance_proxy(
+    table: TokenTable,
+    method: str,
+    rho: float = 0.0,
+    mask: np.ndarray | None = None,
+    alpha: float = 0.0,
+) -> float:
+    pred = method_prediction(table, method, rho, alpha)
     err = (table.reward - pred) ** 2
     if mask is not None:
         err = err[mask]
@@ -265,6 +283,26 @@ def rho_curves(table: TokenTable, rhos: np.ndarray, methods: list[str] | None = 
     return curves
 
 
+def alpha_rho_curves(
+    table: TokenTable,
+    alphas: np.ndarray,
+    rhos: np.ndarray,
+    methods: list[str] | None = None,
+    mask: np.ndarray | None = None,
+) -> dict[str, dict[str, dict[str, float]]]:
+    methods = methods or mixed_methods(include_odds=True)
+    curves: dict[str, dict[str, dict[str, float]]] = {}
+    for method in methods:
+        curves[method] = {
+            f"{alpha:.2f}": {
+                f"{rho:.2f}": variance_proxy(table, method, float(rho), mask=mask, alpha=float(alpha))
+                for rho in rhos
+            }
+            for alpha in alphas
+        }
+    return curves
+
+
 def select_rhos(table: TokenTable, rhos: np.ndarray, methods: list[str] | None = None) -> dict[str, float]:
     selected: dict[str, float] = {}
     methods = methods or rho_methods(include_odds=True)
@@ -275,10 +313,61 @@ def select_rhos(table: TokenTable, rhos: np.ndarray, methods: list[str] | None =
     return selected
 
 
+def two_factor_coefficients(
+    first: np.ndarray,
+    second: np.ndarray,
+    target: np.ndarray,
+    lo: float = 0.0,
+    hi: float = 1.0,
+) -> dict[str, float]:
+    design = np.stack([first, second], axis=1).astype(np.float64)
+    if design.shape[0] == 0:
+        return {"alpha": 0.0, "rho": 0.0}
+    try:
+        alpha, rho = np.linalg.lstsq(design, target.astype(np.float64), rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return {"alpha": 0.0, "rho": 0.0}
+    return {"alpha": float(np.clip(alpha, lo, hi)), "rho": float(np.clip(rho, lo, hi))}
+
+
+def mixed_add_closed_form(table: TokenTable, mask: np.ndarray | None = None) -> dict[str, float]:
+    selected = np.ones_like(table.reward, dtype=bool) if mask is None else mask
+    return two_factor_coefficients(
+        table.value0[selected] - table.loo[selected],
+        table.value[selected] - table.value0[selected],
+        table.reward[selected] - table.loo[selected],
+    )
+
+
+def select_mixed_params(
+    table: TokenTable,
+    alphas: np.ndarray,
+    rhos: np.ndarray,
+    methods: list[str] | None = None,
+    mask: np.ndarray | None = None,
+) -> dict[str, dict[str, float]]:
+    selected: dict[str, dict[str, float]] = {}
+    methods = methods or mixed_methods(include_odds=True)
+    for method in methods:
+        best_alpha = 0.0
+        best_rho = 0.0
+        best_metric = math.inf
+        for alpha in alphas:
+            for rho in rhos:
+                metric = variance_proxy(table, method, float(rho), mask=mask, alpha=float(alpha))
+                if metric < best_metric:
+                    best_alpha = float(alpha)
+                    best_rho = float(rho)
+                    best_metric = metric
+        selected[method] = {"alpha": best_alpha, "rho": best_rho, "variance": float(best_metric)}
+    return selected
+
+
 def summary_at_rhos(
     table: TokenTable,
     selected_rhos: dict[str, float],
     methods: list[str] | None = None,
+    selected_mixed: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     methods = methods or rho_methods(include_odds=True)
     summary = {
@@ -296,6 +385,14 @@ def summary_at_rhos(
             unclipped = method_prediction(table, "anchored_add", rho)
             entry["clip_fraction"] = float(((unclipped < 0.0) | (unclipped > 1.0)).mean())
         summary[method] = entry
+    for method, params in (selected_mixed or {}).items():
+        alpha = float(params["alpha"])
+        rho = float(params["rho"])
+        summary[method] = {
+            "alpha": alpha,
+            "rho": rho,
+            "variance": variance_proxy(table, method, rho, alpha=alpha),
+        }
     loo = summary["loo"]["variance"]
     for entry in summary.values():
         entry["delta_vs_loo"] = entry["variance"] - loo
@@ -310,11 +407,14 @@ def position_summary(
     rhos: np.ndarray,
     position_bucket_edges: list[int] | None = None,
     methods: list[str] | None = None,
+    selected_mixed: dict[str, dict[str, float]] | None = None,
+    mixed_grid: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     methods = methods or rho_methods(include_odds=True)
     rows: list[dict[str, Any]] = []
     val_masks = bucket_masks(val_table, position_bucket_edges)
     test_masks = bucket_masks(test_table, position_bucket_edges)
+    bucket_tuned_mixed = {"early", "middle", "late"}
     for bucket in val_masks:
         val_tokens = int(val_masks[bucket].sum())
         test_tokens = int(test_masks[bucket].sum())
@@ -336,6 +436,37 @@ def position_summary(
             row[f"{method}_variance_bucket_rho"] = variance_proxy(
                 test_table, method, rho_bucket, mask=test_masks[bucket]
             )
+        for method, params in (selected_mixed or {}).items():
+            alpha_overall = float(params["alpha"])
+            rho_overall = float(params["rho"])
+            row[f"{method}_alpha_overall"] = alpha_overall
+            row[f"{method}_rho_overall"] = rho_overall
+            row[f"{method}_variance_overall_params"] = variance_proxy(
+                test_table,
+                method,
+                rho_overall,
+                mask=test_masks[bucket],
+                alpha=alpha_overall,
+            )
+            if mixed_grid is not None and bucket in bucket_tuned_mixed:
+                bucket_params = select_mixed_params(
+                    val_table,
+                    mixed_grid,
+                    mixed_grid,
+                    [method],
+                    mask=val_masks[bucket],
+                )[method]
+                alpha_bucket = float(bucket_params["alpha"])
+                rho_bucket = float(bucket_params["rho"])
+                row[f"{method}_alpha_bucket"] = alpha_bucket
+                row[f"{method}_rho_bucket"] = rho_bucket
+                row[f"{method}_variance_bucket_params"] = variance_proxy(
+                    test_table,
+                    method,
+                    rho_bucket,
+                    mask=test_masks[bucket],
+                    alpha=alpha_bucket,
+                )
         rows.append(row)
     return rows
 
@@ -347,11 +478,14 @@ def group_size_sensitivity(
     group_sizes: list[int],
     actual_group_size: int,
     rhos: np.ndarray,
+    mixed_grid: np.ndarray,
     draws: int,
     seed: int,
     methods: list[str] | None = None,
+    mixed: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     methods = methods or rho_methods(include_odds=True)
+    mixed = mixed or mixed_methods(include_odds=True)
     rng = np.random.default_rng(seed)
     rows: list[dict[str, Any]] = []
     val_prompts = sorted(set(val_pred.prompt_id.astype(int).tolist()))
@@ -359,18 +493,26 @@ def group_size_sensitivity(
     for k in group_sizes:
         if k > actual_group_size:
             continue
-        draw_metrics: dict[str, list[float]] = {method: [] for method in ["loo", "pure_value", *methods]}
+        draw_metrics: dict[str, list[float]] = {method: [] for method in ["loo", "pure_value", *methods, *mixed]}
+        draw_alpha: dict[str, list[float]] = {method: [] for method in mixed}
+        draw_rho: dict[str, list[float]] = {method: [] for method in mixed}
         for draw_idx in range(draws):
             val_groups = _subsample_groups(val_pred, val_prompts, k, rng)
             test_groups = _subsample_groups(test_pred, test_prompts, k, rng)
             val_table = build_token_table(val_pred, group_size=k, group_records=val_groups)
             test_table = build_token_table(test_pred, group_size=k, group_records=test_groups)
             selected = select_rhos(val_table, rhos, methods)
-            summary = summary_at_rhos(test_table, selected, methods)
+            selected_mixed = select_mixed_params(val_table, mixed_grid, mixed_grid, mixed)
+            summary = summary_at_rhos(test_table, selected, methods, selected_mixed)
             for method in draw_metrics:
                 draw_metrics[method].append(summary[method]["variance"])
+                if method in selected_mixed:
+                    draw_alpha[method].append(selected_mixed[method]["alpha"])
+                    draw_rho[method].append(selected_mixed[method]["rho"])
         for method, values in draw_metrics.items():
             arr = np.asarray(values, dtype=np.float64)
+            alpha_values = np.asarray(draw_alpha.get(method, []), dtype=np.float64)
+            rho_values = np.asarray(draw_rho.get(method, []), dtype=np.float64)
             rows.append(
                 {
                     "group_size": k,
@@ -379,6 +521,8 @@ def group_size_sensitivity(
                     "mean_variance": float(arr.mean()),
                     "std_variance": float(arr.std(ddof=1)) if draws > 1 else 0.0,
                     "ci95": float(1.96 * arr.std(ddof=1) / math.sqrt(draws)) if draws > 1 else 0.0,
+                    "mean_alpha": float(alpha_values.mean()) if alpha_values.size else None,
+                    "mean_rho": float(rho_values.mean()) if rho_values.size else None,
                 }
             )
     return rows
@@ -419,41 +563,65 @@ def run_diagnostics(
     group_size: int,
     group_sizes: list[int],
     rho_step: float,
+    mixed_step: float,
     sensitivity_draws: int,
     seed: int,
     position_bucket_edges: list[int] | None = None,
 ) -> dict[str, Any]:
     rhos = np.round(np.arange(0.0, 1.0 + rho_step / 2, rho_step), 6)
+    mixed_grid = np.round(np.arange(0.0, 1.0 + mixed_step / 2, mixed_step), 6)
     val_pred = load_prediction_set(predictions_dir, "val")
     test_pred = load_prediction_set(predictions_dir, "test")
     include_odds = has_binary_rewards(val_pred) and has_binary_rewards(test_pred)
     methods = rho_methods(include_odds)
+    mixed = mixed_methods(include_odds)
     val_table = build_token_table(val_pred, group_size=group_size)
     test_table = build_token_table(test_pred, group_size=group_size)
     selected = select_rhos(val_table, rhos, methods)
+    selected_mixed = select_mixed_params(val_table, mixed_grid, mixed_grid, mixed)
+    mixed_closed_form = mixed_add_closed_form(val_table)
     result = {
         "config": {
             "group_size": group_size,
             "rho_grid": [float(r) for r in rhos],
+            "mixed_grid": [float(v) for v in mixed_grid],
             "selection": "rho selected on val split, evaluated on test split",
+            "mixed_selection": "alpha/rho selected jointly on val split, evaluated on test split",
             "binary_rewards": include_odds,
             "methods": methods,
+            "mixed_methods": mixed,
         },
         "val_selection": selected,
+        "val_mixed_selection": selected_mixed,
+        "val_mixed_closed_form": {"mixed_add": mixed_closed_form},
         "closed_form_note": "closed-form rho uses no-intercept least squares: sum(XY)/(sum(X^2)+eps), clipped to [0,1].",
+        "mixed_closed_form_note": "mixed_add closed form uses no-intercept least squares over [V0-LOO, V-V0], then clips alpha/rho to [0,1]. Grid-selected alpha/rho is the reported metric.",
         "val_curves": rho_curves(val_table, rhos, methods),
+        "val_mixed_curves": alpha_rho_curves(val_table, mixed_grid, mixed_grid, mixed),
         "test_curves_descriptive": rho_curves(test_table, rhos, methods),
-        "test_summary": summary_at_rhos(test_table, selected, methods),
-        "position_summary": position_summary(val_table, test_table, selected, rhos, position_bucket_edges, methods),
+        "test_mixed_curves_descriptive": alpha_rho_curves(test_table, mixed_grid, mixed_grid, mixed),
+        "test_summary": summary_at_rhos(test_table, selected, methods, selected_mixed),
+        "position_summary": position_summary(
+            val_table,
+            test_table,
+            selected,
+            rhos,
+            position_bucket_edges,
+            methods,
+            selected_mixed,
+            mixed_grid,
+        ),
         "group_size_sensitivity": group_size_sensitivity(
             val_pred,
             test_pred,
             group_sizes=group_sizes,
             actual_group_size=group_size,
             rhos=rhos,
+            mixed_grid=mixed_grid,
             draws=sensitivity_draws,
             seed=seed,
             methods=methods,
+            mixed=mixed,
         ),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
