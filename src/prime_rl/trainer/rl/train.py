@@ -760,8 +760,15 @@ def train(config: TrainerConfig):
                 advantages = value_targets[micro_step].advantages
             elif value_config is not None and value_config.mixture is not None:
                 value_target = value_targets[micro_step]
+                group_advantages = advantages
                 rho = mixture_rho(value_target.position_fraction, value_config.mixture)
-                advantages = mix_advantages(advantages, value_target.advantages, rho)
+                advantages = mix_advantages(group_advantages, value_target.advantages, rho)
+                # Log the mixture components over action tokens for diagnostics.
+                m = value_target.mask
+                tensors["advantage/group"].append(group_advantages[m].detach().to("cpu"))
+                tensors["advantage/value"].append(value_target.advantages[m].detach().to("cpu"))
+                tensors["advantage/mixed"].append(advantages[m].detach().to("cpu"))
+                tensors["mixture/rho"].append(rho[m].detach().to("cpu"))
             loss_mask = micro_batch["loss_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             ref_logprobs = micro_batch["ref_logprobs"].to("cuda") if micro_batch["ref_logprobs"] is not None else None
