@@ -202,7 +202,7 @@ The value-training stage can use one or more allocated nodes:
 ```toml
 [train]
 global_batch_size = 256
-micro_batch_tokens = 16384  # optional; defaults to model.seq_len
+micro_batch_tokens = 32768  # optional; defaults to model.seq_len
 num_nodes = 2               # value trainer/predict nodes
 ```
 
@@ -210,6 +210,10 @@ num_nodes = 2               # value trainer/predict nodes
 forward/backward. Individual rollouts are still clipped by `model.seq_len`;
 larger values just pack multiple shorter sequences into one varlen forward when
 memory allows.
+
+With the default `gae_lambda = 1.0`, static value targets are Monte Carlo
+return-to-go values, so the trainer skips the extra no-grad value forward that
+would otherwise be needed for bootstrapped lambda returns.
 
 ### Stages
 
@@ -260,7 +264,7 @@ The default example uses:
 - `group_size = 8`;
 - classifier value loss with `reward_range = [0.0, 1.0]`, `n_bins = 1`;
 - `100` value-training steps with global batch size `256`;
-- two value-training nodes with `micro_batch_tokens = 16384`.
+- two value-training nodes with `micro_batch_tokens = 32768`.
 
 Train prompts start at dataset offset `0`. Held-out prompts start at offset
 `7000` in the saved RGMix dataset to avoid train/eval overlap.

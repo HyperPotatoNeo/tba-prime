@@ -58,7 +58,7 @@ ready_timeout_seconds = 1800
 [train]
 steps = 100
 global_batch_size = 256
-micro_batch_tokens = 16384
+micro_batch_tokens = 32768
 num_nodes = 2
 log_every = 1
 dist_timeout_seconds = 1800

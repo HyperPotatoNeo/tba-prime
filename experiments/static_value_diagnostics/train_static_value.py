@@ -485,8 +485,11 @@ def train(args: argparse.Namespace) -> None:
         for micro_step, micro_batch in enumerate(micro_batches):
             value_inputs = prepare_value_inputs(micro_batch)
             with torch.no_grad():
-                value_logits = forward_value_logits(value_inputs)
-                values = predict_values(value_logits, vconfig.loss)
+                if vconfig.gae_lambda == 1.0:
+                    values = torch.zeros_like(value_inputs["rewards"], dtype=torch.float32)
+                else:
+                    value_logits = forward_value_logits(value_inputs)
+                    values = predict_values(value_logits, vconfig.loss)
                 advantages, returns = compute_gae(
                     rewards=value_inputs["rewards"],
                     dones=value_inputs["dones"],
@@ -637,6 +640,7 @@ def train(args: argparse.Namespace) -> None:
                     {
                         "value_train/dp_world_size": dp_world_size,
                         "value_train/micro_batch_tokens": args.micro_batch_tokens or args.seq_len,
+                        "value_train/target_forward": vconfig.gae_lambda != 1.0,
                         "value_train/local_micro_batches": len(micro_batches),
                         "value_train/local_microbatch_max_tokens": max(micro_batch_tokens, default=0),
                         "value_train/local_microbatch_mean_tokens": sum(micro_batch_tokens)
@@ -662,7 +666,10 @@ def train(args: argparse.Namespace) -> None:
             torch.cuda.synchronize()
             step_seconds = time.perf_counter() - step_start
             peak_flops = args.mfu_peak_tflops_per_gpu * 1e12 * world.world_size
-            estimated_flops = (2.0 + 6.0 * vconfig.warmup_updates_per_batch) * args.mfu_model_params * forward_tokens
+            target_forward_flops = 2.0 if vconfig.gae_lambda != 1.0 else 0.0
+            estimated_flops = (
+                target_forward_flops + 6.0 * vconfig.warmup_updates_per_batch
+            ) * args.mfu_model_params * forward_tokens
             metrics = {
                 "value_train/step": step + 1,
                 "value_train/loss": tensor_stats.get("value/loss/mean", float("nan")),

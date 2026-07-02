@@ -73,7 +73,7 @@ def test_static_value_example_toml_loads_with_static_model_defaults():
     assert config.model.dp_replicate == 4
     assert config.data.train_episodes == 10_000
     assert config.train.steps == 100
-    assert config.train.micro_batch_tokens == 16_384
+    assert config.train.micro_batch_tokens == 32_768
     assert config.train.num_nodes == 2
     assert config.diagnostics.group_sizes == [2, 4, 8]
 
