@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,7 @@ from experiments.static_value_diagnostics.diagnostics import (
     summary_at_rhos,
     variance_proxy,
 )
+from prime_rl.configs.static_value import StaticValueConfig
 
 
 def _prediction_set() -> PredictionSet:
@@ -35,6 +37,54 @@ def _prediction_set() -> PredictionSet:
         initial_value=np.asarray([0.5, 0.5, 0.5, 0.5], dtype=np.float32),
         initial_logit=np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
     )
+
+
+def test_static_value_default_config_preserves_staged_contract():
+    config = StaticValueConfig()
+
+    assert config.model.name == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config.model.seq_len == 8192
+    assert config.model.compile is None
+    assert config.model.ac is not None
+    assert config.model.ac_offloading is None
+    assert not config.model.optim_cpu_offload
+    assert not config.model.reshard_after_forward
+    assert config.data.group_size == 8
+    assert config.data.train_groups == 1250
+    assert config.data.val_groups == 64
+    assert config.data.test_groups == 64
+    assert config.data.eval_test_offset == 7064
+    assert config.value_function.optim.lr == pytest.approx(5e-5)
+    assert config.value_function.scheduler.warmup_steps == 50
+    assert config.value_function.loss.n_bins == 1
+
+
+def test_static_value_example_toml_loads_with_static_model_defaults():
+    path = Path(__file__).parents[3] / "examples/static_value_rg_mix/static_value.toml"
+    data = tomllib.loads(path.read_text())
+    config = StaticValueConfig.model_validate(data)
+
+    assert config.model.name == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config.model.compile is None
+    assert config.model.ac_offloading is None
+    assert config.model.dp_replicate == 4
+    assert config.data.train_episodes == 10_000
+    assert config.train.steps == 100
+    assert config.diagnostics.group_sizes == [2, 4, 8]
+
+
+def test_static_value_config_rejects_prompt_overlap_and_bad_inference_layout():
+    with pytest.raises(ValueError, match="overlaps"):
+        StaticValueConfig.model_validate({"data": {"train_episodes": 64, "group_size": 8, "eval_val_offset": 4}})
+
+    with pytest.raises(ValueError, match="tp \\* inference.dp"):
+        StaticValueConfig.model_validate({"inference": {"gpus_per_node": 4, "tp": 2, "dp": 1}})
+
+    with pytest.raises(ValueError, match="deployment.num_nodes"):
+        StaticValueConfig.model_validate({"deployment": {"num_nodes": 3}})
+
+    with pytest.raises(ValueError, match="model.compile"):
+        StaticValueConfig.model_validate({"model": {"compile": {}}})
 
 
 def test_loo_and_group_mean_baselines_are_distinct():

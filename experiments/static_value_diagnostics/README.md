@@ -17,19 +17,21 @@ Outputs under each run directory:
 - `diagnostics/group_size_sensitivity.csv`: rollout-count sensitivity with resampled groups.
 - `diagnostics/plots/*.png`: summary plots.
 
-Submit the default premium-QOS sweep on Perlmutter:
+The staged runner is exposed as a first-class entrypoint:
 
 ```bash
 cd /pscratch/sd/s/siddart2/value-functions-prime-rl/prime-rl
-bash experiments/static_value_diagnostics/run_sweep.sh
+uv run static-value @ examples/static_value_rg_mix/static_value.toml --dry-run
 ```
 
-Submit the staged two-node run. It uses both nodes for bulk inference, trains the value function offline for 100 steps on one node, then uses both nodes again for held-out inference and checkpointed prediction/diagnostics:
+The default two-node Perlmutter job uses premium QOS. It uses both nodes for bulk inference, trains the value function offline for 100 steps on one node, then uses both nodes again for held-out inference and checkpointed prediction/diagnostics:
 
 ```bash
 cd /pscratch/sd/s/siddart2/value-functions-prime-rl/prime-rl
 bash experiments/static_value_diagnostics/run_two_node.sh
 ```
+
+The experiment contract lives in `examples/static_value_rg_mix/static_value.toml`; the Slurm script is only a NERSC wrapper. The runner writes the resolved config to `configs/static_value.toml` in the run directory, plus per-node inference configs in the same directory. To change steps, batch size, sampling, prompt offsets, value loss, W&B project, or diagnostics settings, edit/copy the TOML or pass normal config CLI overrides to `static-value`.
 
 Submit one run manually:
 
@@ -38,4 +40,4 @@ sbatch --export=ALL,EXPERIMENT_NAME=rgmix-qwen4b-classifier,INFER_GPUS=2,VALUE_G
   experiments/static_value_diagnostics/launch_one_node.sbatch
 ```
 
-The one-node Slurm script requests one full GPU node with `-A m4881`, `-C "gpu&hbm80g"`, `--qos=premium`, and a 48h time limit. The staged two-node script requests two full GPU nodes with the same account/QOS and a 24h time limit. Defaults are group size 8, 8192 sequence length, 10,000 train episodes, 1,024 held-out episodes, global value batch size 256, disabled value-model `torch.compile`, and 100 offline value steps. The train set is fixed tokenized data and is cycled by the trainer when `VALUE_STEPS * GLOBAL_BATCH_SIZE` exceeds 10,000. Held-out collection uses explicit prompt offsets near the end of the saved 7,500-example RGMix dataset to avoid train/eval overlap.
+The one-node Slurm script requests one full GPU node with `-A m4881`, `-C "gpu&hbm80g"`, `--qos=premium`, and a 48h time limit. The staged two-node script requests two full GPU nodes with the same account/QOS and a 24h time limit. Defaults are group size 8, 8192 sequence length, 10,000 train episodes, 1,024 held-out episodes, global value batch size 256, disabled value-model `torch.compile`, and 100 offline value steps. The train set is fixed tokenized data and is cycled by the trainer when `train.steps * train.global_batch_size` exceeds 10,000. Held-out collection uses explicit prompt offsets near the end of the saved 7,500-example RGMix dataset to avoid train/eval overlap.

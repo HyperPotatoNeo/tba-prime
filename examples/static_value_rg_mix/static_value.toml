@@ -1,0 +1,77 @@
+output_dir = "/pscratch/sd/s/siddart2/static_value_diagnostics/rgmix-qwen4b-classifier-staged"
+repo_dir = "/pscratch/sd/s/siddart2/value-functions-prime-rl/prime-rl"
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+seq_len = 8192
+
+[value_function]
+gamma = 1.0
+gae_lambda = 1.0
+warmup_updates_per_batch = 1
+
+[value_function.loss]
+type = "classification"
+reward_range = [0.0, 1.0]
+n_bins = 1
+
+[value_function.optim]
+type = "adamw"
+lr = 5e-5
+weight_decay = 0.01
+max_norm = 1.0
+
+[value_function.scheduler]
+type = "linear"
+warmup_steps = 50
+decay_steps = 0
+min_lr = 0.0
+
+[data]
+dataset_path = "/pscratch/sd/s/siddart2/datasets/rg_mix_7500"
+train_episodes = 10000
+eval_episodes = 1024
+group_size = 8
+train_offset = 0
+eval_val_offset = 7000
+max_dataset_prompts = 7500
+seed = 42
+
+[sampling]
+temperature = 1.0
+top_p = 1.0
+top_k = -1
+min_p = 0.0
+renderer_pool_size = 128
+max_concurrent_groups = 32
+max_retries = 3
+group_max_attempts = 4
+
+[inference]
+gpus_per_node = 4
+port = 8000
+tp = 1
+dp = 4
+gpu_memory_utilization = 0.9
+ready_timeout_seconds = 1800
+
+[train]
+steps = 100
+global_batch_size = 256
+log_every = 1
+dist_timeout_seconds = 1800
+mfu_model_params = 4.0e9
+mfu_peak_tflops_per_gpu = 312.0
+
+[diagnostics]
+group_sizes = [2, 4, 8]
+rho_step = 0.05
+sensitivity_draws = 200
+seed = 0
+
+[deployment]
+num_nodes = 2
+train_node_index = 0
+
+[wandb]
+project = "prime-rl-static-value-diagnostics"

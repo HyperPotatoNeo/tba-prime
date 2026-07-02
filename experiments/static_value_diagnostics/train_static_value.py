@@ -58,12 +58,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--group-size", type=int, default=None)
     parser.add_argument("--updates-per-batch", type=int, default=1)
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--max-norm", type=float, default=1.0)
     parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument("--min-lr", type=float, default=0.0)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--gae-lambda", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--reward-range", type=float, nargs=2, default=[0.0, 1.0])
     parser.add_argument("--n-bins", type=int, default=1)
+    parser.add_argument("--loss-weight", type=float, default=1.0)
     parser.add_argument("--attn", type=str, default="flash_attention_2")
     parser.add_argument("--impl", type=str, default="auto")
     parser.add_argument("--optimization-dtype", type=str, default="bfloat16")
@@ -128,11 +132,22 @@ def value_config(args: argparse.Namespace) -> ValueFunctionConfig:
                 "reward_range": tuple(float(x) for x in args.reward_range),
                 "n_bins": args.n_bins,
             },
-            "optim": {"type": "adamw", "lr": args.lr, "weight_decay": 0.01, "max_norm": 1.0},
-            "scheduler": {"type": "linear", "warmup_steps": args.warmup_steps, "decay_steps": 0, "min_lr": 0.0},
+            "optim": {
+                "type": "adamw",
+                "lr": args.lr,
+                "weight_decay": args.weight_decay,
+                "max_norm": args.max_norm,
+            },
+            "scheduler": {
+                "type": "linear",
+                "warmup_steps": args.warmup_steps,
+                "decay_steps": 0,
+                "min_lr": args.min_lr,
+            },
             "gamma": args.gamma,
             "gae_lambda": args.gae_lambda,
             "warmup_updates_per_batch": args.updates_per_batch,
+            "loss_weight": args.loss_weight,
         }
     )
 

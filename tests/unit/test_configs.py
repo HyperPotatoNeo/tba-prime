@@ -11,6 +11,7 @@ from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
+from prime_rl.configs.static_value import StaticValueConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli
@@ -20,6 +21,7 @@ CONFIG_CLASSES = [
     RLConfig,
     TrainerConfig,
     SFTConfig,
+    StaticValueConfig,
     OrchestratorConfig,
     InferenceConfig,
 ]
