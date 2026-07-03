@@ -8,6 +8,7 @@ import torch
 from experiments.static_value_diagnostics.common import RolloutRecord
 from experiments.static_value_diagnostics.diagnostics import (
     PredictionSet,
+    binarize_prediction_set,
     bucket_masks,
     build_token_table,
     group_size_sensitivity,
@@ -246,6 +247,56 @@ def test_group_size_sensitivity_includes_position_mixed_methods():
     methods = {row["method"] for row in rows}
     assert "mixed_clipped_pos_linear" in methods
     assert "mixed_clipped_pos_conservative_alpha" in methods
+
+
+def test_group_size_sensitivity_can_skip_draws():
+    pred = _prediction_set()
+    assert (
+        group_size_sensitivity(
+            pred,
+            pred,
+            group_sizes=[2],
+            actual_group_size=2,
+            rhos=np.asarray([0.0, 1.0]),
+            mixed_grid=np.asarray([0.0, 1.0]),
+            draws=0,
+            seed=0,
+        )
+        == []
+    )
+
+
+def test_logit_position_baselines_use_smoothed_loo_odds():
+    table = build_token_table(_prediction_set(), group_size=2)
+    linear = method_prediction(table, "logit_linear_position", 0.0)
+    mixed = method_prediction(table, "mixed_odds_pos_linear", 1.0, 1.0)
+    global_mixed = method_prediction(table, "mixed_odds", 1.0, 1.0)
+
+    assert linear[::2].tolist() == pytest.approx(table.odds_prior[::2].tolist())
+    assert linear[1::2].tolist() == pytest.approx(table.value[1::2].tolist(), abs=2e-6)
+    assert mixed[::2].tolist() == pytest.approx(table.odds_prior[::2].tolist())
+    assert mixed[1::2].tolist() == pytest.approx(global_mixed[1::2].tolist())
+
+
+def test_binarize_prediction_set_thresholds_rewards_only():
+    pred = _prediction_set()
+    pred = pred.__class__(
+        prompt_id=pred.prompt_id,
+        rollout_id=pred.rollout_id,
+        reward=np.asarray([0.2, 0.5, 0.8, 1.0], dtype=np.float32),
+        offsets=pred.offsets,
+        values=pred.values,
+        logits=pred.logits,
+        positions=pred.positions,
+        gen_lengths=pred.gen_lengths,
+        initial_value=pred.initial_value,
+        initial_logit=pred.initial_logit,
+    )
+    binary = binarize_prediction_set(pred, 0.5)
+
+    assert binary.reward.tolist() == pytest.approx([0.0, 1.0, 1.0, 1.0])
+    assert binary.values is pred.values
+    assert binary.logits is pred.logits
 
 
 def test_anchored_odds_uses_binary_logit_difference():

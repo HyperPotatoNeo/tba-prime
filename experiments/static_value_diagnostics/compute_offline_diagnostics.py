@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed-step", type=float, default=0.1)
     parser.add_argument("--sensitivity-draws", type=int, default=32)
     parser.add_argument("--position-bucket-edges", type=int, nargs="+", default=None)
+    parser.add_argument("--binarize-rewards-threshold", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wandb-project", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
@@ -34,6 +35,7 @@ def main() -> None:
         sensitivity_draws=args.sensitivity_draws,
         seed=args.seed,
         position_bucket_edges=args.position_bucket_edges,
+        binarize_rewards_threshold=args.binarize_rewards_threshold,
     )
     loo = result["test_summary"]["loo"]["variance"]
     best = min(result["test_summary"].items(), key=lambda kv: kv[1]["variance"])

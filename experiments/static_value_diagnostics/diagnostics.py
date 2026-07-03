@@ -112,12 +112,33 @@ def mixed_methods(include_odds: bool) -> list[str]:
     return methods
 
 
-def deterministic_methods() -> list[str]:
-    return ["linear_position"]
+def deterministic_methods(include_odds: bool = False) -> list[str]:
+    methods = ["linear_position"]
+    if include_odds:
+        methods.append("logit_linear_position")
+    return methods
 
 
-def position_mixed_methods() -> list[str]:
-    return ["mixed_clipped_pos_linear", "mixed_clipped_pos_conservative_alpha"]
+def position_mixed_methods(include_odds: bool = False) -> list[str]:
+    methods = ["mixed_clipped_pos_linear", "mixed_clipped_pos_conservative_alpha"]
+    if include_odds:
+        methods.extend(["mixed_odds_pos_linear", "mixed_odds_pos_conservative_alpha"])
+    return methods
+
+
+def binarize_prediction_set(pred: PredictionSet, threshold: float = 0.5) -> PredictionSet:
+    return PredictionSet(
+        prompt_id=pred.prompt_id,
+        rollout_id=pred.rollout_id,
+        reward=(pred.reward >= threshold).astype(np.float32),
+        offsets=pred.offsets,
+        values=pred.values,
+        logits=pred.logits,
+        positions=pred.positions,
+        gen_lengths=pred.gen_lengths,
+        initial_value=pred.initial_value,
+        initial_logit=pred.initial_logit,
+    )
 
 
 def _reorder_prediction_set(pred: PredictionSet, order: np.ndarray) -> PredictionSet:
@@ -235,6 +256,9 @@ def method_prediction(table: TokenTable, method: str, rho: float, alpha: float =
         return table.loo + rho * (table.value - table.loo)
     if method == "linear_position":
         return table.loo + table.position_rho * (table.value - table.loo)
+    if method == "logit_linear_position":
+        prior_logit = logit(table.odds_prior)
+        return sigmoid(prior_logit + table.position_rho * (table.logit - prior_logit))
     if method == "anchored_add":
         return table.loo + rho * (table.value - table.value0)
     if method == "anchored_add_clipped":
@@ -254,6 +278,10 @@ def method_prediction(table: TokenTable, method: str, rho: float, alpha: float =
     if method == "mixed_odds":
         prior_logit = logit(table.odds_prior)
         return sigmoid(prior_logit + alpha * (table.logit0 - prior_logit) + rho * (table.logit - table.logit0))
+    if method == "mixed_odds_pos_linear":
+        return sigmoid(mixed_odds_position_raw(table, rho=rho, alpha=alpha, alpha_power=1.0))
+    if method == "mixed_odds_pos_conservative_alpha":
+        return sigmoid(mixed_odds_position_raw(table, rho=rho, alpha=alpha, alpha_power=2.0))
     raise ValueError(f"unknown method {method!r}")
 
 
@@ -261,6 +289,15 @@ def mixed_position_raw(table: TokenTable, *, rho: float, alpha: float, alpha_pow
     alpha_gate = table.position_rho**alpha_power
     rho_gate = table.position_rho
     return table.loo + alpha_gate * alpha * (table.value0 - table.loo) + rho_gate * rho * (table.value - table.value0)
+
+
+def mixed_odds_position_raw(table: TokenTable, *, rho: float, alpha: float, alpha_power: float) -> np.ndarray:
+    prior_logit = logit(table.odds_prior)
+    alpha_gate = table.position_rho**alpha_power
+    rho_gate = table.position_rho
+    return prior_logit + alpha_gate * alpha * (table.logit0 - prior_logit) + rho_gate * rho * (
+        table.logit - table.logit0
+    )
 
 
 def variance_proxy(
@@ -396,7 +433,7 @@ def position_mixed_params(
     base = selected_mixed["mixed_add_clipped"]
     alpha = float(base["alpha"])
     rho = float(base["rho"])
-    return {
+    selected = {
         "mixed_clipped_pos_linear": {
             "alpha": alpha,
             "rho": rho,
@@ -412,6 +449,36 @@ def position_mixed_params(
             "variance": variance_proxy(table, "mixed_clipped_pos_conservative_alpha", rho, alpha=alpha),
         },
     }
+    odds_base = selected_mixed.get("mixed_odds")
+    if odds_base is not None:
+        odds_alpha = float(odds_base["alpha"])
+        odds_rho = float(odds_base["rho"])
+        selected.update(
+            {
+                "mixed_odds_pos_linear": {
+                    "alpha": odds_alpha,
+                    "rho": odds_rho,
+                    "alpha_gate": "linear",
+                    "rho_gate": "linear",
+                    "space": "logit",
+                    "variance": variance_proxy(table, "mixed_odds_pos_linear", odds_rho, alpha=odds_alpha),
+                },
+                "mixed_odds_pos_conservative_alpha": {
+                    "alpha": odds_alpha,
+                    "rho": odds_rho,
+                    "alpha_gate": "quadratic",
+                    "rho_gate": "linear",
+                    "space": "logit",
+                    "variance": variance_proxy(
+                        table,
+                        "mixed_odds_pos_conservative_alpha",
+                        odds_rho,
+                        alpha=odds_alpha,
+                    ),
+                },
+            }
+        )
+    return selected
 
 
 def summary_at_rhos(
@@ -459,15 +526,18 @@ def summary_at_rhos(
         alpha = float(params["alpha"])
         rho = float(params["rho"])
         alpha_power = 2.0 if params["alpha_gate"] == "quadratic" else 1.0
-        unclipped = mixed_position_raw(table, rho=rho, alpha=alpha, alpha_power=alpha_power)
         summary[method] = {
             "alpha": alpha,
             "rho": rho,
             "alpha_gate": params["alpha_gate"],
             "rho_gate": params["rho_gate"],
-            "clip_fraction": float(((unclipped < 0.0) | (unclipped > 1.0)).mean()),
             "variance": variance_proxy(table, method, rho, alpha=alpha),
         }
+        if params.get("space") is not None:
+            summary[method]["space"] = params["space"]
+        else:
+            unclipped = mixed_position_raw(table, rho=rho, alpha=alpha, alpha_power=alpha_power)
+            summary[method]["clip_fraction"] = float(((unclipped < 0.0) | (unclipped > 1.0)).mean())
     loo = summary["loo"]["variance"]
     for entry in summary.values():
         entry["delta_vs_loo"] = entry["variance"] - loo
@@ -580,6 +650,8 @@ def group_size_sensitivity(
     deterministic: list[str] | None = None,
     position_mixed: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    if draws <= 0:
+        return []
     methods = methods or rho_methods(include_odds=True)
     mixed = mixed or mixed_methods(include_odds=True)
     deterministic = deterministic or deterministic_methods()
@@ -678,15 +750,20 @@ def run_diagnostics(
     sensitivity_draws: int,
     seed: int,
     position_bucket_edges: list[int] | None = None,
+    binarize_rewards_threshold: float | None = None,
 ) -> dict[str, Any]:
     rhos = np.round(np.arange(0.0, 1.0 + rho_step / 2, rho_step), 6)
     mixed_grid = np.round(np.arange(0.0, 1.0 + mixed_step / 2, mixed_step), 6)
     val_pred = load_prediction_set(predictions_dir, "val")
     test_pred = load_prediction_set(predictions_dir, "test")
+    if binarize_rewards_threshold is not None:
+        val_pred = binarize_prediction_set(val_pred, binarize_rewards_threshold)
+        test_pred = binarize_prediction_set(test_pred, binarize_rewards_threshold)
     include_odds = has_binary_rewards(val_pred) and has_binary_rewards(test_pred)
     methods = rho_methods(include_odds)
     mixed = mixed_methods(include_odds)
-    deterministic = deterministic_methods()
+    deterministic = deterministic_methods(include_odds)
+    position_mixed = position_mixed_methods(include_odds)
     val_table = build_token_table(val_pred, group_size=group_size)
     test_table = build_token_table(test_pred, group_size=group_size)
     selected = select_rhos(val_table, rhos, methods)
@@ -701,10 +778,11 @@ def run_diagnostics(
             "selection": "rho selected on val split, evaluated on test split",
             "mixed_selection": "alpha/rho selected jointly on val split, evaluated on test split",
             "binary_rewards": include_odds,
+            "binarize_rewards_threshold": binarize_rewards_threshold,
             "methods": methods,
             "mixed_methods": mixed,
             "deterministic_methods": deterministic,
-            "position_mixed_methods": position_mixed_methods(),
+            "position_mixed_methods": position_mixed,
         },
         "val_selection": selected,
         "val_mixed_selection": selected_mixed,
@@ -748,6 +826,7 @@ def run_diagnostics(
             methods=methods,
             mixed=mixed,
             deterministic=deterministic,
+            position_mixed=position_mixed,
         ),
     }
     output_dir.mkdir(parents=True, exist_ok=True)
