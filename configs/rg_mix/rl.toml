@@ -17,6 +17,7 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 [trainer.model]
 impl = "custom"              # custom Qwen3 stack (required by FA4; auto also resolves to it for Qwen3)
 attn = "flash_attention_4"   # FA4 (flash-attn-cute), Blackwell-native attention
+dp_replicate = 2             # pure data-parallel across the 2 trainer GPUs (no FSDP shard; 4B fits on one GB200)
 
 [wandb]
 project = "rgmix-value-grpo"

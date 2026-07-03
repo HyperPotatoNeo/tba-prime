@@ -9,7 +9,9 @@ gae_lambda = 1.0
 updates_per_step = 1
 
 [trainer.value_function.loss]
-type = "mse"                 # scalar regression, suited to fractional [0,1] rewards
+type = "classification"   # binary classifier (matches offline diagnostics)
+reward_range = [0.0, 1.0]
+n_bins = 1                 # binary split at the reward-range midpoint
 
 [trainer.value_function.optim]
 type = "adamw"
