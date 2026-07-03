@@ -507,6 +507,9 @@ class ValueFunctionConfig(BaseConfig):
     init_checkpoint: Path | None = None
     """Optional value-only checkpoint to initialize the value model, optimizer, and scheduler."""
 
+    export_warmup_checkpoint: bool = False
+    """When true, after value warmup completes, also save a standalone value-only checkpoint (loadable via ``init_checkpoint``) to ``<ckpt_dir>/value_warmup_checkpoint``, so the warmed value can be reused across runs."""
+
     optim: OptimizerConfig = AdamWConfig(lr=5e-5)
     """Optimizer for the value function. Defaults to AdamW with lr=5e-5."""
 

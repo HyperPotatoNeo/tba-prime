@@ -26,11 +26,13 @@ policy lr 3e-6, full fine-tuning, checkpoint every 50 steps.
 ## Run
 
 ```bash
-# 1. Warm up the value function once (100 value-only steps) and note the value checkpoint path.
+# 1. Warm up the value function once (100 value-only steps). This exports a
+#    value-only checkpoint to ~/rgmix_runs/warmup/checkpoints/value_warmup_checkpoint.
 sbatch experiments/rgmix_value_baselines/warmup.sbatch
 
 # 2. Submit all 24 runs; value baselines load the warmed value checkpoint.
-INIT_CKPT=/path/to/warmup/value_checkpoint bash experiments/rgmix_value_baselines/submit_all.sh
+INIT_CKPT=~/rgmix_runs/warmup/checkpoints/value_warmup_checkpoint \
+  bash experiments/rgmix_value_baselines/submit_all.sh
 ```
 
 W&B: project `rgmix-value-grpo`, grouped by K (`group="k{K}"`, `name="{baseline}-k{K}-s{seed}"`).

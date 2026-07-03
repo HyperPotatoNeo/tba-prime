@@ -13,7 +13,7 @@ from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
 from torch.profiler import profile, ProfilerActivity, record_function
-from prime_rl.trainer.ckpt import load_value_checkpoint, setup_ckpt_managers
+from prime_rl.trainer.ckpt import load_value_checkpoint, save_value_checkpoint, setup_ckpt_managers
 from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
@@ -717,6 +717,11 @@ def train(config: TrainerConfig):
                 )
                 save_ckpt_time += time.perf_counter() - save_ckpt_start_time
                 ckpt_manager.maybe_clean()
+
+                if value_config.export_warmup_checkpoint and value_optimizer is not None:
+                    value_only_path = ckpt_manager.ckpt_dir / "value_warmup_checkpoint"
+                    logger.info(f"Exporting value-only warmup checkpoint to {value_only_path}")
+                    save_value_checkpoint(value_only_path, value_model, [value_optimizer], value_scheduler)
 
             step_time = time.perf_counter() - step_start_time
             peak_memory = torch.cuda.max_memory_reserved() / 1024**3

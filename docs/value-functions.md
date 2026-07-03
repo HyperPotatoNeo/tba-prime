@@ -137,6 +137,11 @@ not create async trainer/inference lag. The last warmup batch requests a full
 trainer checkpoint, and the orchestrator saves its checkpoint after the trainer
 checkpoint is stable.
 
+To reuse a warmed value model across separate runs, set
+`export_warmup_checkpoint = true`; after warmup the trainer additionally writes a
+standalone value-only checkpoint to `<output_dir>/checkpoints/value_warmup_checkpoint`
+that later runs load via `trainer.value_function.init_checkpoint`.
+
 To skip warmup from a pre-trained value checkpoint:
 
 ```toml
