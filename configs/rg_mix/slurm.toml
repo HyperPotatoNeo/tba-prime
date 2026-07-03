@@ -1,0 +1,10 @@
+# BLC Slurm overlay for the router-free 2-node RG-Mix runs.
+# Rendered by `uv run --no-sync rl @ rl.toml @ <baseline> @ slurm.toml ...`, which
+# writes the {trainer,orchestrator,inference}.toml subconfigs and submits the job.
+# Uses a router-free template (single vLLM dp server, no x86-only vllm-router).
+[slurm]
+partition = "gb200"
+account = "reasoning"
+project_dir = "/home/siddarth.venkatraman/tba-prime"
+template_path = "/home/siddarth.venkatraman/tba-prime/experiments/rgmix_value_baselines/blc/router_free_2node.sbatch.j2"
+time = "24:00:00"
