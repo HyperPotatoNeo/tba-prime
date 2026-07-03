@@ -13,6 +13,8 @@ POSITION_METHODS = {
     "linear_position": "linear_position_variance",
     "mixed_add": "mixed_add_variance_overall_params",
     "mixed_add_clipped": "mixed_add_clipped_variance_overall_params",
+    "mixed_clipped_pos_linear": "mixed_clipped_pos_linear_variance_overall_params",
+    "mixed_clipped_pos_conservative_alpha": "mixed_clipped_pos_conservative_alpha_variance_overall_params",
 }
 
 

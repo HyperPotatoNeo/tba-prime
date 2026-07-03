@@ -10,6 +10,7 @@ from experiments.static_value_diagnostics.diagnostics import (
     PredictionSet,
     bucket_masks,
     build_token_table,
+    group_size_sensitivity,
     has_binary_rewards,
     method_prediction,
     mixed_methods,
@@ -227,6 +228,24 @@ def test_position_mixed_clipped_ramps_from_loo_to_global_mixed():
     tied_mid = method_prediction(mid_table, "mixed_clipped_pos_linear", rho, alpha)
     conservative_mid = method_prediction(mid_table, "mixed_clipped_pos_conservative_alpha", rho, alpha)
     assert np.mean(np.abs(conservative_mid - mid_table.loo)) < np.mean(np.abs(tied_mid - mid_table.loo))
+
+
+def test_group_size_sensitivity_includes_position_mixed_methods():
+    pred = _prediction_set()
+    rows = group_size_sensitivity(
+        pred,
+        pred,
+        group_sizes=[2],
+        actual_group_size=2,
+        rhos=np.asarray([0.0, 1.0]),
+        mixed_grid=np.asarray([0.0, 1.0]),
+        draws=1,
+        seed=0,
+    )
+
+    methods = {row["method"] for row in rows}
+    assert "mixed_clipped_pos_linear" in methods
+    assert "mixed_clipped_pos_conservative_alpha" in methods
 
 
 def test_anchored_odds_uses_binary_logit_difference():

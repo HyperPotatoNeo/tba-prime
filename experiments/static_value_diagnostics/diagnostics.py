@@ -578,10 +578,12 @@ def group_size_sensitivity(
     methods: list[str] | None = None,
     mixed: list[str] | None = None,
     deterministic: list[str] | None = None,
+    position_mixed: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     methods = methods or rho_methods(include_odds=True)
     mixed = mixed or mixed_methods(include_odds=True)
     deterministic = deterministic or deterministic_methods()
+    position_mixed = position_mixed or position_mixed_methods()
     rng = np.random.default_rng(seed)
     rows: list[dict[str, Any]] = []
     val_prompts = sorted(set(val_pred.prompt_id.astype(int).tolist()))
@@ -590,10 +592,10 @@ def group_size_sensitivity(
         if k > actual_group_size:
             continue
         draw_metrics: dict[str, list[float]] = {
-            method: [] for method in ["loo", "pure_value", *deterministic, *methods, *mixed]
+            method: [] for method in ["loo", "pure_value", *deterministic, *methods, *mixed, *position_mixed]
         }
-        draw_alpha: dict[str, list[float]] = {method: [] for method in mixed}
-        draw_rho: dict[str, list[float]] = {method: [] for method in mixed}
+        draw_alpha: dict[str, list[float]] = {method: [] for method in [*mixed, *position_mixed]}
+        draw_rho: dict[str, list[float]] = {method: [] for method in [*mixed, *position_mixed]}
         for draw_idx in range(draws):
             val_groups = _subsample_groups(val_pred, val_prompts, k, rng)
             test_groups = _subsample_groups(test_pred, test_prompts, k, rng)
@@ -601,12 +603,23 @@ def group_size_sensitivity(
             test_table = build_token_table(test_pred, group_size=k, group_records=test_groups)
             selected = select_rhos(val_table, rhos, methods)
             selected_mixed = select_mixed_params(val_table, mixed_grid, mixed_grid, mixed)
-            summary = summary_at_rhos(test_table, selected, methods, selected_mixed, deterministic)
+            selected_position_mixed = position_mixed_params(val_table, selected_mixed)
+            summary = summary_at_rhos(
+                test_table,
+                selected,
+                methods,
+                selected_mixed,
+                deterministic,
+                selected_position_mixed,
+            )
             for method in draw_metrics:
                 draw_metrics[method].append(summary[method]["variance"])
                 if method in selected_mixed:
                     draw_alpha[method].append(selected_mixed[method]["alpha"])
                     draw_rho[method].append(selected_mixed[method]["rho"])
+                elif method in selected_position_mixed:
+                    draw_alpha[method].append(selected_position_mixed[method]["alpha"])
+                    draw_rho[method].append(selected_position_mixed[method]["rho"])
         for method, values in draw_metrics.items():
             arr = np.asarray(values, dtype=np.float64)
             alpha_values = np.asarray(draw_alpha.get(method, []), dtype=np.float64)
