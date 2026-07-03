@@ -478,26 +478,43 @@ ValueLossConfig: TypeAlias = Annotated[MSEValueLossConfig | ClassificationValueL
 
 
 class ValueMixtureConfig(BaseConfig):
-    """Value-corrected group baseline. Blends the orchestrator group advantage
-    (e.g. GRPO leave-one-out, ``A_group = R - B_loo``) with the trainer GAE
-    advantage (``A_value = R - V_t`` for gamma=lambda=1) per token:
+    """Value-corrected group baseline. Two families, selected by ``kind``.
 
-        ``A = (1 - rho_t) * A_group + rho_t * A_value``
+    ``linear`` blends the orchestrator group advantage (``A_group = R - B_group``)
+    with the trainer GAE advantage (``A_value = R - V_t`` for gamma=lambda=1):
 
-    equivalently the linear baseline ``b = (1 - rho) B_loo + rho V_t``. Pair with
-    an orchestrator group baseline such as GRPO ``baseline='loo'``."""
+        ``A = (1 - rho_t) * A_group + rho_t * A_value``   (baseline ``(1-rho) B_group + rho V_t``)
+
+    ``mixed_clipped`` ("TETHER") keeps the group baseline as a prompt-level anchor
+    and adds a two-factor value correction, clipped to the reward range [0, 1]:
+
+        ``b = clip( B_group + g_t * [ alpha (V_0 - B_group) + rho (V_t - V_0) ], 0, 1 )``
+        ``A = R - b``
+
+    where ``V_0`` is the value at the first response token, ``alpha (V_0 - B_group)``
+    is the prompt-prior correction, ``rho (V_t - V_0)`` is the prefix-progress
+    correction, and the gate ``g_t`` is 1 everywhere (``schedule='constant'``) or the
+    response position fraction ``u_t`` (``schedule='linear'``, ramping the whole
+    correction from 0 at the first response token to full at the last). Pair with an
+    orchestrator group baseline (GRPO ``baseline='mean'`` or ``'loo'``)."""
+
+    kind: Literal["linear", "mixed_clipped"] = "linear"
+    """``linear`` = convex group<->value blend. ``mixed_clipped`` = TETHER: group anchor + clipped two-factor (prompt-prior + prefix-progress) correction."""
 
     rho: float = Field(0.5, ge=0, le=1)
-    """Constant mixture weight (``schedule='constant'``). 0 = pure group baseline, 1 = pure value."""
+    """``linear``: constant mixture weight (0 = pure group, 1 = pure value). ``mixed_clipped``: weight on the prefix-progress term ``V_t - V_0``."""
+
+    alpha: float = Field(0.5, ge=0, le=1)
+    """``mixed_clipped`` only: weight on the prompt-prior term ``V_0 - B_group``. Ignored for ``linear``."""
 
     schedule: Literal["constant", "linear"] = "constant"
-    """``constant`` applies ``rho`` at every token; ``linear`` ramps the weight from ``rho_start`` at the first response token to ``rho_end`` at the last, by response-token position fraction (interpolating LOO -> pure value along the response)."""
+    """``constant`` = no position gating (``linear`` applies ``rho`` at every token; ``mixed_clipped`` gate ``g_t=1``). ``linear`` = gate by response position fraction ``u_t`` (``linear`` ramps ``rho_start`` -> ``rho_end``; ``mixed_clipped`` ramps the whole correction 0 -> full)."""
 
     rho_start: float = Field(0.0, ge=0, le=1)
-    """Linear schedule: mixture weight at the first response token."""
+    """``linear`` kind + ``schedule='linear'``: mixture weight at the first response token."""
 
     rho_end: float = Field(1.0, ge=0, le=1)
-    """Linear schedule: mixture weight at the last response token."""
+    """``linear`` kind + ``schedule='linear'``: mixture weight at the last response token."""
 
 
 class ValueFunctionConfig(BaseConfig):

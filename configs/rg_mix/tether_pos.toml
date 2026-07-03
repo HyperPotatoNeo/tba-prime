@@ -1,0 +1,41 @@
+# Baseline 6: TETHER (position-conditioned) — group-mean anchor + clipped
+# two-factor value correction, gated by response position u_t (the offline
+# `mixed_clipped_pos_linear` baseline, best held-out variant overall).
+#   u_t = pos / (response_len - 1)
+#   b = clip( B_mean + u_t (alpha (V_0 - B_mean) + rho (V_t - V_0)), 0, 1 )
+#   A = R - b
+# The whole correction ramps from 0 at the first response token to full at the
+# last, so early tokens stay at the group anchor (avoids early-token damage).
+# Fixed alpha=0.5, rho=0.8 per the offline sweep.
+# Load the warmed value checkpoint at launch:
+#   --trainer.value-function.init-checkpoint /path/to/value_checkpoint
+
+[orchestrator.algo]
+type = "grpo"
+baseline = "mean"
+
+[trainer.value_function]
+use_gae = false              # blend, do not replace
+gamma = 1.0
+gae_lambda = 1.0
+updates_per_step = 1
+
+[trainer.value_function.loss]
+type = "classification"   # binary classifier (matches offline diagnostics)
+reward_range = [0.0, 1.0]
+n_bins = 1
+
+[trainer.value_function.optim]
+type = "adamw"
+lr = 5e-5
+weight_decay = 0.01
+max_norm = 1.0
+
+[trainer.value_function.scheduler]
+type = "constant"   # warmed critic trains at constant LR (optim lr) during RL — no LR re-warmup
+
+[trainer.value_function.mixture]
+kind = "mixed_clipped"
+alpha = 0.5
+rho = 0.8
+schedule = "linear"   # gate g_t = u_t (position-conditioned, ramps 0 -> full over the response)

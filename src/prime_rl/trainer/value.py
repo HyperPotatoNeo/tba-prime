@@ -20,6 +20,8 @@ class ValueTargets:
     returns: Float[Tensor, "batch seq"]
     mask: Bool[Tensor, "batch seq"]
     position_fraction: Float[Tensor, "batch seq"]
+    values: Float[Tensor, "batch seq"]
+    start_value: Float[Tensor, "batch seq"]
 
 
 @dataclass(frozen=True)
@@ -179,6 +181,51 @@ def mix_advantages(
     value advantage ``A_value = R - V_t`` (GAE with gamma=lambda=1), this equals
     ``R - [(1 - rho) B_loo + rho V_t]`` — the linear value-corrected baseline."""
     return (1.0 - rho) * group_advantages + rho * value_advantages
+
+
+def broadcast_start_value(
+    values: Float[Tensor, "batch seq"],
+    mask: Bool[Tensor, "batch seq"],
+    sequence_lengths: list[int],
+) -> Float[Tensor, "batch seq"]:
+    """Per-token ``V_0``: the value prediction at the first action token of each
+    packed sequence, broadcast to every position of that sequence. Sequences with
+    no action tokens stay 0.0. Used by the ``mixed_clipped`` baseline's prompt-prior
+    and prefix-progress split."""
+    flat_values = values.reshape(-1).float()
+    flat_mask = mask.reshape(-1)
+    out = torch.zeros_like(flat_values)
+    offset = 0
+    for seq_len in sequence_lengths:
+        seq_slice = slice(offset, offset + seq_len)
+        action_idxs = flat_mask[seq_slice].nonzero(as_tuple=False).flatten() + offset
+        if action_idxs.numel() > 0:
+            out[seq_slice] = flat_values[action_idxs[0]]
+        offset += seq_len
+    return out.reshape_as(values)
+
+
+def mixed_clipped_advantage(
+    group_advantages: Float[Tensor, "batch seq"],
+    returns: Float[Tensor, "batch seq"],
+    values: Float[Tensor, "batch seq"],
+    start_value: Float[Tensor, "batch seq"],
+    gate: Float[Tensor, "batch seq"],
+    alpha: float,
+    rho: float,
+    reward_range: tuple[float, float] = (0.0, 1.0),
+) -> Float[Tensor, "batch seq"]:
+    """TETHER advantage: group anchor + clipped two-factor value correction.
+
+    ``b = clip( B_group + gate * [ alpha (V_0 - B_group) + rho (V_t - V_0) ], lo, hi )``
+    and ``A = R - b``. The group baseline is recovered from the orchestrator
+    advantage ``B_group = R - A_group`` (with ``returns = R`` at action tokens under
+    gamma=lambda=1), ``V_t = values``, ``V_0 = start_value``. ``gate`` is 1 (global)
+    or the response position fraction ``u_t`` (position-conditioned)."""
+    b_group = returns - group_advantages
+    correction = gate * (alpha * (start_value - b_group) + rho * (values - start_value))
+    baseline = (b_group + correction).clamp(min=reward_range[0], max=reward_range[1])
+    return returns - baseline
 
 
 def compute_value_loss(

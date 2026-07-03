@@ -49,9 +49,11 @@ from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.value import (
     align_value_logits,
+    broadcast_start_value,
     compute_gae,
     compute_value_loss,
     mix_advantages,
+    mixed_clipped_advantage,
     mixture_rho,
     predict_values,
     response_position_fraction,
@@ -492,11 +494,16 @@ def train(config: TrainerConfig):
             position_fraction = response_position_fraction(
                 value_inputs["mask"], micro_batch["sequence_lengths"]
             )
+            start_value = broadcast_start_value(
+                values, value_inputs["mask"], micro_batch["sequence_lengths"]
+            )
             target = ValueTargets(
                 advantages=advantages.detach(),
                 returns=returns.detach(),
                 mask=value_inputs["mask"].detach(),
                 position_fraction=position_fraction.detach(),
+                values=values.detach(),
+                start_value=start_value.detach(),
             )
             targets[micro_step] = target
             if first_value_update:
@@ -769,15 +776,34 @@ def train(config: TrainerConfig):
                 advantages = value_targets[micro_step].advantages
             elif value_config is not None and value_config.mixture is not None:
                 value_target = value_targets[micro_step]
+                mixture = value_config.mixture
                 group_advantages = advantages
-                rho = mixture_rho(value_target.position_fraction, value_config.mixture)
-                advantages = mix_advantages(group_advantages, value_target.advantages, rho)
-                # Log the mixture components over action tokens for diagnostics.
                 m = value_target.mask
+                if mixture.kind == "mixed_clipped":
+                    # TETHER: group anchor + clipped two-factor value correction.
+                    gate = (
+                        value_target.position_fraction
+                        if mixture.schedule == "linear"
+                        else torch.ones_like(value_target.position_fraction)
+                    )
+                    advantages = mixed_clipped_advantage(
+                        group_advantages,
+                        value_target.returns,
+                        value_target.values,
+                        value_target.start_value,
+                        gate,
+                        mixture.alpha,
+                        mixture.rho,
+                    )
+                    tensors["mixture/gate"].append(gate[m].detach().to("cpu"))
+                else:
+                    rho = mixture_rho(value_target.position_fraction, mixture)
+                    advantages = mix_advantages(group_advantages, value_target.advantages, rho)
+                    tensors["mixture/rho"].append(rho[m].detach().to("cpu"))
+                # Log the mixture components over action tokens for diagnostics.
                 tensors["advantage/group"].append(group_advantages[m].detach().to("cpu"))
                 tensors["advantage/value"].append(value_target.advantages[m].detach().to("cpu"))
                 tensors["advantage/mixed"].append(advantages[m].detach().to("cpu"))
-                tensors["mixture/rho"].append(rho[m].detach().to("cpu"))
             loss_mask = micro_batch["loss_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             ref_logprobs = micro_batch["ref_logprobs"].to("cuda") if micro_batch["ref_logprobs"] is not None else None
