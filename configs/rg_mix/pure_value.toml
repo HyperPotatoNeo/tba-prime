@@ -20,7 +20,4 @@ weight_decay = 0.01
 max_norm = 1.0
 
 [trainer.value_function.scheduler]
-type = "linear"
-warmup_steps = 50            # matches warmup scheduler; restored state keeps value LR constant during RL
-decay_steps = 0
-min_lr = 0.0
+type = "constant"   # warmed critic trains at constant LR (optim lr) during RL — no LR re-warmup
