@@ -295,7 +295,11 @@ def train(config: TrainerConfig):
     elif value_config is not None and value_config.init_checkpoint is not None:
         if value_model is None or value_optimizer is None or value_scheduler is None:
             raise RuntimeError("value_function.init_checkpoint requires an initialized value function.")
-        load_value_checkpoint(value_config.init_checkpoint, value_model, [value_optimizer], value_scheduler)
+        # Warm-start the value model and optimizer, but keep this run's freshly
+        # constructed scheduler — the new run has its own (possibly different-typed)
+        # LR schedule, so restoring the checkpoint's scheduler state is both wrong
+        # and load-incompatible across scheduler types.
+        load_value_checkpoint(value_config.init_checkpoint, value_model, [value_optimizer])
         logger.info(f"Loaded value function checkpoint from {value_config.init_checkpoint}")
 
     logger.info(
