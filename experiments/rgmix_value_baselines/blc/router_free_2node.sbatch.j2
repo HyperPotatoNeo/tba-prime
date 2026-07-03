@@ -55,6 +55,16 @@ rm -f $OUTPUT_DIR/logs/inference/*.log
 ln -sfn trainer/node_0.log $OUTPUT_DIR/logs/trainer.log
 ln -sfn inference/node_0.log $OUTPUT_DIR/logs/inference.log
 
+# Fresh-start hygiene. This launcher runs the components directly, so the
+# `rl` entrypoint's clean_future_steps() (which wipes stale weight broadcasts +
+# rollouts) never runs at job time. On a SLURM requeue the inference server would
+# otherwise reload the PREVIOUS attempt's stale broadcast from shared Lustre and
+# generate rollouts from non-base weights (step-0 reward jumps from ~0.22 to
+# ~0.3-0.4 and the run is contaminated). These runs always start from scratch, so
+# wipe the shared staging dirs on every (re)start. (Guard behind a resume flag if
+# checkpoint-resume is ever added.)
+rm -rf $OUTPUT_DIR/weights $OUTPUT_DIR/rollouts $OUTPUT_DIR/broadcasts
+
 # Shared W&B run across trainer + orchestrator (single logical run).
 export WANDB_SHARED_MODE=1
 export WANDB_SHARED_RUN_ID=${WANDB_SHARED_RUN_ID:-$(python3 -c "import uuid; print(uuid.uuid4().hex)")}
