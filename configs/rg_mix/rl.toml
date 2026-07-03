@@ -1,9 +1,9 @@
 # RG-Mix value-corrected GRPO — shared base config.
 #
-# Compose with one baseline overlay and set K (group_size) + seed per run, e.g.:
-#   uv run rl @ configs/rg_mix/rl.toml @ configs/rg_mix/loo.toml \
-#     --orchestrator.group-size 8 --inference.seed 1 \
-#     --wandb.name loo-k8-s1 --wandb.group k8 --output-dir outputs/loo-k8-s1
+# Compose with one baseline overlay and set K (group_size) per run, e.g.:
+#   uv run rl @ configs/rg_mix/rl.toml @ configs/rg_mix/mean.toml \
+#     --orchestrator.group-size 8 --wandb.name mean-k8 --wandb.group k8 \
+#     --output-dir outputs/mean-k8
 #
 # Value overlays additionally take a warmed value checkpoint:
 #   --trainer.value-function.init-checkpoint /path/to/value_checkpoint
@@ -17,7 +17,7 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 [trainer.model]
 impl = "custom"              # custom Qwen3 stack (required by FA4; auto also resolves to it for Qwen3)
 attn = "flash_attention_4"   # FA4 (flash-attn-cute), Blackwell-native attention
-dp_replicate = 2             # pure data-parallel across the 2 trainer GPUs (no FSDP shard; 4B fits on one GB200)
+# 1 trainer node (4 GB200): FSDP shards policy + value evenly across all 4 trainer GPUs.
 
 [wandb]
 project = "rgmix-value-grpo"
@@ -26,7 +26,7 @@ project = "rgmix-value-grpo"
 interval = 50                # checkpoint every 50 steps
 
 [orchestrator]
-batch_size = 128
+batch_size = 256
 group_size = 8               # K; override per run with --orchestrator.group-size
 
 # Ancestral sampling: temperature 1.0, top_p 1.0 (hardcoded), top_k disabled, min_p 0.
@@ -44,11 +44,15 @@ args = { dataset_path = "/home/siddarth.venkatraman/datasets/rg_mix_10k", num_tr
 name = "default"
 
 [trainer.optim]
-lr = 3e-6                    # policy LR; full fine-tuning (no LoRA)
+lr = 1e-6                    # policy LR (prime-rl default); full fine-tuning (no LoRA)
 
+# 2 nodes per run: 1 inference node (4 GPUs) + 1 trainer node (4 GPUs).
 [deployment]
-gpus_per_node = 4           # GB200 node = 4 GPUs; value function is co-located on the trainer GPUs
-num_infer_gpus = 2
-num_train_gpus = 2
+type = "multi_node"
+gpus_per_node = 4
+num_train_nodes = 1
+num_infer_nodes = 1
 
-[inference]
+[inference.parallel]
+dp = 4
+tp = 1

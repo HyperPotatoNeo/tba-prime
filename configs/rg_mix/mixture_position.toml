@@ -1,12 +1,12 @@
-# Baseline 4: position-aware value/LOO mixture, rho(t) linear 0 -> 1 along the response.
+# Baseline 4: position-aware value/mean mixture, rho(t) linear 0 -> 1 along the response.
 # rho(t) = pos / (response_len - 1): pure LOO at the response start, pure value at the end.
-# A_{i,t} = (1-rho(t)) (R_i - B_i^loo) + rho(t) (R_i - V(s_{i,t}))
+# A_{i,t} = (1-rho(t)) (R_i - B_mean) + rho(t) (R_i - V(s_{i,t}))
 # Load the warmed value checkpoint at launch:
 #   --trainer.value-function.init-checkpoint /path/to/value_checkpoint
 
 [orchestrator.algo]
 type = "grpo"
-baseline = "loo"
+baseline = "mean"
 
 [trainer.value_function]
 use_gae = false              # blend, do not replace
