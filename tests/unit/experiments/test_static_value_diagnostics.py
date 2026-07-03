@@ -196,6 +196,39 @@ def test_position_linear_ramp_goes_from_loo_to_value():
     ] == pytest.approx(0.5)
 
 
+def test_position_mixed_clipped_ramps_from_loo_to_global_mixed():
+    table = build_token_table(_prediction_set(), group_size=2)
+    alpha = 0.5
+    rho = 0.8
+    tied = method_prediction(table, "mixed_clipped_pos_linear", rho, alpha)
+    conservative = method_prediction(table, "mixed_clipped_pos_conservative_alpha", rho, alpha)
+    global_mixed = method_prediction(table, "mixed_add_clipped", rho, alpha)
+
+    assert tied[::2].tolist() == pytest.approx(table.loo[::2].tolist())
+    assert conservative[::2].tolist() == pytest.approx(table.loo[::2].tolist())
+    assert tied[1::2].tolist() == pytest.approx(global_mixed[1::2].tolist())
+    assert conservative[1::2].tolist() == pytest.approx(global_mixed[1::2].tolist())
+
+    mid_table = table.__class__(
+        reward=table.reward,
+        group_mean=table.group_mean,
+        loo=table.loo,
+        value=table.value,
+        value0=table.value0,
+        logit=table.logit,
+        logit0=table.logit0,
+        odds_prior=table.odds_prior,
+        position=table.position,
+        frac_position=table.frac_position,
+        position_rho=np.asarray([0.5] * len(table.reward)),
+        group_id=table.group_id,
+        rollout_id=table.rollout_id,
+    )
+    tied_mid = method_prediction(mid_table, "mixed_clipped_pos_linear", rho, alpha)
+    conservative_mid = method_prediction(mid_table, "mixed_clipped_pos_conservative_alpha", rho, alpha)
+    assert np.mean(np.abs(conservative_mid - mid_table.loo)) < np.mean(np.abs(tied_mid - mid_table.loo))
+
+
 def test_anchored_odds_uses_binary_logit_difference():
     table = build_token_table(_prediction_set(), group_size=2)
     pred0 = method_prediction(table, "anchored_odds", 0.0)
