@@ -13,7 +13,9 @@ seq_len = 8192
 
 [model]
 name = "Qwen/Qwen3-4B-Instruct-2507"
-attn = "flash_attention_2"
+
+[trainer.model]
+attn = "flash_attention_2"   # trainer attention backend (flipped to flash_attention_4 once FA4 is validated)
 
 [wandb]
 project = "rgmix-value-grpo"
