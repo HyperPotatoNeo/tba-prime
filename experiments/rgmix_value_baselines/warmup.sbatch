@@ -17,6 +17,9 @@ set -eux
 export PATH="$HOME/.local/bin:$PATH"
 export UV_CACHE_DIR=$HOME/.uv_cache
 export HF_HOME=$HOME/.hf
+# Local CUDA 12.8 toolkit (flash-attn build + FA4 runtime JIT on GB200).
+export CUDA_HOME="$HOME/cuda-12.8"
+export PATH="$CUDA_HOME/bin:$PATH"
 [ -f "$HOME/.env" ] && source "$HOME/.env"
 mkdir -p "$HOME/rgmix_runs/logs"
 cd "$HOME/tba-prime"
