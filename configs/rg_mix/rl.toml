@@ -17,7 +17,15 @@ name = "Qwen/Qwen3-4B-Instruct-2507"
 [trainer.model]
 impl = "custom"              # custom Qwen3 stack (required by FA4; auto also resolves to it for Qwen3)
 attn = "flash_attention_4"   # FA4 (flash-attn-cute), Blackwell-native attention
-# 1 trainer node (4 GB200): FSDP shards policy + value evenly across all 4 trainer GPUs.
+# 1 trainer node (4 GB200). The trainer is communication-bound on the value runs (a
+# second 4B critic + per-microbatch FSDP all-gather/reduce-scatter), so the shard
+# degree matters. Measured on GB200 (pure_value-k8, tok/s | peak HBM):
+#   dp_shard=4 (dp_replicate=1): ~9.5k | 29 GiB   (most sharding comm)
+#   dp_replicate=2 x dp_shard=2: ~10.3k | 70 GiB  (+8%, memory-safe -> chosen)
+#   dp_replicate=4 (no shard):   ~11.8k | 165 GiB (+12% but OOM-risky at 89% HBM)
+# Non-algo tweaks that did NOT help: optim_cpu_offload/reshard off (no change),
+# ac.mode=selective (no change, same 29 GiB). dp_shard auto-derives to 2 here.
+dp_replicate = 2             # HSDP 2x2: halve FSDP shard comm at safe 70GiB/GPU
 
 [wandb]
 project = "rgmix-value-grpo"
