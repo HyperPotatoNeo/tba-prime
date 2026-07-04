@@ -24,6 +24,9 @@ export PATH="$CUDA_HOME/bin:$PATH"
 mkdir -p "$HOME/rgmix_runs/logs"
 cd "$HOME/tba-prime"
 
+# rl.toml defaults to the 2-node deployment; the warmup is a single-node
+# value-only run (inference + value trainer co-located on one GB200), so override.
 uv run --no-sync rl @ configs/rg_mix/rl.toml @ configs/rg_mix/warmup.toml \
+  --deployment.type single_node \
   --wandb.name value-warmup --wandb.group warmup \
   --output-dir "$HOME/rgmix_runs/warmup"
