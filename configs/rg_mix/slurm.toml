@@ -8,3 +8,6 @@ account = "reasoning"
 project_dir = "/home/siddarth.venkatraman/tba-prime"
 template_path = "/home/siddarth.venkatraman/tba-prime/experiments/rgmix_value_baselines/blc/router_free_2node.sbatch.j2"
 time = "24:00:00"
+# Rack p4-r12 faulted on 2026-07-04 (vLLM worker BrokenPipe + admin-cancelled all
+# jobs scheduled there); exclude it so (re)launches avoid the bad hardware.
+exclude = "p4-r12-ct[01-18]"
