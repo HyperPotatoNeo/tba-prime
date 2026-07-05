@@ -55,6 +55,7 @@ from prime_rl.trainer.value import (
     mix_advantages,
     mixed_clipped_advantage,
     mixture_rho,
+    mixture_step_scale,
     predict_values,
     response_position_fraction,
     ValueTargets,
@@ -353,6 +354,12 @@ def train(config: TrainerConfig):
         loss_mask = micro_batch["loss_mask"].to("cuda")
         rewards = micro_batch["value_rewards"].to("cuda")
         dones = micro_batch["value_dones"].to("cuda")
+        # Optional global-episode position fraction stamped by the orchestrator
+        # (multi-turn mixture position schedule). None -> trainer falls back to
+        # per-segment response_position_fraction.
+        global_position_fraction = micro_batch.get("value_position_fraction")
+        if global_position_fraction is not None:
+            global_position_fraction = global_position_fraction.to("cuda")
         routed_experts = micro_batch["routed_experts"].to("cuda") if micro_batch["routed_experts"] is not None else None
 
         if routed_experts is None and config.enable_router_replay:
@@ -389,6 +396,7 @@ def train(config: TrainerConfig):
             "mask": loss_mask,
             "rewards": rewards,
             "dones": dones,
+            "global_position_fraction": global_position_fraction,
         }
 
     def forward_value_logits(value_inputs: dict[str, torch.Tensor | dict[str, torch.Tensor] | None]) -> torch.Tensor:
@@ -491,9 +499,14 @@ def train(config: TrainerConfig):
                     gamma=value_config.gamma,
                     gae_lambda=value_config.gae_lambda,
                 )
-            position_fraction = response_position_fraction(
-                value_inputs["mask"], micro_batch["sequence_lengths"]
-            )
+            # Prefer the orchestrator's GLOBAL episode position fraction (across all
+            # turn segments) when present; otherwise fall back to per-segment.
+            if value_inputs.get("global_position_fraction") is not None:
+                position_fraction = value_inputs["global_position_fraction"]
+            else:
+                position_fraction = response_position_fraction(
+                    value_inputs["mask"], micro_batch["sequence_lengths"]
+                )
             start_value = broadcast_start_value(
                 values, value_inputs["mask"], micro_batch["sequence_lengths"]
             )
@@ -779,6 +792,7 @@ def train(config: TrainerConfig):
                 mixture = value_config.mixture
                 group_advantages = advantages
                 m = value_target.mask
+                step_scale = mixture_step_scale(mixture, progress.step)
                 if mixture.kind == "mixed_clipped":
                     # TETHER: group anchor + clipped two-factor value correction.
                     gate = (
@@ -794,10 +808,11 @@ def train(config: TrainerConfig):
                         gate,
                         mixture.alpha,
                         mixture.rho,
+                        step_scale=step_scale,
                     )
                     tensors["mixture/gate"].append(gate[m].detach().to("cpu"))
                 else:
-                    rho = mixture_rho(value_target.position_fraction, mixture)
+                    rho = mixture_rho(value_target.position_fraction, mixture) * step_scale
                     advantages = mix_advantages(group_advantages, value_target.advantages, rho)
                     tensors["mixture/rho"].append(rho[m].detach().to("cpu"))
                 # Log the mixture components over action tokens for diagnostics.

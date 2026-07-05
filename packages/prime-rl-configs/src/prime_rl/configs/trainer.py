@@ -516,6 +516,12 @@ class ValueMixtureConfig(BaseConfig):
     rho_end: float = Field(1.0, ge=0, le=1)
     """``linear`` kind + ``schedule='linear'``: mixture weight at the last response token."""
 
+    warmup_start_step: int = Field(0, ge=0)
+    """Training-step anneal (applies to BOTH kinds). Before this step the value correction is off (pure group baseline) so the critic trains unused. Default 0 = disabled (value correction applied immediately from step 0, legacy behavior)."""
+
+    warmup_steps: int = Field(0, ge=0)
+    """Training-step anneal (applies to BOTH kinds). Over this many steps after ``warmup_start_step`` a scale factor ramps 0 -> 1 (0 = single-step jump at ``warmup_start_step``). For ``linear`` the scale multiplies the mixture weight rho; for ``mixed_clipped`` it multiplies the ENTIRE two-factor correction (both alpha*(V0-Bgroup) and rho*(Vt-V0)). Default 0 = disabled (scale identically 1)."""
+
 
 class ValueFunctionConfig(BaseConfig):
     loss: ValueLossConfig = MSEValueLossConfig()

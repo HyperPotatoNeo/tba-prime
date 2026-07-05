@@ -159,13 +159,27 @@ def response_position_fraction(
     return frac.reshape_as(mask)
 
 
+def mixture_step_scale(config: ValueMixtureConfig, step: int) -> float:
+    """Training-step annealing factor in [0, 1] applied to the whole mixture
+    weight: 0 before ``warmup_start_step``, then linearly to 1 over
+    ``warmup_steps`` (1 immediately after the start step when steps == 0).
+    Lets the critic train unused (rho=0) for a warmup window before the value
+    correction is phased in over training steps (independent of episode position)."""
+    if step < config.warmup_start_step:
+        return 0.0
+    if config.warmup_steps <= 0:
+        return 1.0
+    return min((step - config.warmup_start_step) / config.warmup_steps, 1.0)
+
+
 def mixture_rho(
     position_fraction: Float[Tensor, "batch seq"],
     config: ValueMixtureConfig,
 ) -> Float[Tensor, "batch seq"]:
-    """Per-token mixture weight rho(t) in [0, 1]. ``constant`` uses ``rho``
-    everywhere; ``linear`` ramps ``rho_start`` -> ``rho_end`` along the response
-    by ``position_fraction``."""
+    """Per-token position schedule for rho in [0, 1]. ``constant`` uses ``rho``
+    everywhere; ``linear`` ramps ``rho_start`` -> ``rho_end`` along the response by
+    ``position_fraction``. The training-step anneal (``mixture_step_scale``) is
+    applied separately by the caller."""
     if config.schedule == "constant":
         return torch.full_like(position_fraction, config.rho)
     return config.rho_start + (config.rho_end - config.rho_start) * position_fraction
@@ -213,6 +227,7 @@ def mixed_clipped_advantage(
     gate: Float[Tensor, "batch seq"],
     alpha: float,
     rho: float,
+    step_scale: float = 1.0,
     reward_range: tuple[float, float] = (0.0, 1.0),
 ) -> Float[Tensor, "batch seq"]:
     """TETHER advantage: group anchor + clipped two-factor value correction.
@@ -221,9 +236,10 @@ def mixed_clipped_advantage(
     and ``A = R - b``. The group baseline is recovered from the orchestrator
     advantage ``B_group = R - A_group`` (with ``returns = R`` at action tokens under
     gamma=lambda=1), ``V_t = values``, ``V_0 = start_value``. ``gate`` is 1 (global)
-    or the response position fraction ``u_t`` (position-conditioned)."""
+    or the response position fraction ``u_t`` (position-conditioned). ``step_scale``
+    in [0, 1] anneals the whole correction over training steps (default 1.0 = no anneal)."""
     b_group = returns - group_advantages
-    correction = gate * (alpha * (start_value - b_group) + rho * (values - start_value))
+    correction = step_scale * gate * (alpha * (start_value - b_group) + rho * (values - start_value))
     baseline = (b_group + correction).clamp(min=reward_range[0], max=reward_range[1])
     return returns - baseline
 
