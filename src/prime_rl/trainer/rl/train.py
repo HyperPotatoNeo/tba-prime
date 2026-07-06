@@ -49,7 +49,7 @@ from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.value import (
     align_value_logits,
-    broadcast_start_value,
+    broadcast_first_action,
     compute_gae,
     compute_value_loss,
     mix_advantages,
@@ -507,8 +507,14 @@ def train(config: TrainerConfig):
                 position_fraction = response_position_fraction(
                     value_inputs["mask"], micro_batch["sequence_lengths"]
                 )
-            start_value = broadcast_start_value(
+            start_value = broadcast_first_action(
                 values, value_inputs["mask"], micro_batch["sequence_lengths"]
+            )
+            # Per-episode reward R broadcast to every action token: the return-to-go
+            # head equals the episodic reward, so this is the episode-basis R that
+            # pairs with the per-episode group advantage to recover B_group = mean(R).
+            episodic_return = broadcast_first_action(
+                returns, value_inputs["mask"], micro_batch["sequence_lengths"]
             )
             target = ValueTargets(
                 advantages=advantages.detach(),
@@ -517,6 +523,7 @@ def train(config: TrainerConfig):
                 position_fraction=position_fraction.detach(),
                 values=values.detach(),
                 start_value=start_value.detach(),
+                episodic_return=episodic_return.detach(),
             )
             targets[micro_step] = target
             if first_value_update:
@@ -800,15 +807,17 @@ def train(config: TrainerConfig):
                         if mixture.schedule == "linear"
                         else torch.ones_like(value_target.position_fraction)
                     )
+                    reward_range = getattr(value_config.loss, "reward_range", (0.0, 1.0))
                     advantages = mixed_clipped_advantage(
                         group_advantages,
-                        value_target.returns,
+                        value_target.episodic_return,
                         value_target.values,
                         value_target.start_value,
                         gate,
                         mixture.alpha,
                         mixture.rho,
                         step_scale=step_scale,
+                        reward_range=reward_range,
                     )
                     tensors["mixture/gate"].append(gate[m].detach().to("cpu"))
                 else:

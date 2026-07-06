@@ -22,6 +22,7 @@ class ValueTargets:
     position_fraction: Float[Tensor, "batch seq"]
     values: Float[Tensor, "batch seq"]
     start_value: Float[Tensor, "batch seq"]
+    episodic_return: Float[Tensor, "batch seq"]
 
 
 @dataclass(frozen=True)
@@ -197,31 +198,36 @@ def mix_advantages(
     return (1.0 - rho) * group_advantages + rho * value_advantages
 
 
-def broadcast_start_value(
-    values: Float[Tensor, "batch seq"],
+def broadcast_first_action(
+    tensor: Float[Tensor, "batch seq"],
     mask: Bool[Tensor, "batch seq"],
     sequence_lengths: list[int],
 ) -> Float[Tensor, "batch seq"]:
-    """Per-token ``V_0``: the value prediction at the first action token of each
-    packed sequence, broadcast to every position of that sequence. Sequences with
-    no action tokens stay 0.0. Used by the ``mixed_clipped`` baseline's prompt-prior
-    and prefix-progress split."""
-    flat_values = values.reshape(-1).float()
+    """Per-token value at the FIRST action token of each packed sequence, broadcast
+    to every position of that sequence (0.0 for sequences with no action tokens).
+
+    Applied to ``values`` it yields ``V_0`` (the ``mixed_clipped`` prompt-prior /
+    prefix-progress anchor). Applied to ``returns`` it yields the per-EPISODE reward
+    ``R_episode``: at the first action token the return-to-go is the full-episode
+    return (routing's ``stamp_value_returns`` asserts head == episodic reward), so
+    broadcasting it gives the same episode-basis ``R`` at every token — matching the
+    per-episode broadcast of the orchestrator group advantage."""
+    flat = tensor.reshape(-1).float()
     flat_mask = mask.reshape(-1)
-    out = torch.zeros_like(flat_values)
+    out = torch.zeros_like(flat)
     offset = 0
     for seq_len in sequence_lengths:
         seq_slice = slice(offset, offset + seq_len)
         action_idxs = flat_mask[seq_slice].nonzero(as_tuple=False).flatten() + offset
         if action_idxs.numel() > 0:
-            out[seq_slice] = flat_values[action_idxs[0]]
+            out[seq_slice] = flat[action_idxs[0]]
         offset += seq_len
-    return out.reshape_as(values)
+    return out.reshape_as(tensor)
 
 
 def mixed_clipped_advantage(
     group_advantages: Float[Tensor, "batch seq"],
-    returns: Float[Tensor, "batch seq"],
+    episodic_return: Float[Tensor, "batch seq"],
     values: Float[Tensor, "batch seq"],
     start_value: Float[Tensor, "batch seq"],
     gate: Float[Tensor, "batch seq"],
@@ -232,16 +238,36 @@ def mixed_clipped_advantage(
 ) -> Float[Tensor, "batch seq"]:
     """TETHER advantage: group anchor + clipped two-factor value correction.
 
-    ``b = clip( B_group + gate * [ alpha (V_0 - B_group) + rho (V_t - V_0) ], lo, hi )``
-    and ``A = R - b``. The group baseline is recovered from the orchestrator
-    advantage ``B_group = R - A_group`` (with ``returns = R`` at action tokens under
-    gamma=lambda=1), ``V_t = values``, ``V_0 = start_value``. ``gate`` is 1 (global)
-    or the response position fraction ``u_t`` (position-conditioned). ``step_scale``
-    in [0, 1] anneals the whole correction over training steps (default 1.0 = no anneal)."""
-    b_group = returns - group_advantages
-    correction = step_scale * gate * (alpha * (start_value - b_group) + rho * (values - start_value))
+    Intended baseline (reward space)::
+
+        b = clip( B_group + gate * [ alpha (V_0 - B_group) + rho (V_t - V_0) ], lo, hi )
+        A = R - b
+
+    We keep ``A_group = group_advantages`` (the orchestrator's raw group advantage
+    ``R - B_group``, per-EPISODE and broadcast to every action token) as the anchor
+    and express the whole thing in ADVANTAGE space as ``A_group`` minus the annealed
+    clip-vs-anchor delta::
+
+        A = A_group - step_scale * ( clip(B_group + gate*[..], lo, hi) - B_group )
+
+    Because ``step_scale`` multiplies the ENTIRE delta, ``step_scale = 0`` returns
+    ``A_group`` EXACTLY (a true no-op, matching the ``linear`` path at rho=0), and
+    ``step_scale = 1`` gives ``A = (R - B_group) - (b - B_group) = R - b`` exactly.
+
+    ``B_group`` is the RAW group baseline ``mean(R)``, reconstructed on the EPISODE
+    basis as ``episodic_return - group_advantages``. ``episodic_return`` is the
+    per-episode reward ``R`` broadcast to every action token (the return-to-go head,
+    see ``broadcast_first_action``) — NOT the per-token per-TURN return-to-go. The
+    old code used the per-turn ``returns`` here, mixing bases (RTG - R_episode),
+    which pushed ``B_group`` out of ``reward_range`` and made the clip fire even with
+    the correction off — the multi-turn collapse this replaces. ``V_t = values``,
+    ``V_0 = start_value``, ``gate`` is 1 (global) or the response position fraction
+    ``u_t`` (position-conditioned). ``step_scale`` in [0, 1] anneals the whole
+    correction over training steps (default 1.0 = no anneal)."""
+    b_group = episodic_return - group_advantages
+    correction = gate * (alpha * (start_value - b_group) + rho * (values - start_value))
     baseline = (b_group + correction).clamp(min=reward_range[0], max=reward_range[1])
-    return returns - baseline
+    return group_advantages - step_scale * (baseline - b_group)
 
 
 def compute_value_loss(
