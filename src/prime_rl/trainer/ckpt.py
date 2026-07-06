@@ -9,6 +9,8 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner, create_default_local_load_plan
+from torch.distributed.checkpoint.planner import LoadPlan
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_model_state_dict, set_state_dict
 from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.checkpoint.state_dict_saver import save as dcp_save
@@ -40,6 +42,54 @@ def _try_rmtree(path: Path, logger) -> None:
         shutil.rmtree(path)
     except OSError as e:
         logger.warning(f"Failed to remove {path}: {e}, skipping cleanup")
+
+
+# Marks the flattened FQN segments that identify per-parameter optimizer *state*
+# (e.g. ``app.optimizers.state.<param_fqn>.step``). Optimizer param_groups
+# (``...optimizers.param_groups...``) are intentionally excluded — those are
+# always present and must load strictly.
+_OPTIMIZER_STATE_MARKERS = (".optimizers.state.", ".value_optimizers.state.")
+
+
+def _is_optimizer_state_key(fqn: str) -> bool:
+    return any(marker in fqn for marker in _OPTIMIZER_STATE_MARKERS)
+
+
+class _TolerantOptimizerLoadPlanner(DefaultLoadPlanner):
+    """Load planner that tolerates *optimizer-state* entries missing from the checkpoint.
+
+    VLMs (e.g. ``Qwen3_5ForConditionalGeneration``) carry a vision tower
+    (``model.visual.*``) whose params keep ``requires_grad=True`` but receive no
+    gradient during text-only RL — no image inputs ever flow through them. AdamW
+    therefore never creates optimizer state (``step``/``exp_avg``/``exp_avg_sq``)
+    for those params, so the saved DCP checkpoint has no
+    ``app.optimizers.state.model.visual.*`` entries. On resume the freshly-built
+    optimizer state_dict (the load target) *does* contain those keys (the params
+    are still in a param group), and the default strict planner raises
+    "Missing key in checkpoint state_dict".
+
+    ``DefaultLoadPlanner(allow_partial_load=True)`` would fix the crash but is too
+    blunt: ``create_default_local_load_plan`` skips *any* missing key, so a
+    genuinely-missing model weight would be silently dropped instead of erroring.
+    Here we instead run strict planning on everything, then tolerate only the
+    missing keys that are per-parameter optimizer state. Those simply stay at
+    their fresh init (step 0 / zero moments), which is exactly correct for params
+    that never had optimizer state. Missing model weights (or optimizer
+    param_groups) still raise.
+    """
+
+    def create_local_plan(self) -> LoadPlan:
+        present = self.metadata.state_dict_metadata
+        missing = [fqn for fqn in self.state_dict if fqn not in present]
+        tolerable = [fqn for fqn in missing if _is_optimizer_state_key(fqn)]
+        # Any missing key that is NOT tolerable optimizer state is a real error:
+        # delegate to strict planning so it raises with the original message.
+        if len(tolerable) != len(missing):
+            return create_default_local_load_plan(self.state_dict, self.metadata, strict=True)
+        # Drop only the tolerable optimizer-state keys from the load target so
+        # they are not requested, then plan strictly over the remainder.
+        filtered = {fqn: obj for fqn, obj in self.state_dict.items() if fqn not in tolerable}
+        return create_default_local_load_plan(filtered, self.metadata, strict=True)
 
 
 class AppState(Stateful):
@@ -378,7 +428,16 @@ class CheckpointManager:
             value_scheduler=value_scheduler,
         )
         state_dict = {"app": app_state}
-        dcp_load(state_dict=state_dict, checkpoint_id=path)
+        # Tolerate optimizer-state entries that the checkpoint lacks (VLM vision
+        # tower gets no grad in text-only RL -> AdamW never made state for it, so
+        # old checkpoints have no app.optimizers.state.model.visual.* keys). Those
+        # params stay at fresh init (step 0 / zero moments); model weights and all
+        # present optimizer state still load strictly. See planner docstring.
+        dcp_load(
+            state_dict=state_dict,
+            checkpoint_id=path,
+            planner=_TolerantOptimizerLoadPlanner(),
+        )
 
         # Load the dataloader
         if dataloader is not None:
