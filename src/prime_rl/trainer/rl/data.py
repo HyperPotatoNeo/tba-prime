@@ -55,6 +55,10 @@ class TensorMicroBatch(TypedDict):
     ref_kl_weights: Float[Tensor, "batch seq"] | None
     value_rewards: Float[Tensor, "batch seq"] | None
     value_dones: Bool[Tensor, "batch seq"] | None
+    value_position_fraction: Float[Tensor, "batch seq"] | None
+    value_episodic_return: Float[Tensor, "batch seq"] | None
+    value_turn_return: Float[Tensor, "batch seq"] | None
+    value_turn_tether: Float[Tensor, "batch seq"] | None
 
     # Packer-derived metadata used for run-local debug exports.
     run_id: str | None
@@ -122,6 +126,8 @@ class FakeDataLoader:
         inference_logprobs = torch.randn(input_ids.shape[0], generator=generator)
         value_rewards = torch.zeros(input_ids.shape[0])
         value_dones = torch.zeros(input_ids.shape[0], dtype=torch.bool)
+        value_turn_return = torch.ones(input_ids.shape[0])
+        value_turn_tether = torch.full((input_ids.shape[0],), 0.5)
         value_rewards[-1] = 1.0
         value_dones[-1] = True
         lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
@@ -146,6 +152,10 @@ class FakeDataLoader:
             "ref_kl_weights": None,
             "value_rewards": value_rewards.unsqueeze(0),
             "value_dones": value_dones.unsqueeze(0),
+            "value_position_fraction": None,
+            "value_episodic_return": None,
+            "value_turn_return": value_turn_return.unsqueeze(0),
+            "value_turn_tether": value_turn_tether.unsqueeze(0),
             "run_id": None,
             "run_step": None,
             "phase": "train",
@@ -155,6 +165,8 @@ class FakeDataLoader:
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
         lora_num_tokens = torch.zeros(self.multi_run_manager.max_runs, dtype=torch.int32)
         lora_num_tokens[0] = self.seq_len
+        value_turn_return = torch.ones(self.seq_len, dtype=torch.float)
+        value_turn_tether = torch.full((self.seq_len,), 0.5)
         return {
             "input_ids": torch.randint(
                 0,
@@ -182,6 +194,10 @@ class FakeDataLoader:
             "ref_kl_weights": None,
             "value_rewards": torch.zeros(self.seq_len, dtype=torch.float).unsqueeze(0),
             "value_dones": (torch.arange(self.seq_len) == self.seq_len - 1).unsqueeze(0),
+            "value_position_fraction": None,
+            "value_episodic_return": None,
+            "value_turn_return": value_turn_return.unsqueeze(0),
+            "value_turn_tether": value_turn_tether.unsqueeze(0),
             "run_id": None,
             "run_step": None,
             "phase": "train",
@@ -294,6 +310,18 @@ class DataLoader:
             else None,
             value_dones=torch.tensor(micro_batch.value_dones, dtype=torch.bool).unsqueeze(0)
             if micro_batch.value_dones is not None
+            else None,
+            value_position_fraction=torch.tensor(micro_batch.value_position_fraction, dtype=torch.float).unsqueeze(0)
+            if micro_batch.value_position_fraction is not None
+            else None,
+            value_episodic_return=torch.tensor(micro_batch.value_episodic_return, dtype=torch.float).unsqueeze(0)
+            if micro_batch.value_episodic_return is not None
+            else None,
+            value_turn_return=torch.tensor(micro_batch.value_turn_return, dtype=torch.float).unsqueeze(0)
+            if micro_batch.value_turn_return is not None
+            else None,
+            value_turn_tether=torch.tensor(micro_batch.value_turn_tether, dtype=torch.float).unsqueeze(0)
+            if micro_batch.value_turn_tether is not None
             else None,
             run_id=micro_batch.run_id,
             run_step=micro_batch.run_step,

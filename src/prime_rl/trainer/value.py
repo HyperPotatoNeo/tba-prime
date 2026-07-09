@@ -23,6 +23,10 @@ class ValueTargets:
     values: Float[Tensor, "batch seq"]
     start_value: Float[Tensor, "batch seq"]
     episodic_return: Float[Tensor, "batch seq"]
+    turn_return: Float[Tensor, "batch seq"] | None = None
+    turn_tether: Float[Tensor, "batch seq"] | None = None
+    turn_start_value: Float[Tensor, "batch seq"] | None = None
+    turn_position_fraction: Float[Tensor, "batch seq"] | None = None
 
 
 @dataclass(frozen=True)
@@ -43,20 +47,47 @@ def value_scheduler_max_steps(max_steps: int | None, config: ValueFunctionConfig
     return config.resolved_warmup_batches * config.warmup_updates_per_batch + max_steps * config.updates_per_step
 
 
-def align_value_logits(value_logits: Float[Tensor, "batch seq output"]) -> Float[Tensor, "batch seq output"]:
-    return torch.cat(
-        [
-            torch.zeros(
-                value_logits.shape[0],
-                1,
-                value_logits.shape[-1],
-                dtype=value_logits.dtype,
-                device=value_logits.device,
-            ),
-            value_logits[:, :-1],
-        ],
-        dim=1,
+def align_value_logits(
+    value_logits: Float[Tensor, "batch seq output"],
+    sequence_lengths: list[int] | None = None,
+) -> Float[Tensor, "batch seq output"]:
+    """Causal shift so the value read at action token t uses the hidden state at t-1:
+    prepend a zero row and drop the last, INDEPENDENTLY within each packed segment.
+
+    ``sequence_lengths`` partitions the flattened batch into causally-independent segments
+    (one per turn/sequence), matching ``compute_gae``. Each segment's first position is
+    seeded with zero. Without it the whole batch is treated as a single segment — correct for
+    single-sequence forwards (e.g. offline value probes) but wrong for a packed multi-segment
+    batch, where a single global shift would leak the previous segment's last hidden state
+    into the next segment's first position.
+    """
+    if sequence_lengths is None:
+        return torch.cat(
+            [
+                torch.zeros(
+                    value_logits.shape[0],
+                    1,
+                    value_logits.shape[-1],
+                    dtype=value_logits.dtype,
+                    device=value_logits.device,
+                ),
+                value_logits[:, :-1],
+            ],
+            dim=1,
+        )
+
+    out = value_logits.shape[-1]
+    flat = value_logits.reshape(-1, out)
+    assert sum(sequence_lengths) == flat.shape[0], (
+        f"sequence_lengths sum {sum(sequence_lengths)} != packed length {flat.shape[0]}"
     )
+    aligned = torch.zeros_like(flat)
+    offset = 0
+    for seq_len in sequence_lengths:
+        if seq_len > 1:
+            aligned[offset + 1 : offset + seq_len] = flat[offset : offset + seq_len - 1]
+        offset += seq_len
+    return aligned.reshape_as(value_logits)
 
 
 def _reward_bounds(loss_config: ClassificationValueLossConfig) -> tuple[float, float]:
@@ -77,7 +108,9 @@ def predict_values(
         probs = value_logits.float().softmax(dim=-1)
         return probs @ _bin_values(loss_config, value_logits.device)
 
-    return value_logits.squeeze(-1).float()
+    low, high = loss_config.reward_range
+    normalized = torch.sigmoid(value_logits.squeeze(-1).float())
+    return low + (high - low) * normalized
 
 
 def _classification_targets(
@@ -160,6 +193,30 @@ def response_position_fraction(
     return frac.reshape_as(mask)
 
 
+def action_span_position_fraction(
+    mask: Bool[Tensor, "batch seq"],
+    sequence_lengths: list[int],
+) -> Float[Tensor, "batch seq"]:
+    flat_mask = mask.reshape(-1)
+    frac = torch.zeros(flat_mask.numel(), dtype=torch.float32, device=mask.device)
+    offset = 0
+    for seq_len in sequence_lengths:
+        end = offset + seq_len
+        idx = offset
+        while idx < end:
+            if not bool(flat_mask[idx]):
+                idx += 1
+                continue
+            start = idx
+            while idx < end and bool(flat_mask[idx]):
+                idx += 1
+            n = idx - start
+            if n > 1:
+                frac[start:idx] = torch.linspace(0.0, 1.0, n, dtype=torch.float32, device=frac.device)
+        offset = end
+    return frac.reshape_as(mask)
+
+
 def mixture_step_scale(config: ValueMixtureConfig, step: int) -> float:
     """Training-step annealing factor in [0, 1] applied to the whole mixture
     weight: 0 before ``warmup_start_step``, then linearly to 1 over
@@ -177,12 +234,17 @@ def mixture_rho(
     position_fraction: Float[Tensor, "batch seq"],
     config: ValueMixtureConfig,
 ) -> Float[Tensor, "batch seq"]:
-    """Per-token position schedule for rho in [0, 1]. ``constant`` uses ``rho``
-    everywhere; ``linear`` ramps ``rho_start`` -> ``rho_end`` along the response by
-    ``position_fraction``. The training-step anneal (``mixture_step_scale``) is
-    applied separately by the caller."""
+    """Per-token position schedule for rho in [0, 1].
+
+    ``linear`` keeps its explicit ``rho_start`` -> ``rho_end`` ramp for the
+    convex group/value blend. TETHER-style baselines use ``rho`` as the terminal
+    progress coefficient, so ``schedule=linear`` ramps ``0 -> rho`` while the
+    anchor coefficient ``alpha`` remains position-independent.
+    """
     if config.schedule == "constant":
         return torch.full_like(position_fraction, config.rho)
+    if config.kind in ("mixed_clipped", "turn_anchor"):
+        return config.rho * position_fraction
     return config.rho_start + (config.rho_end - config.rho_start) * position_fraction
 
 
@@ -225,49 +287,65 @@ def broadcast_first_action(
     return out.reshape_as(tensor)
 
 
+def broadcast_action_span_starts(
+    tensor: Float[Tensor, "batch seq"],
+    mask: Bool[Tensor, "batch seq"],
+    sequence_lengths: list[int],
+) -> Float[Tensor, "batch seq"]:
+    """Broadcast the first action-token value within each contiguous sampled span.
+
+    With aligned value logits, the first sampled token of a span is the value of
+    the state before that assistant turn's actions. This is the turn-start anchor.
+    """
+    flat = tensor.reshape(-1).float()
+    flat_mask = mask.reshape(-1)
+    out = torch.zeros_like(flat)
+    offset = 0
+    for seq_len in sequence_lengths:
+        end = offset + seq_len
+        idx = offset
+        while idx < end:
+            if not bool(flat_mask[idx]):
+                idx += 1
+                continue
+            start = idx
+            while idx < end and bool(flat_mask[idx]):
+                idx += 1
+            out[start:idx] = flat[start]
+        offset = end
+    return out.reshape_as(tensor)
+
+
 def mixed_clipped_advantage(
     group_advantages: Float[Tensor, "batch seq"],
     episodic_return: Float[Tensor, "batch seq"],
     values: Float[Tensor, "batch seq"],
     start_value: Float[Tensor, "batch seq"],
-    gate: Float[Tensor, "batch seq"],
     alpha: float,
-    rho: float,
-    step_scale: float = 1.0,
+    rho: Float[Tensor, "batch seq"],
     reward_range: tuple[float, float] = (0.0, 1.0),
 ) -> Float[Tensor, "batch seq"]:
-    """TETHER advantage: group anchor + clipped two-factor value correction.
+    """Token TETHER advantage with the exact clipped reward-space baseline.
 
-    Intended baseline (reward space)::
-
-        b = clip( B_group + gate * [ alpha (V_0 - B_group) + rho (V_t - V_0) ], lo, hi )
-        A = R - b
-
-    We keep ``A_group = group_advantages`` (the orchestrator's raw group advantage
-    ``R - B_group``, per-EPISODE and broadcast to every action token) as the anchor
-    and express the whole thing in ADVANTAGE space as ``A_group`` minus the annealed
-    clip-vs-anchor delta::
-
-        A = A_group - step_scale * ( clip(B_group + gate*[..], lo, hi) - B_group )
-
-    Because ``step_scale`` multiplies the ENTIRE delta, ``step_scale = 0`` returns
-    ``A_group`` EXACTLY (a true no-op, matching the ``linear`` path at rho=0), and
-    ``step_scale = 1`` gives ``A = (R - B_group) - (b - B_group) = R - b`` exactly.
-
-    ``B_group`` is the RAW group baseline ``mean(R)``, reconstructed on the EPISODE
-    basis as ``episodic_return - group_advantages``. ``episodic_return`` is the
-    per-episode reward ``R`` broadcast to every action token (the return-to-go head,
-    see ``broadcast_first_action``) — NOT the per-token per-TURN return-to-go. The
-    old code used the per-turn ``returns`` here, mixing bases (RTG - R_episode),
-    which pushed ``B_group`` out of ``reward_range`` and made the clip fire even with
-    the correction off — the multi-turn collapse this replaces. ``V_t = values``,
-    ``V_0 = start_value``, ``gate`` is 1 (global) or the response position fraction
-    ``u_t`` (position-conditioned). ``step_scale`` in [0, 1] anneals the whole
-    correction over training steps (default 1.0 = no anneal)."""
+    ``B_group`` is reconstructed as ``R - A_group`` on the episode basis. The
+    policy advantage is ``R - clip(B + alpha*(V0-B) + rho*(Vt-V0), low, high)``.
+    """
     b_group = episodic_return - group_advantages
-    correction = gate * (alpha * (start_value - b_group) + rho * (values - start_value))
-    baseline = (b_group + correction).clamp(min=reward_range[0], max=reward_range[1])
-    return group_advantages - step_scale * (baseline - b_group)
+    baseline = b_group + alpha * (start_value - b_group) + rho * (values - start_value)
+    return episodic_return - baseline.clamp(min=reward_range[0], max=reward_range[1])
+
+
+def turn_anchor_tether_advantage(
+    turn_return: Float[Tensor, "batch seq"],
+    turn_tether: Float[Tensor, "batch seq"],
+    values: Float[Tensor, "batch seq"],
+    turn_start_value: Float[Tensor, "batch seq"],
+    alpha: float,
+    rho: Float[Tensor, "batch seq"],
+    reward_range: tuple[float, float] = (0.0, 1.0),
+) -> Float[Tensor, "batch seq"]:
+    baseline = turn_tether + alpha * (turn_start_value - turn_tether) + rho * (values - turn_start_value)
+    return turn_return - baseline.clamp(min=reward_range[0], max=reward_range[1])
 
 
 def compute_value_loss(

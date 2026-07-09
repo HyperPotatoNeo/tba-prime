@@ -140,6 +140,39 @@ def setup_optimizer(
     return optimizer
 
 
+def setup_value_optimizer_differential(
+    config: OptimizerConfig,
+    named_params: list[tuple[str, nn.Parameter]],
+    head_lr: float,
+    trunk_lr: float,
+    parallel_dims: ParallelDims,
+    cpu_offload: bool = False,
+) -> Optimizer | CPUOffloadOptimizer:
+    """AdamW value optimizer with two LR groups: ``value_head`` params at ``head_lr`` and all
+    other (trunk) params at ``trunk_lr``. Only trainable params are included (frozen excluded,
+    matching ``setup_optimizer``). Each group keeps its own base LR, so a linear-warmup
+    scheduler ramps both groups from ~0 to their respective LRs. Only ``adamw`` is supported."""
+    assert config.type == "adamw", f"differential value LR only supported for adamw, got {config.type}"
+    head_params = [p for n, p in named_params if p.requires_grad and "value_head" in n]
+    trunk_params = [p for n, p in named_params if p.requires_grad and "value_head" not in n]
+    assert head_params, "no trainable value_head params found for differential value optimizer"
+    assert trunk_params, "no trainable trunk params found (use head_only instead of trunk_lr?)"
+    param_groups = [
+        {"params": head_params, "lr": head_lr},
+        {"params": trunk_params, "lr": trunk_lr},
+    ]
+    optimizer = AdamW(
+        param_groups,
+        lr=head_lr,
+        weight_decay=config.weight_decay,
+        betas=(config.betas1, config.betas2),
+    )
+    if cpu_offload:
+        get_logger().info("Wrapping value optimizer with CPUOffloadOptimizer for optimizer state CPU offloading")
+        return CPUOffloadOptimizer(optimizer)
+    return optimizer
+
+
 def _create_optimizer(
     config: OptimizerConfig,
     named_params: list[tuple[str, nn.Parameter]],

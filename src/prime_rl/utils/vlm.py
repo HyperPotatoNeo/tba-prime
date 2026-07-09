@@ -111,6 +111,19 @@ def get_layer_prefix(model_config: PretrainedConfig, override: str | None = None
     return DEFAULT_LAYER_PREFIX
 
 
+def get_language_model_prefix(model_config: PretrainedConfig, override: str | None = None) -> str | None:
+    """Return the state-dict key prefix of the language model submodule.
+
+    For registered VLMs this is e.g. 'model.language_model' (the LM is nested
+    beside the vision tower in the checkpoint). Returns None for text-only /
+    unknown models, where the LM already lives at the top-level 'model'.
+    """
+    if override is not None:
+        return override
+    info = _get_model_info_from_config(model_config)
+    return info.language_model_attr if info is not None else None
+
+
 # ---------------------------------------------------------------------------
 # Internal
 # ---------------------------------------------------------------------------

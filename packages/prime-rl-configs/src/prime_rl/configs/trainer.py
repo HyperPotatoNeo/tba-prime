@@ -455,6 +455,16 @@ class MSEValueLossConfig(BaseConfig):
     type: Literal["mse"] = "mse"
     """Regress scalar value targets with mean-squared error."""
 
+    reward_range: tuple[float, float] = (0.0, 1.0)
+    """Closed value range represented by the sigmoid-bounded scalar."""
+
+    @model_validator(mode="after")
+    def validate_reward_range(self):
+        low, high = self.reward_range
+        if high <= low:
+            raise ValueError("value_function.loss.reward_range must be increasing.")
+        return self
+
 
 class ClassificationValueLossConfig(BaseConfig):
     type: Literal["classification"] = "classification"
@@ -485,30 +495,32 @@ class ValueMixtureConfig(BaseConfig):
 
         ``A = (1 - rho_t) * A_group + rho_t * A_value``   (baseline ``(1-rho) B_group + rho V_t``)
 
-    ``mixed_clipped`` ("TETHER") keeps the group baseline as a prompt-level anchor
-    and adds a two-factor value correction, clipped to the reward range [0, 1]:
+    ``mixed_clipped`` ("TETHER") keeps the episode group baseline as the anchor
+    and adds a two-factor value correction, clipped to ``loss.reward_range``:
 
-        ``b = clip( B_group + g_t * [ alpha (V_0 - B_group) + rho (V_t - V_0) ], 0, 1 )``
+        ``b = clip( B_group + alpha (V_0 - B_group) + rho_t (V_t - V_0), low, high )``
         ``A = R - b``
 
-    where ``V_0`` is the value at the first response token, ``alpha (V_0 - B_group)``
-    is the prompt-prior correction, ``rho (V_t - V_0)`` is the prefix-progress
-    correction, and the gate ``g_t`` is 1 everywhere (``schedule='constant'``) or the
-    response position fraction ``u_t`` (``schedule='linear'``, ramping the whole
-    correction from 0 at the first response token to full at the last). Pair with an
-    orchestrator group baseline (GRPO ``baseline='mean'`` or ``'loo'``)."""
+    ``turn_anchor`` uses the group mean return-to-go at each assistant turn as the
+    anchor and measures value progress relative to that turn's start state:
 
-    kind: Literal["linear", "mixed_clipped"] = "linear"
-    """``linear`` = convex group<->value blend. ``mixed_clipped`` = TETHER: group anchor + clipped two-factor (prompt-prior + prefix-progress) correction."""
+        ``b = clip( T_m + alpha (V_m - T_m) + rho_t (V_t - V_m), low, high )``
+        ``A = G_m - b``
+
+    Pair mixture baselines with an orchestrator group baseline such as GRPO
+    ``baseline='mean'`` or ``'loo'``."""
+
+    kind: Literal["linear", "mixed_clipped", "turn_anchor"] = "linear"
+    """``linear`` = convex group<->value blend. ``mixed_clipped`` = episode TETHER. ``turn_anchor`` = turn-level TETHER."""
 
     rho: float = Field(0.5, ge=0, le=1)
-    """``linear``: constant mixture weight (0 = pure group, 1 = pure value). ``mixed_clipped``: weight on the prefix-progress term ``V_t - V_0``."""
+    """``linear``: constant mixture weight. TETHER kinds: weight on the progress term (``V_t - V_0`` or ``V_t - V_m``)."""
 
     alpha: float = Field(0.5, ge=0, le=1)
-    """``mixed_clipped`` only: weight on the prompt-prior term ``V_0 - B_group``. Ignored for ``linear``."""
+    """TETHER kinds only: weight on the anchor correction term. Ignored for ``linear``."""
 
     schedule: Literal["constant", "linear"] = "constant"
-    """``constant`` = no position gating (``linear`` applies ``rho`` at every token; ``mixed_clipped`` gate ``g_t=1``). ``linear`` = gate by response position fraction ``u_t`` (``linear`` ramps ``rho_start`` -> ``rho_end``; ``mixed_clipped`` ramps the whole correction 0 -> full)."""
+    """``constant`` uses ``rho`` at every token. ``linear`` ramps by position: the ``linear`` kind uses ``rho_start`` -> ``rho_end``; TETHER kinds use ``0`` -> ``rho`` for the progress coefficient only."""
 
     rho_start: float = Field(0.0, ge=0, le=1)
     """``linear`` kind + ``schedule='linear'``: mixture weight at the first response token."""
@@ -520,12 +532,24 @@ class ValueMixtureConfig(BaseConfig):
     """Training-step anneal (applies to BOTH kinds). Before this step the value correction is off (pure group baseline) so the critic trains unused. Default 0 = disabled (value correction applied immediately from step 0, legacy behavior)."""
 
     warmup_steps: int = Field(0, ge=0)
-    """Training-step anneal (applies to BOTH kinds). Over this many steps after ``warmup_start_step`` a scale factor ramps 0 -> 1 (0 = single-step jump at ``warmup_start_step``). For ``linear`` the scale multiplies the mixture weight rho; for ``mixed_clipped`` it multiplies the ENTIRE two-factor correction (both alpha*(V0-Bgroup) and rho*(Vt-V0)). Default 0 = disabled (scale identically 1)."""
+    """Training-step anneal. Over this many steps after ``warmup_start_step`` a scale factor ramps 0 -> 1 (0 = single-step jump at ``warmup_start_step``). The scale multiplies mixture coefficients before reward-range clipping. Default 0 = disabled (scale identically 1)."""
 
 
 class ValueFunctionConfig(BaseConfig):
     loss: ValueLossConfig = MSEValueLossConfig()
     """Value-function training loss."""
+
+    head_only: bool = False
+    """Train only the value head, keeping the value backbone frozen at its initialization. The frozen backbone is a fixed feature extractor, so its features are computed once per batch and reused across the (cheap) head updates instead of re-running the full backbone forward/backward each update."""
+
+    shared_trunk: bool = False
+    """Value head reads the LIVE POLICY trunk instead of a separate value backbone. The head is
+    applied to the policy's post-norm hidden states, captured via a forward hook on the policy
+    backbone during the policy's own forward pass (no extra trunk forward). Those hidden states are
+    detached before the head, so value-loss gradients never reach the trunk — the trunk changes only
+    via the policy loss, while the head learns to read the drifting policy features. No second Qwen3
+    backbone is allocated. Mutually exclusive with ``head_only`` (separate frozen backbone) and
+    ``trunk_lr`` (differential-LR full trunk)."""
 
     init_checkpoint: Path | None = None
     """Optional value-only checkpoint to initialize the value model, optimizer, and scheduler."""
@@ -535,6 +559,14 @@ class ValueFunctionConfig(BaseConfig):
 
     optim: OptimizerConfig = AdamWConfig(lr=5e-5)
     """Optimizer for the value function. Defaults to AdamW with lr=5e-5."""
+
+    trunk_lr: float | None = None
+    """Full-model value only: if set, the value backbone/trunk params (everything except
+    ``value_head``) use this learning rate while the value head uses ``optim.lr``. Enables a
+    differential LR — fast head, slow trunk — to protect the pretrained/policy-warm-started
+    trunk representation while the head learns quickly. The LR scheduler warmup ramps BOTH
+    groups from ~0 to their respective LRs. ``None`` = single LR (``optim.lr``) for all value
+    params. Mutually exclusive with ``head_only`` (which freezes the trunk entirely)."""
 
     scheduler: SchedulerConfig = LinearSchedulerConfig(warmup_steps=50, decay_steps=0)
     """Learning-rate scheduler for the value function. Defaults to 50-step linear warmup then constant LR."""
@@ -546,7 +578,7 @@ class ValueFunctionConfig(BaseConfig):
     """When true, replace orchestrator advantages with trainer-computed GAE advantages for the RL loss."""
 
     mixture: ValueMixtureConfig | None = None
-    """Optional value-corrected group baseline (see ``ValueMixtureConfig``). When set, the policy advantage is a per-token blend of the orchestrator group advantage and the trainer GAE advantage. Mutually exclusive with ``use_gae``; pair with a group baseline such as GRPO ``baseline='loo'``."""
+    """Optional value-corrected policy baseline (see ``ValueMixtureConfig``). When set, the policy advantage is computed from value-corrected group or turn anchors instead of trainer GAE. Mutually exclusive with ``use_gae``; pair with a group baseline such as GRPO ``baseline='loo'``."""
 
     gamma: float = Field(1.0, ge=0, le=1)
     """Discount factor for value targets and GAE."""
@@ -575,6 +607,34 @@ class ValueFunctionConfig(BaseConfig):
             data = dict(data)
             data["scheduler"] = {**scheduler, "decay_steps": 0}
         return data
+
+    @model_validator(mode="after")
+    def validate_trunk_lr_excludes_head_only(self):
+        """``trunk_lr`` gives the trainable trunk its own (slow) LR; ``head_only`` freezes the
+        trunk entirely. They are mutually exclusive."""
+        if self.trunk_lr is not None and self.head_only:
+            raise ValueError(
+                "value_function.trunk_lr cannot be combined with head_only=true; "
+                "head_only freezes the trunk, so there is no trunk LR to set."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_shared_trunk_exclusivity(self):
+        """``shared_trunk`` reads the live policy trunk with head-only gradients; it has no separate
+        value backbone, so ``head_only`` (frozen separate backbone) and ``trunk_lr`` (trainable
+        separate trunk) are both meaningless and mutually exclusive with it."""
+        if self.shared_trunk and self.head_only:
+            raise ValueError(
+                "value_function.shared_trunk cannot be combined with head_only=true; "
+                "shared_trunk has no separate value backbone to freeze."
+            )
+        if self.shared_trunk and self.trunk_lr is not None:
+            raise ValueError(
+                "value_function.shared_trunk cannot be combined with trunk_lr; "
+                "shared_trunk has no separate value trunk to assign an LR to."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_mixture_excludes_gae(self):

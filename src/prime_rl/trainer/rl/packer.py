@@ -187,18 +187,19 @@ class MultiPacker(BasePacker):
                 False,
                 f"Run wrote a sample with ref logprobs length != sample length ({len(sample.ref_logprobs)} != {sample_length})",
             )
-        if sample.value_rewards is not None and len(sample.value_rewards) != sample_length:
-            return (
-                False,
-                "Run wrote a sample with value_rewards length != sample length "
-                f"({len(sample.value_rewards)} != {sample_length})",
-            )
-        if sample.value_dones is not None and len(sample.value_dones) != sample_length:
-            return (
-                False,
-                "Run wrote a sample with value_dones length != sample length "
-                f"({len(sample.value_dones)} != {sample_length})",
-            )
+        for name, arr in (
+            ("value_rewards", sample.value_rewards),
+            ("value_dones", sample.value_dones),
+            ("value_position_fraction", sample.value_position_fraction),
+            ("value_episodic_return", sample.value_episodic_return),
+            ("value_turn_return", sample.value_turn_return),
+            ("value_turn_tether", sample.value_turn_tether),
+        ):
+            if arr is not None and len(arr) != sample_length:
+                return (
+                    False,
+                    f"Run wrote a sample with {name} length != sample length ({len(arr)} != {sample_length})",
+                )
         return True, None
 
     def _get_batch(self) -> None:

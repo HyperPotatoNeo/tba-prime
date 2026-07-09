@@ -190,6 +190,8 @@ def test_prepare_batch_preserves_value_streams_through_packing_and_padding():
         env_name="test-env",
         value_rewards=[0.0, 0.0, 1.0],
         value_dones=[False, False, True],
+        value_turn_return=[0.0, 1.0, 1.0],
+        value_turn_tether=[0.0, 0.5, 0.5],
     )
 
     batches_per_gpu = prepare_batch(
@@ -207,6 +209,8 @@ def test_prepare_batch_preserves_value_streams_through_packing_and_padding():
     [micro_batch] = _flatten_batches(batches_per_gpu)
     assert micro_batch.value_rewards == [0.0, 0.0, 1.0, 0.0]
     assert micro_batch.value_dones == [False, False, True, False]
+    assert micro_batch.value_turn_return == [0.0, 1.0, 1.0, 0.0]
+    assert micro_batch.value_turn_tether == [0.0, 0.5, 0.5, 0.0]
     assert micro_batch.loss_mask == [False, True, True, False]
     assert micro_batch.phase == "value_warmup"
     assert micro_batch.save_checkpoint
