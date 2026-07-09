@@ -1,0 +1,156 @@
+#!/bin/bash
+# Router-free 2-node RL launcher for BLC GB200 (aarch64 compute nodes).
+#
+# prime-rl's stock multi_node template fronts inference with `vllm-router`, whose
+# wheel is x86-only and does not exist for aarch64 (GB200) — every rollout then
+# fails with APIConnectionError because the router never starts. This template
+# drops the router entirely: node 0 runs ONE vLLM data-parallel server (dp=4) on
+# 0.0.0.0:8000 (exactly like single-node `uv run inference`), node 1 runs the
+# torchrun trainer (4 GPUs, FSDP shard) plus the orchestrator, and the
+# orchestrator talks to the inference node directly over http://<infer>:8000/v1.
+# Weights sync via the filesystem broadcast over shared Lustre (works cross-node).
+#
+# Rendered by `uv run --no-sync rl @ rl.toml @ <baseline> @ slurm.toml ...`, which
+# also writes the {trainer,orchestrator,inference}.toml subconfigs into CONFIG_DIR.
+
+#SBATCH --job-name={{ job_name }}
+#SBATCH --nodes={{ num_train_nodes + num_infer_nodes }}
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:{{ gpus_per_node }}
+#SBATCH --partition={{ partition }}
+#SBATCH --qos=priority-reasoning
+{%- if account %}
+#SBATCH --account={{ account }}
+{%- endif %}
+{%- if time %}
+#SBATCH --time={{ time }}
+{%- endif %}
+{%- if nodelist %}
+#SBATCH --nodelist={{ nodelist }}
+{%- endif %}
+{%- if exclude %}
+#SBATCH --exclude={{ exclude }}
+{%- endif %}
+#SBATCH --exclusive
+#SBATCH --output={{ output_dir }}/job_%j.log
+#SBATCH --error={{ output_dir }}/job_%j.log
+
+# Exit immediately on any failed command so a crash releases the allocation.
+set -e
+
+export NUM_INFER_NODES={{ num_infer_nodes }}
+export NUM_TRAIN_NODES={{ num_train_nodes }}
+export GPUS_PER_NODE={{ gpus_per_node }}
+export PROJECT_DIR={{ project_dir }}
+export CONFIG_DIR={{ config_dir }}
+export OUTPUT_DIR={{ output_dir }}
+
+# BLC aarch64: local CUDA 12.8 toolkit + aarch64 uv on PATH (compute nodes ship
+# CUDA 13.0 and have no system uv). Needed on both the batch shell and each srun.
+export CUDA_HOME=$HOME/cuda-12.8
+export PATH=$HOME/.local/bin:$CUDA_HOME/bin:$PATH
+
+mkdir -p $OUTPUT_DIR/logs/trainer $OUTPUT_DIR/logs/inference
+rm -f $OUTPUT_DIR/logs/inference/*.log
+ln -sfn trainer/node_0.log $OUTPUT_DIR/logs/trainer.log
+ln -sfn inference/node_0.log $OUTPUT_DIR/logs/inference.log
+
+# Fresh-start hygiene. This launcher runs the components directly, so the
+# `rl` entrypoint's clean_future_steps() (which wipes stale weight broadcasts +
+# rollouts) never runs at job time. On a SLURM requeue the inference server would
+# otherwise reload the PREVIOUS attempt's stale broadcast from shared Lustre and
+# generate rollouts from non-base weights (step-0 reward jumps from ~0.22 to
+# ~0.3-0.4 and the run is contaminated). These runs always start from scratch, so
+# wipe the shared staging dirs on every (re)start. (Guard behind a resume flag if
+# checkpoint-resume is ever added.)
+rm -rf $OUTPUT_DIR/weights $OUTPUT_DIR/rollouts $OUTPUT_DIR/broadcasts
+
+# Shared W&B run across trainer + orchestrator (single logical run).
+export WANDB_SHARED_MODE=1
+export WANDB_SHARED_RUN_ID=${WANDB_SHARED_RUN_ID:-$(python3 -c "import uuid; print(uuid.uuid4().hex)")}
+
+# Node roles: node 0 = inference, node 1 = trainer (+ orchestrator).
+HOSTNAMES=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
+export INFER_HOST="${HOSTNAMES[0]}"
+export TRAIN_HOST="${HOSTNAMES[1]}"
+export INFER_URL="http://${INFER_HOST}:8000/v1"
+echo "INFER_HOST=$INFER_HOST TRAIN_HOST=$TRAIN_HOST INFER_URL=$INFER_URL"
+
+# Clean stale node-local state from prior jobs (orphan procs + vLLM/torch IPC
+# under /dev/shm and /tmp) that can hang the next launch. Harmless when clean.
+srun bash -s <<'CLEANUP_SH'
+    pkill -9 -f "[p]ython.*prime_rl" 2>/dev/null || true
+    pkill -9 -f "[t]orchrun" 2>/dev/null || true
+    pkill -9 -f "[v]llm" 2>/dev/null || true
+    pkill -9 "vllm" 2>/dev/null || true
+    sleep 2
+    rm -rf /dev/shm/vllm-* /dev/shm/vllm_* /tmp/vllm-* /tmp/vllm_* /tmp/torch-* /tmp/torchelastic_* 2>/dev/null || true
+    gpu=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk "{s+=\$1} END {print s}")
+    echo "[node-cleanup] $(hostname) gpu_mem=${gpu}MiB"
+CLEANUP_SH
+
+# --kill-on-bad-exit=1: a non-zero exit on any node reaps the peer task so the
+# whole job tears down instead of leaving zombies holding the allocation.
+srun --kill-on-bad-exit=1 bash -c '
+    set -o pipefail
+    cd $PROJECT_DIR
+    # WANDB_API_KEY (and any other secrets) live in ~/.env. set -a auto-exports
+    # so the uv-run children (inference/trainer/orchestrator) inherit them.
+    set -a; [ -f "$HOME/.env" ] && source "$HOME/.env"; [ -f .env ] && source .env; set +a
+    source .venv/bin/activate
+    export CUDA_HOME=$HOME/cuda-12.8
+    export PATH=$HOME/.local/bin:$CUDA_HOME/bin:$PATH
+    # The Qwen3-4B snapshot is fully cached under $HF_HOME; go offline so components
+    # never call the HF API (parallel jobs otherwise trip a 429 rate limit on the
+    # model-tree endpoint and crash before the model loads).
+    export HF_HUB_OFFLINE=1
+    ulimit -n 65536
+
+    if [ "$SLURM_PROCID" -eq 0 ]; then
+        # ===== Inference node: ONE vLLM data-parallel server (dp), no router =====
+{%- for key, value in inference_env_vars.items() %}
+        export {{ key }}="{{ value }}"
+{%- endfor %}
+        echo "[inference] $(hostname) -> vLLM dp server on 0.0.0.0:8000" \
+            | tee $OUTPUT_DIR/logs/inference/node_0.log
+        WANDB_SHARED_LABEL=inference uv run --no-sync inference @ $CONFIG_DIR/inference.toml \
+            2>&1 | tee -a $OUTPUT_DIR/logs/inference/node_0.log &
+    else
+        # ===== Trainer node: torchrun trainer (FSDP over 4 GPUs) + orchestrator =====
+{%- for key, value in trainer_env_vars.items() %}
+        export {{ key }}="{{ value }}"
+{%- endfor %}
+        echo "[trainer] $(hostname)" | tee $OUTPUT_DIR/logs/trainer/node_0.log
+        WANDB_SHARED_LABEL=trainer uv run --no-sync torchrun \
+            --role=trainer \
+            --nnodes=$NUM_TRAIN_NODES \
+            --nproc-per-node=$GPUS_PER_NODE \
+            --node-rank=0 \
+            --rdzv-endpoint=$TRAIN_HOST:29500 \
+            --rdzv-id=job_$SLURM_JOB_ID \
+            --log-dir=$OUTPUT_DIR/logs/trainer/torchrun \
+            --tee=3 --redirects=3 \
+            --local-ranks-filter={{ ranks_filter }} \
+            -m prime_rl.trainer.rl.train \
+            @ $CONFIG_DIR/trainer.toml \
+            2>&1 | sed -u "s/^\[[a-zA-Z]*[0-9]*\]://" | tee -a $OUTPUT_DIR/logs/trainer/node_0.log &
+
+        # Orchestrator co-located on the trainer node; points straight at the
+        # inference node (no router). admin_base_url is unset -> falls back to
+        # base_url (same single server handles weight-load notifications).
+{%- for key, value in orchestrator_env_vars.items() %}
+        export {{ key }}="{{ value }}"
+{%- endfor %}
+        WANDB_SHARED_LABEL=orchestrator uv run --no-sync orchestrator @ $CONFIG_DIR/orchestrator.toml \
+            --model.client.base-url $INFER_URL \
+            2>&1 | tee $OUTPUT_DIR/logs/orchestrator.log &
+    fi
+
+    # Reap the first background component to exit; --kill-on-bad-exit broadcasts
+    # a crash to the peer node so the whole allocation tears down.
+    wait -n
+    EXIT_CODE=$?
+    echo "[$(hostname)] tearing down (exit code $EXIT_CODE)"
+    for pid in $(jobs -p); do kill -TERM $pid 2>/dev/null || true; done
+    exit $EXIT_CODE
+'

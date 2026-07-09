@@ -1,0 +1,23 @@
+# Baseline 2: pure value function (GAE with gamma=lambda=1, i.e. A_{i,t}=R_i-V(s_{i,t})).
+# Load the warmed value checkpoint at launch:
+#   --trainer.value-function.init-checkpoint /path/to/value_checkpoint
+
+[trainer.value_function]
+use_gae = true
+gamma = 1.0
+gae_lambda = 1.0
+updates_per_step = 1
+
+[trainer.value_function.loss]
+type = "classification"   # binary classifier (matches offline diagnostics)
+reward_range = [0.0, 1.0]
+n_bins = 1                 # binary split at the reward-range midpoint
+
+[trainer.value_function.optim]
+type = "adamw"
+lr = 5e-5
+weight_decay = 0.01
+max_norm = 1.0
+
+[trainer.value_function.scheduler]
+type = "constant"   # warmed critic trains at constant LR (optim lr) during RL — no LR re-warmup

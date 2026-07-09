@@ -1,0 +1,66 @@
+# RG-Mix value-corrected GRPO — shared base config.
+#
+# Compose with one baseline overlay and set K (group_size) per run, e.g.:
+#   uv run rl @ configs/rg_mix/rl.toml @ configs/rg_mix/mean.toml \
+#     --orchestrator.group-size 8 --wandb.name mean-k8 --wandb.group k8 \
+#     --output-dir outputs/mean-k8
+#
+# Value overlays additionally take a warmed value checkpoint:
+#   --trainer.value-function.init-checkpoint /path/to/value_checkpoint
+
+max_steps = 500
+seq_len = 8192
+
+[model]
+name = "Qwen/Qwen3-4B-Instruct-2507"
+
+[trainer.model]
+impl = "custom"              # custom Qwen3 stack (required by FA4; auto also resolves to it for Qwen3)
+attn = "flash_attention_4"   # FA4 (flash-attn-cute), Blackwell-native attention
+# 1 trainer node (4 GB200). The trainer is communication-bound on the value runs (a
+# second 4B critic + per-microbatch FSDP all-gather/reduce-scatter), so the shard
+# degree matters. Measured on GB200 (pure_value-k8, tok/s | peak HBM):
+#   dp_shard=4 (dp_replicate=1): ~9.5k | 29 GiB   (most sharding comm)
+#   dp_replicate=2 x dp_shard=2: ~10.3k | 70 GiB  (+8%, memory-safe -> chosen)
+#   dp_replicate=4 (no shard):   ~11.8k | 165 GiB (+12% but OOM-risky at 89% HBM)
+# Non-algo tweaks that did NOT help: optim_cpu_offload/reshard off (no change),
+# ac.mode=selective (no change, same 29 GiB). dp_shard auto-derives to 2 here.
+dp_replicate = 2             # HSDP 2x2: halve FSDP shard comm at safe 70GiB/GPU
+
+[wandb]
+project = "rgmix-value-grpo"
+
+[ckpt]
+interval = 50                # checkpoint every 50 steps
+
+[orchestrator]
+batch_size = 256
+group_size = 8               # K; override per run with --orchestrator.group-size
+
+# Ancestral sampling: temperature 1.0, top_p 1.0 (hardcoded), top_k disabled, min_p 0.
+[orchestrator.train.sampling]
+temperature = 1.0
+max_completion_tokens = 6144
+extra_body = { top_k = -1, min_p = 0.0 }
+
+[[orchestrator.train.env]]
+id = "rg-mix"
+name = "rg-mix"
+args = { dataset_path = "/home/siddarth.venkatraman/datasets/rg_mix_10k", num_train_examples = 10000, num_eval_examples = 500, seed = 42 }
+
+[orchestrator.renderer]
+name = "default"
+
+[trainer.optim]
+lr = 1e-6                    # policy LR (prime-rl default); full fine-tuning (no LoRA)
+
+# 2 nodes per run: 1 inference node (4 GPUs) + 1 trainer node (4 GPUs).
+[deployment]
+type = "multi_node"
+gpus_per_node = 4
+num_train_nodes = 1
+num_infer_nodes = 1
+
+[inference.parallel]
+dp = 4
+tp = 1

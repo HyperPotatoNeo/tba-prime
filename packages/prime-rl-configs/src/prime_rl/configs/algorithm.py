@@ -191,10 +191,16 @@ class BaseAlgoConfig(BaseConfig):
 
 class GRPOAlgoConfig(BaseAlgoConfig):
     type: Literal["grpo"] = "grpo"
-    """GRPO: scalar advantage = reward minus the per-group mean baseline,
-    consumed by the ``rl`` loss component on the rollout's action tokens."""
+    """GRPO: scalar advantage = reward minus the per-group baseline, consumed by
+    the ``rl`` loss component on the rollout's action tokens."""
 
     action_loss_type: ClassVar[ActionLossType] = "rl"
+
+    baseline: Literal["mean", "loo"] = "mean"
+    """Group baseline subtracted from each reward. ``mean`` uses the group mean
+    (includes the rollout's own reward, the standard GRPO reference); ``loo`` uses
+    the leave-one-out mean ``B_i = (sum_{j!=i} R_j) / (G-1)``, a cleaner control
+    variate that excludes the rollout's own reward."""
 
     length_penalty: LengthPenaltyConfig | None = None
     """Linear length penalty subtracted from each reward before the GRPO baseline (see ``LinearLengthPenaltyConfig``): a ``pass_rate``-scaled sum of output-token, input-token, and turns terms, each normalized by the group's own max for that quantity. None disables it."""

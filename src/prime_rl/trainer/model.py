@@ -56,7 +56,12 @@ from prime_rl.trainer.world import get_world
 from prime_rl.utils.logger import get_logger
 from prime_rl.utils.sequence import get_cu_seqlens_from_position_ids
 from prime_rl.utils.utils import format_time
-from prime_rl.utils.vlm import get_language_model, get_vision_encoder, is_vlm_architecture
+from prime_rl.utils.vlm import (
+    get_language_model,
+    get_language_model_prefix,
+    get_vision_encoder,
+    is_vlm_architecture,
+)
 
 
 def pre_download_model(model_name: str) -> None:
@@ -454,6 +459,7 @@ class ValueFunctionModel(nn.Module):
         self.config = causal_lm.config
         self._prime_conversion_cls = type(causal_lm) if isinstance(causal_lm, PreTrainedModelPrimeRL) else None
         self.model = get_language_model(causal_lm)
+        self.backbone_is_frozen = False
         text_config = self.config.get_text_config() if hasattr(self.config, "get_text_config") else self.config
         old_head = causal_lm.lm_head
         self.value_head = nn.Linear(
@@ -466,14 +472,22 @@ class ValueFunctionModel(nn.Module):
     def init_value_head(self) -> None:
         self.value_head.reset_parameters()
 
-    def forward(
+    def freeze_backbone(self) -> int:
+        num_frozen = 0
+        for param in self.model.parameters():
+            param.requires_grad = False
+            num_frozen += 1
+        self.backbone_is_frozen = True
+        return num_frozen
+
+    def backbone_hidden_states(
         self,
         input_ids: Int[Tensor, "batch seq"],
         position_ids: Int[Tensor, "batch seq"],
         routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
         mm_kwargs: dict[str, Tensor] | None = None,
         mm_token_type_ids: Int[Tensor, "batch seq"] | None = None,
-    ) -> Float[Tensor, "batch seq output"]:
+    ) -> Float[Tensor, "batch seq hidden"]:
         if mm_kwargs is not None or mm_token_type_ids is not None:
             raise ValueError("ValueFunctionModel only supports text-only batches.")
 
@@ -485,8 +499,23 @@ class ValueFunctionModel(nn.Module):
             kwargs["routed_experts"] = routed_experts
 
         outputs = self.model(**kwargs)
-        hidden_states = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+        return outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+
+    def value_head_logits(self, hidden_states: Float[Tensor, "batch seq hidden"]) -> Float[Tensor, "batch seq output"]:
         return self.value_head(hidden_states).float()
+
+    def forward(
+        self,
+        input_ids: Int[Tensor, "batch seq"],
+        position_ids: Int[Tensor, "batch seq"],
+        routed_experts: Int[Tensor, "batch seq layers topk"] | None = None,
+        mm_kwargs: dict[str, Tensor] | None = None,
+        mm_token_type_ids: Int[Tensor, "batch seq"] | None = None,
+    ) -> Float[Tensor, "batch seq output"]:
+        hidden_states = self.backbone_hidden_states(
+            input_ids, position_ids, routed_experts, mm_kwargs, mm_token_type_ids
+        )
+        return self.value_head_logits(hidden_states)
 
 
 def get_model(
@@ -688,10 +717,13 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
     mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
     offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
 
+    frozen_value_backbone = isinstance(model, ValueFunctionModel) and model.backbone_is_frozen
+    reshard_after_forward = True if frozen_value_backbone else config.reshard_after_forward
+
     fsdp_config = {
         "mp_policy": mp_policy,
         "offload_policy": offload_policy,
-        "reshard_after_forward": config.reshard_after_forward,
+        "reshard_after_forward": reshard_after_forward,
     }
 
     hsdp_mesh = parallel_dims.get_mesh("hsdp")
@@ -746,13 +778,27 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
             **fsdp_config,
         )
         norm_module = getattr(language_model, "norm", None) or language_model.norm_f
-        fully_shard(
-            [head_module, norm_module],
-            mesh=hsdp_mesh,
-            mp_policy=mp_policy,
-            offload_policy=offload_policy,
-            reshard_after_forward=False,
-        )
+        # Frozen-backbone value models do not backprop through the trunk, so the
+        # head+norm group cannot rely on backward to restore its sharded state.
+        # Shard the head separately because the cached-feature head-only path
+        # calls value_head directly; FSDP requires a single root for that forward.
+        if frozen_value_backbone:
+            for module in (norm_module, head_module):
+                fully_shard(
+                    module,
+                    mesh=hsdp_mesh,
+                    mp_policy=mp_policy,
+                    offload_policy=offload_policy,
+                    reshard_after_forward=True,
+                )
+        else:
+            fully_shard(
+                [head_module, norm_module],
+                mesh=hsdp_mesh,
+                mp_policy=mp_policy,
+                offload_policy=offload_policy,
+                reshard_after_forward=False,
+            )
     else:
         get_logger().warning("Skipping the last-layer no-reshard optimization.")
 
@@ -761,7 +807,7 @@ def setup_fsdp(model: nn.Module, config: ModelConfig, parallel_dims: ParallelDim
         mesh=hsdp_mesh,
         mp_policy=mp_policy,
         offload_policy=offload_policy,
-        reshard_after_forward=config.reshard_after_forward,
+        reshard_after_forward=reshard_after_forward,
     )
 
     if not parallel_dims.ep_enabled:
@@ -896,6 +942,18 @@ def load_dcp_from_hf(model: nn.Module, config: ModelConfig, parallel_dims: Paral
         for key in list(state_dict):
             if key.startswith("value_head."):
                 del state_dict[key]
+        # ValueFunctionModel reparents just the language model as ``self.model``
+        # (backbone keys ``model.*``), but a VLM checkpoint nests it under
+        # ``model.language_model.*`` alongside the vision tower. Remap the
+        # backbone keys to the checkpoint's language-model prefix so the HF DCP
+        # load matches; the checkpoint's vision/mtp keys are simply unused.
+        lm_prefix = get_language_model_prefix(model.config)
+        if lm_prefix is not None and lm_prefix != "model":
+            assert lm_prefix.startswith("model."), f"unexpected language model prefix {lm_prefix!r}"
+            state_dict = {
+                lm_prefix + key[len("model") :] if key.startswith("model.") else key: value
+                for key, value in state_dict.items()
+            }
     if model.config.tie_word_embeddings:
         state_dict.pop("lm_head.weight", None)
     dcp_load(
@@ -1005,6 +1063,20 @@ def reshard_module(model: nn.Module):
     for module in model.modules():
         if isinstance(module, FSDPModule):
             module.reshard()
+
+
+def _wrap_value_function_model(
+    causal_lm: nn.Module,
+    value_head_output_size: int | None,
+    freeze_value_backbone: bool,
+) -> nn.Module:
+    if value_head_output_size is None:
+        return causal_lm
+    value_model = ValueFunctionModel(causal_lm, value_head_output_size)
+    if freeze_value_backbone:
+        num_frozen = value_model.freeze_backbone()
+        get_logger().info(f"Froze {num_frozen} value-backbone params for head-only value training")
+    return value_model
 
 
 def apply_ac(model: nn.Module, ac_config: ActivationCheckpointConfig):
@@ -1136,6 +1208,7 @@ def setup_model(
     loading_from_checkpoint_later: bool = False,
     fused_cross_entropy: bool | str = False,
     value_head_output_size: int | None = None,
+    freeze_value_backbone: bool = False,
 ) -> nn.Module:
     if value_head_output_size is not None and config.lora is not None:
         raise ValueError("Value functions do not support LoRA yet.")
@@ -1153,8 +1226,7 @@ def setup_model(
 
     # 1. We load to meta device by default
     model = get_model(config, device=torch.device("meta"), dtype=DTYPE_MAP[config.optimization_dtype])
-    if value_head_output_size is not None:
-        model = ValueFunctionModel(model, value_head_output_size)
+    model = _wrap_value_function_model(model, value_head_output_size, freeze_value_backbone)
     configure_moe_ep_backend(model, config)
 
     possible_to_load_to_meta = can_reinit_empty_buffers(model)
@@ -1168,8 +1240,7 @@ def setup_model(
     if not possible_to_load_to_meta:
         logger.warning("Cannot load model to meta device only, loading to CPU instead.")
         model = get_model(config, device=torch.device("cpu"), dtype=DTYPE_MAP[config.optimization_dtype])
-        if value_head_output_size is not None:
-            model = ValueFunctionModel(model, value_head_output_size)
+        model = _wrap_value_function_model(model, value_head_output_size, freeze_value_backbone)
         configure_moe_ep_backend(model, config)
 
     lm_head_chunk_size: int | None = None
@@ -1200,9 +1271,11 @@ def setup_model(
     if parallel_dims.ep_enabled:
         apply_ep(model, config, parallel_dims)
         # EP replaces params with DTensors that default to requires_grad=True,
-        # re-freeze base params that LoRA froze earlier.
+        # re-freeze base params that LoRA/head-only setup froze earlier.
         if config.lora is not None:
             freeze_all_except_lora_and_specified(model, config.lora)
+        if freeze_value_backbone and isinstance(model, ValueFunctionModel):
+            model.freeze_backbone()
 
     # the right order is AC -> Compile -> FSDP
     if config.ac is not None:
@@ -1250,13 +1323,76 @@ def setup_value_model(
     parallel_dims: ParallelDims,
     loading_from_checkpoint_later: bool,
     head_output_size: int,
+    head_only: bool = False,
 ) -> nn.Module:
     return setup_model(
         config,
         parallel_dims,
         loading_from_checkpoint_later,
         value_head_output_size=head_output_size,
+        freeze_value_backbone=head_only,
     )
+
+
+class SharedTrunkValueHead(nn.Module):
+    """Standalone value head for the ``shared_trunk`` mode: a single Linear applied to the LIVE
+    policy trunk's (detached) post-norm hidden states. There is no value backbone — the policy
+    trunk is shared, so this module holds only ``value_head``. The ``value_head_logits`` method
+    matches ``ValueFunctionModel`` so the trainer's ``forward_value_logits(features=...)`` path,
+    the ``"value_head"`` optimizer filter, and the value checkpoint plumbing all work unchanged."""
+
+    def __init__(self, hidden_size: int, output_size: int, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.value_head = nn.Linear(hidden_size, output_size, dtype=dtype)
+
+    def init_value_head(self) -> None:
+        self.value_head.reset_parameters()
+
+    def value_head_logits(self, hidden_states: Float[Tensor, "batch seq hidden"]) -> Float[Tensor, "batch seq output"]:
+        return self.value_head(hidden_states).float()
+
+
+def setup_shared_value_head(
+    config: ModelConfig,
+    parallel_dims: ParallelDims,
+    hidden_size: int,
+    output_size: int,
+) -> nn.Module:
+    """Build + FSDP-wrap the standalone shared-trunk value head. Mirrors the meta-device flow of
+    ``setup_model``: build on meta, ``fully_shard`` on the hsdp mesh (reshard-after-forward like the
+    value head/norm group), then ``to_empty`` + re-init the head. No buffers, so no ``fix_model_post_empty``."""
+    dtype = DTYPE_MAP[config.optimization_dtype]
+    with torch.device("meta"):
+        head = SharedTrunkValueHead(hidden_size, output_size, dtype=dtype)
+
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=DTYPE_MAP[config.reduce_dtype])
+    offload_policy: OffloadPolicy = CPUOffloadPolicy(pin_memory=True) if config.fsdp_cpu_offload else OffloadPolicy()
+    # Shard the value_head Linear itself (as the head_only path shards its value_head), so calling
+    # `head.value_head(features)` triggers the FSDP unshard. Sharding the outer container would only
+    # unshard on its __call__, but the head is invoked via value_head_logits -> self.value_head(...).
+    hsdp_mesh = parallel_dims.get_mesh("hsdp")
+    fully_shard(
+        head.value_head,
+        mesh=hsdp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=True,
+    )
+    # Also shard the container as the FSDP root (mirrors setup_model's shard-children-then-root
+    # order); it owns no direct params, so this just makes to_empty/state-dict handling uniform.
+    fully_shard(
+        head,
+        mesh=hsdp_mesh,
+        mp_policy=mp_policy,
+        offload_policy=offload_policy,
+        reshard_after_forward=True,
+    )
+
+    device = "cpu" if config.fsdp_cpu_offload else "cuda"
+    head.to_empty(device=device)
+    torch.distributed.barrier()
+    head.init_value_head()
+    return head
 
 
 def forward(

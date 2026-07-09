@@ -10,7 +10,7 @@ from prime_rl.configs.algorithm import (
 )
 from prime_rl.orchestrator.algo.grpo import GRPOAlgorithm
 from prime_rl.orchestrator.algo.max_rl import MaxRLAlgorithm
-from prime_rl.orchestrator.algo.routing import stamp_value_returns
+from prime_rl.orchestrator.algo.routing import stamp_turn_anchor_tethers, stamp_value_returns
 from prime_rl.orchestrator.trajectories import trace_to_samples
 from prime_rl.orchestrator.types import Rollout
 
@@ -259,3 +259,24 @@ def test_stamp_value_returns_uses_raw_terminal_reward():
     assert rewards == [0.0, 0.0, 0.8, 0.0]
     assert dones == [False, False, True, False]
     assert terminal == 2
+
+
+def test_stamp_turn_anchor_tethers_broadcasts_turn_returns_and_group_means():
+    group = [
+        _build_rollout(0.8, sampled_lengths=[2, 1], obs_lengths=[1]),
+        _build_rollout(0.2, sampled_lengths=[1, 2], obs_lengths=[1]),
+    ]
+
+    stamp_turn_anchor_tethers(group)
+
+    for rollout, reward in zip(group, [0.8, 0.2], strict=True):
+        turn_returns = [value for sample in rollout.samples for value in sample.value_turn_return]
+        turn_tethers = [value for sample in rollout.samples for value in sample.value_turn_tether]
+        mask = [trainable for sample in rollout.samples for trainable in sample.mask]
+
+        assert [value for value, trainable in zip(turn_returns, mask, strict=True) if trainable] == [
+            reward,
+            reward,
+            reward,
+        ]
+        assert [value for value, trainable in zip(turn_tethers, mask, strict=True) if trainable] == [0.5, 0.5, 0.5]

@@ -67,6 +67,57 @@ gae_lambda = 1.0
 With `gae_lambda = 1.0`, the estimator has no lambda bias but keeps high
 variance.
 
+### Value-corrected baselines (LOO + mixture)
+
+The value function can be used as a *correction* to the group baseline instead
+of a wholesale replacement. This keeps the robust group estimate of prompt
+difficulty while letting the critic add token-level credit.
+
+The group baseline itself is chosen on the orchestrator side. GRPO supports a
+leave-one-out (LOO) baseline that excludes the rollout's own reward:
+
+```toml
+[orchestrator.algo]
+type = "grpo"
+baseline = "loo"   # B_i = (sum_{j!=i} R_j) / (G-1); "mean" (default) is standard GRPO
+```
+
+`trainer.value_function.mixture` then blends the orchestrator group advantage
+`A_group = R - B` with the trainer GAE advantage `A_value = R - V_t` per token:
+
+```text
+A = (1 - rho_t) * A_group + rho_t * A_value
+  = R - [ (1 - rho_t) * B + rho_t * V_t ]      # the linear value-corrected baseline
+```
+
+`rho` can be constant, or a linear schedule over response-token position that
+ramps from `rho_start` at the first response token to `rho_end` at the last
+(interpolating LOO -> pure value from response start to end, which keeps value
+corrections weak early and strong late):
+
+```toml
+# Constant mixture (linear interpolation baseline), rho=0.5
+[trainer.value_function]
+use_gae = false                 # required: the mixture blends, it does not replace
+
+[trainer.value_function.mixture]
+rho = 0.5
+schedule = "constant"
+
+# Position-aware mixture: rho(t) ramps 0 -> 1 along the response
+[trainer.value_function.mixture]
+schedule = "linear"
+rho_start = 0.0
+rho_end = 1.0
+```
+
+`mixture` is mutually exclusive with `use_gae` (which fully replaces the
+orchestrator advantage) and is intended to be paired with `baseline = "loo"`.
+Special cases: `rho = 0` recovers LOO; `rho = 1` recovers pure value
+(equivalent to `use_gae = true` with `gamma = gae_lambda = 1`). The trainer logs
+`advantage/group`, `advantage/value`, `advantage/mixed`, and `mixture/rho` over
+action tokens for diagnostics.
+
 ### Warmup
 
 Value warmup sends value-only batches before normal policy training:
@@ -85,6 +136,11 @@ Warmup batches do not advance `progress.step`, do not update the policy, and do
 not create async trainer/inference lag. The last warmup batch requests a full
 trainer checkpoint, and the orchestrator saves its checkpoint after the trainer
 checkpoint is stable.
+
+To reuse a warmed value model across separate runs, set
+`export_warmup_checkpoint = true`; after warmup the trainer additionally writes a
+standalone value-only checkpoint to `<output_dir>/checkpoints/value_warmup_checkpoint`
+that later runs load via `trainer.value_function.init_checkpoint`.
 
 To skip warmup from a pre-trained value checkpoint:
 

@@ -1,0 +1,6 @@
+# Baseline 1: group-mean GRPO (no value function).
+# A_{i,t} = R_i - mean_j(R_j)   (per-group mean baseline)
+
+[orchestrator.algo]
+type = "grpo"
+baseline = "mean"

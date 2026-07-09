@@ -13,9 +13,9 @@ from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
 from torch.profiler import profile, ProfilerActivity, record_function
-from prime_rl.trainer.ckpt import load_value_checkpoint, setup_ckpt_managers
+from prime_rl.trainer.ckpt import load_value_checkpoint, save_value_checkpoint, setup_ckpt_managers
 from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
-from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
+from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer, setup_value_optimizer_differential
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
@@ -39,8 +39,10 @@ from prime_rl.trainer.rl.token_export import setup_token_exporter
 from prime_rl.trainer.model import (
     forward,
     predict_value,
+    reshard_module,
     setup_tokenizer,
     setup_model,
+    setup_shared_value_head,
     setup_value_model,
     is_tt_moe_model,
     get_load_balance_stats,
@@ -48,10 +50,19 @@ from prime_rl.trainer.model import (
 from prime_rl.trainer.parallel_dims import get_parallel_dims, resolve_ep
 from prime_rl.trainer.perf import get_perf_counter
 from prime_rl.trainer.value import (
+    action_span_position_fraction,
     align_value_logits,
+    broadcast_action_span_starts,
+    broadcast_first_action,
     compute_gae,
     compute_value_loss,
+    mix_advantages,
+    mixed_clipped_advantage,
+    mixture_rho,
+    mixture_step_scale,
     predict_values,
+    turn_anchor_tether_advantage,
+    response_position_fraction,
     ValueTargets,
     ValueUpdateStats,
     value_head_output_size,
@@ -80,6 +91,22 @@ from prime_rl.utils.process import set_proc_title
 from prime_rl.utils.utils import clean_exit, resolve_latest_ckpt_step, to_col_format
 from ring_flash_attn import substitute_hf_flash_attn
 from torchtitan.distributed.utils import clip_grad_norm_
+
+
+def _assert_head_only_value_checkpoint(path) -> None:
+    """Guard for shared_trunk: its value checkpoint must be head-only (no value backbone). A
+    separate-critic checkpoint would load only the head and SILENTLY drop the trunk warmup (shapes
+    match, so no crash), so reject it explicitly."""
+    from torch.distributed.checkpoint import FileSystemReader
+
+    metadata = FileSystemReader(path).read_metadata()
+    backbone_keys = [k for k in metadata.state_dict_metadata if k.startswith("value_model.model.")]
+    if backbone_keys:
+        raise ValueError(
+            f"value_function.shared_trunk requires a head-only value checkpoint, but {path} contains "
+            f"{len(backbone_keys)} value-backbone keys (e.g. {backbone_keys[0]}). Point init_checkpoint "
+            f"at a shared_trunk warmup checkpoint, not a separate-critic one."
+        )
 
 
 @clean_exit
@@ -167,12 +194,27 @@ def train(config: TrainerConfig):
     if value_config is not None:
         logger.info(f"Initializing value function ({value_config})")
         loading_value_from_ckpt_later = loading_from_ckpt_later or value_config.init_checkpoint is not None
-        value_model = setup_value_model(
-            config.model,
-            parallel_dims,
-            loading_value_from_ckpt_later,
-            value_head_output_size(value_config.loss),
-        )
+        if value_config.shared_trunk:
+            # No separate value backbone: a standalone head reads the live policy trunk's hidden
+            # states (captured via a forward hook during the policy forward). Text-only for now.
+            if config.model.vlm is not None:
+                raise NotImplementedError("value_function.shared_trunk does not support VLM models yet.")
+            text_config = model.config.get_text_config() if hasattr(model.config, "get_text_config") else model.config
+            hidden_size = text_config.hidden_size
+            value_model = setup_shared_value_head(
+                config.model,
+                parallel_dims,
+                hidden_size,
+                value_head_output_size(value_config.loss),
+            )
+        else:
+            value_model = setup_value_model(
+                config.model,
+                parallel_dims,
+                loading_value_from_ckpt_later,
+                value_head_output_size(value_config.loss),
+                head_only=value_config.head_only,
+            )
 
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
@@ -195,12 +237,35 @@ def train(config: TrainerConfig):
         scheduler = setup_scheduler(optimizer, config.scheduler, config.max_steps, config.optim.lr)
         if value_model is not None and value_config is not None:
             logger.info(f"Initializing value optimizer ({value_config.optim})")
-            value_optimizer = setup_optimizer(
-                value_config.optim,
-                list(value_model.named_parameters()),
-                parallel_dims,
-                cpu_offload=config.model.optim_cpu_offload,
-            )
+            # Head-only / shared-trunk: only the value head is optimized. head_only keeps a
+            # separate frozen backbone (grads discarded); shared_trunk has no value backbone at
+            # all (the head reads the live policy trunk). Either way, filter to value-head params.
+            if value_config.head_only or value_config.shared_trunk:
+                value_named_params = [
+                    (name, param) for name, param in value_model.named_parameters() if "value_head" in name
+                ]
+                logger.info(f"Head-only value training: optimizing {len(value_named_params)} value-head params")
+            else:
+                value_named_params = list(value_model.named_parameters())
+            if value_config.trunk_lr is not None and not value_config.head_only:
+                # Differential LR: value head at optim.lr, trunk/backbone at trunk_lr (slow),
+                # to protect the warm-started trunk representation while the head learns fast.
+                logger.info(f"Differential value LR: head={value_config.optim.lr} trunk={value_config.trunk_lr}")
+                value_optimizer = setup_value_optimizer_differential(
+                    value_config.optim,
+                    value_named_params,
+                    head_lr=value_config.optim.lr,
+                    trunk_lr=value_config.trunk_lr,
+                    parallel_dims=parallel_dims,
+                    cpu_offload=config.model.optim_cpu_offload,
+                )
+            else:
+                value_optimizer = setup_optimizer(
+                    value_config.optim,
+                    value_named_params,
+                    parallel_dims,
+                    cpu_offload=config.model.optim_cpu_offload,
+                )
             value_scheduler = setup_scheduler(
                 value_optimizer,
                 value_config.scheduler,
@@ -292,7 +357,13 @@ def train(config: TrainerConfig):
     elif value_config is not None and value_config.init_checkpoint is not None:
         if value_model is None or value_optimizer is None or value_scheduler is None:
             raise RuntimeError("value_function.init_checkpoint requires an initialized value function.")
-        load_value_checkpoint(value_config.init_checkpoint, value_model, [value_optimizer], value_scheduler)
+        if value_config.shared_trunk:
+            _assert_head_only_value_checkpoint(value_config.init_checkpoint)
+        # Warm-start the value model and optimizer, but keep this run's freshly
+        # constructed scheduler — the new run has its own (possibly different-typed)
+        # LR schedule, so restoring the checkpoint's scheduler state is both wrong
+        # and load-incompatible across scheduler types.
+        load_value_checkpoint(value_config.init_checkpoint, value_model, [value_optimizer])
         logger.info(f"Loaded value function checkpoint from {value_config.init_checkpoint}")
 
     logger.info(
@@ -344,6 +415,21 @@ def train(config: TrainerConfig):
         loss_mask = micro_batch["loss_mask"].to("cuda")
         rewards = micro_batch["value_rewards"].to("cuda")
         dones = micro_batch["value_dones"].to("cuda")
+        # Optional global-episode position fraction stamped by the orchestrator
+        # (multi-turn mixture position schedule). None -> trainer falls back to
+        # per-segment response_position_fraction.
+        global_position_fraction = micro_batch.get("value_position_fraction")
+        if global_position_fraction is not None:
+            global_position_fraction = global_position_fraction.to("cuda")
+        episodic_return = micro_batch.get("value_episodic_return")
+        if episodic_return is not None:
+            episodic_return = episodic_return.to("cuda")
+        turn_return = micro_batch.get("value_turn_return")
+        if turn_return is not None:
+            turn_return = turn_return.to("cuda")
+        turn_tether = micro_batch.get("value_turn_tether")
+        if turn_tether is not None:
+            turn_tether = turn_tether.to("cuda")
         routed_experts = micro_batch["routed_experts"].to("cuda") if micro_batch["routed_experts"] is not None else None
 
         if routed_experts is None and config.enable_router_replay:
@@ -380,25 +466,38 @@ def train(config: TrainerConfig):
             "mask": loss_mask,
             "rewards": rewards,
             "dones": dones,
+            "global_position_fraction": global_position_fraction,
+            "episodic_return": episodic_return,
+            "turn_return": turn_return,
+            "turn_tether": turn_tether,
+            # Packed-segment boundaries so align_value_logits shifts per segment (not globally).
+            "sequence_lengths": micro_batch["sequence_lengths"],
         }
 
-    def forward_value_logits(value_inputs: dict[str, torch.Tensor | dict[str, torch.Tensor] | None]) -> torch.Tensor:
+    def forward_value_logits(
+        value_inputs: dict[str, torch.Tensor | dict[str, torch.Tensor] | None],
+        features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Head-only: reuse cached frozen-backbone features and run just the value head.
         with maybe_record_function("value_forward"), maybe_activation_offloading(config.model.ac_offloading):
-            value_logits = predict_value(
-                value_model,
-                value_inputs["input_ids"],
-                value_inputs["position_ids"],
-                mm_kwargs=value_inputs["mm_kwargs"],
-                mm_token_type_ids=value_inputs["mm_token_type_ids"],
-                routed_experts=value_inputs["routed_experts"],
-            )
+            if features is not None:
+                value_logits = value_model.value_head_logits(features)
+            else:
+                value_logits = predict_value(
+                    value_model,
+                    value_inputs["input_ids"],
+                    value_inputs["position_ids"],
+                    mm_kwargs=value_inputs["mm_kwargs"],
+                    mm_token_type_ids=value_inputs["mm_token_type_ids"],
+                    routed_experts=value_inputs["routed_experts"],
+                )
         if cp_enabled:
             value_logits = gather_for_cp(value_logits, cp_group)
-        return align_value_logits(value_logits)
+        return align_value_logits(value_logits, value_inputs.get("sequence_lengths"))
 
     def target_values_required() -> bool:
         assert value_config is not None
-        return value_config.use_gae or value_config.gae_lambda != 1.0
+        return value_config.use_gae or value_config.gae_lambda != 1.0 or value_config.mixture is not None
 
     def backward_value_loss(
         value_logits: torch.Tensor,
@@ -451,23 +550,42 @@ def train(config: TrainerConfig):
         first_value_update: bool,
         value_scale: int,
         tensors: Tensors,
-    ) -> tuple[dict[int, ValueTargets], bool]:
+    ) -> tuple[dict[int, ValueTargets], bool, dict[int, torch.Tensor] | None]:
         if value_model is None or value_config is None:
-            return {}, False
+            return {}, False, None
         if first_value_update and (value_optimizer is None or value_scheduler is None):
             first_value_update = False
 
+        # Head-only: run the frozen backbone once under no_grad and cache detached
+        # features. All value optimizer updates below re-run just the value head on
+        # those features, so updates_per_step does not multiply trunk work.
+        head_only = value_config.head_only
+        do_first_update = first_value_update and not head_only
+        value_features: dict[int, torch.Tensor] | None = {} if head_only else None
+        captured: dict[str, torch.Tensor] = {}
+        hidden_hook = None
+        if head_only:
+
+            def _capture_hidden(_module, _inputs, output):
+                captured["hidden"] = output.last_hidden_state if hasattr(output, "last_hidden_state") else output[0]
+
+            hidden_hook = value_model.model.register_forward_hook(_capture_hidden)
+
         targets = {}
-        if first_value_update:
+        if do_first_update:
             value_optimizer.zero_grad()
         needs_target_values = target_values_required()
         for micro_step, micro_batch in enumerate(micro_batches):
             value_inputs = prepare_value_inputs(micro_batch)
             value_logits = None
-            if first_value_update:
+            if head_only:
+                captured.pop("hidden", None)
+            if do_first_update:
                 value_logits = forward_value_logits(value_inputs)
             with torch.no_grad():
-                if needs_target_values:
+                # Head-only always needs the (no-grad) backbone forward so the hook captures
+                # its hidden states, even when no GAE/mixture target values are required.
+                if needs_target_values or head_only:
                     if value_logits is None:
                         value_logits = forward_value_logits(value_inputs)
                     values = predict_values(value_logits.detach(), value_config.loss)
@@ -482,16 +600,50 @@ def train(config: TrainerConfig):
                     gamma=value_config.gamma,
                     gae_lambda=value_config.gae_lambda,
                 )
+            # Prefer the orchestrator's GLOBAL episode position fraction (across all
+            # turn segments) when present; otherwise fall back to per-segment.
+            if value_inputs.get("global_position_fraction") is not None:
+                position_fraction = value_inputs["global_position_fraction"]
+            else:
+                position_fraction = response_position_fraction(value_inputs["mask"], micro_batch["sequence_lengths"])
+            start_value = broadcast_first_action(values, value_inputs["mask"], micro_batch["sequence_lengths"])
+            turn_start_value = broadcast_action_span_starts(
+                values, value_inputs["mask"], micro_batch["sequence_lengths"]
+            )
+            turn_position_fraction = action_span_position_fraction(
+                value_inputs["mask"], micro_batch["sequence_lengths"]
+            )
+            # Prefer the orchestrator's episode-basis R when present; otherwise single-turn
+            # batches recover it from the first action return.
+            if value_inputs.get("episodic_return") is not None:
+                episodic_return = value_inputs["episodic_return"]
+            else:
+                episodic_return = broadcast_first_action(returns, value_inputs["mask"], micro_batch["sequence_lengths"])
+            turn_return = value_inputs.get("turn_return")
+            turn_tether = value_inputs.get("turn_tether")
             target = ValueTargets(
                 advantages=advantages.detach(),
                 returns=returns.detach(),
                 mask=value_inputs["mask"].detach(),
+                position_fraction=position_fraction.detach(),
+                values=values.detach(),
+                start_value=start_value.detach(),
+                episodic_return=episodic_return.detach(),
+                turn_return=turn_return.detach() if turn_return is not None else None,
+                turn_tether=turn_tether.detach() if turn_tether is not None else None,
+                turn_start_value=turn_start_value.detach(),
+                turn_position_fraction=turn_position_fraction.detach(),
             )
             targets[micro_step] = target
-            if first_value_update:
+            if head_only:
+                assert "hidden" in captured, "head-only backbone forward hook did not fire"
+                value_features[micro_step] = captured["hidden"].detach()
+            if do_first_update:
                 assert value_logits is not None
                 backward_value_loss(value_logits, target, value_scale, tensors)
-        return targets, first_value_update
+        if hidden_hook is not None:
+            hidden_hook.remove()
+        return targets, do_first_update, value_features
 
     def run_value_updates(
         micro_batches,
@@ -499,6 +651,7 @@ def train(config: TrainerConfig):
         update_count: int,
         value_scale: int,
         tensors: Tensors,
+        value_features: dict[int, torch.Tensor] | None = None,
     ) -> ValueUpdateStats:
         if value_model is None or value_config is None or value_optimizer is None or value_scheduler is None:
             return ValueUpdateStats(grad_norm=None, zero_grad_ratio=None)
@@ -508,12 +661,166 @@ def train(config: TrainerConfig):
             value_optimizer.zero_grad()
             for micro_step, micro_batch in enumerate(micro_batches):
                 value_inputs = prepare_value_inputs(micro_batch)
-                value_logits = forward_value_logits(value_inputs)
+                features = value_features[micro_step] if value_features is not None else None
+                value_logits = forward_value_logits(value_inputs, features=features)
                 backward_value_loss(value_logits, value_targets[micro_step], value_scale, tensors)
 
             value_update_stats = finish_value_update()
 
         return value_update_stats
+
+    shared_trunk = value_config is not None and value_config.shared_trunk
+    if shared_trunk and cp_enabled:
+        raise NotImplementedError("value_function.shared_trunk does not support context parallelism yet.")
+
+    def apply_value_advantage(
+        micro_step: int,
+        base_advantages: torch.Tensor,
+        value_targets: dict[int, ValueTargets],
+        tensors: Tensors,
+    ) -> torch.Tensor:
+        """Compute the policy advantage from precomputed value targets (GAE replacement, or the
+        linear / mixed_clipped mixture) and append the mixture/advantage diagnostics. Shared by the
+        standard pre-forward path and the shared-trunk in-loop path so the two stay identical."""
+        if value_config is None or not (value_config.use_gae or value_config.mixture is not None):
+            return base_advantages
+        if value_config.use_gae:
+            return value_targets[micro_step].advantages
+        value_target = value_targets[micro_step]
+        mixture = value_config.mixture
+        group_advantages = base_advantages
+        m = value_target.mask
+        step_scale = mixture_step_scale(mixture, progress.step)
+        reward_range = value_config.loss.reward_range
+        if mixture.kind == "mixed_clipped":
+            rho = mixture_rho(value_target.position_fraction, mixture) * step_scale
+            advantages = mixed_clipped_advantage(
+                group_advantages,
+                value_target.episodic_return,
+                value_target.values,
+                value_target.start_value,
+                alpha=mixture.alpha * step_scale,
+                rho=rho,
+                reward_range=reward_range,
+            )
+            tensors["mixture/alpha"].append(torch.full_like(rho[m], mixture.alpha * step_scale).detach().to("cpu"))
+            tensors["mixture/rho"].append(rho[m].detach().to("cpu"))
+        elif mixture.kind == "turn_anchor":
+            if (
+                value_target.turn_return is None
+                or value_target.turn_tether is None
+                or value_target.turn_start_value is None
+                or value_target.turn_position_fraction is None
+            ):
+                raise ValueError("turn_anchor value mixture requires value_turn_return and value_turn_tether streams")
+            rho = mixture_rho(value_target.turn_position_fraction, mixture) * step_scale
+            advantages = turn_anchor_tether_advantage(
+                value_target.turn_return,
+                value_target.turn_tether,
+                value_target.values,
+                value_target.turn_start_value,
+                alpha=mixture.alpha * step_scale,
+                rho=rho,
+                reward_range=reward_range,
+            )
+            tensors["mixture/alpha"].append(torch.full_like(rho[m], mixture.alpha * step_scale).detach().to("cpu"))
+            tensors["mixture/rho"].append(rho[m].detach().to("cpu"))
+        else:
+            rho = mixture_rho(value_target.position_fraction, mixture) * step_scale
+            advantages = mix_advantages(group_advantages, value_target.advantages, rho)
+            tensors["mixture/rho"].append(rho[m].detach().to("cpu"))
+        tensors["advantage/group"].append(group_advantages[m].detach().to("cpu"))
+        tensors["advantage/value"].append(value_target.advantages[m].detach().to("cpu"))
+        tensors["advantage/mixed"].append(advantages[m].detach().to("cpu"))
+        return advantages
+
+    def build_shared_target(micro_batch, value_inputs, hidden_det: torch.Tensor) -> ValueTargets:
+        """Build value targets for shared_trunk from the policy trunk's DETACHED hidden states.
+        Mirrors build_value_targets' target construction (compute_gae + position fraction + start/
+        episodic broadcasts) but sources features from the policy forward, so no value backbone runs."""
+        assert value_config is not None
+        needs_target_values = value_config.use_gae or value_config.gae_lambda != 1.0 or value_config.mixture is not None
+        with torch.no_grad():
+            if needs_target_values:
+                value_logits = forward_value_logits(value_inputs, features=hidden_det)
+                values = predict_values(value_logits, value_config.loss)
+            else:
+                values = torch.zeros_like(value_inputs["rewards"], dtype=torch.float32)
+            advantages, returns = compute_gae(
+                rewards=value_inputs["rewards"],
+                dones=value_inputs["dones"],
+                values=values,
+                mask=value_inputs["mask"],
+                sequence_lengths=micro_batch["sequence_lengths"],
+                gamma=value_config.gamma,
+                gae_lambda=value_config.gae_lambda,
+            )
+        if value_inputs.get("global_position_fraction") is not None:
+            position_fraction = value_inputs["global_position_fraction"]
+        else:
+            position_fraction = response_position_fraction(value_inputs["mask"], micro_batch["sequence_lengths"])
+        start_value = broadcast_first_action(values, value_inputs["mask"], micro_batch["sequence_lengths"])
+        turn_start_value = broadcast_action_span_starts(values, value_inputs["mask"], micro_batch["sequence_lengths"])
+        turn_position_fraction = action_span_position_fraction(value_inputs["mask"], micro_batch["sequence_lengths"])
+        if value_inputs.get("episodic_return") is not None:
+            episodic_return = value_inputs["episodic_return"]
+        else:
+            episodic_return = broadcast_first_action(returns, value_inputs["mask"], micro_batch["sequence_lengths"])
+        turn_return = value_inputs.get("turn_return")
+        turn_tether = value_inputs.get("turn_tether")
+        return ValueTargets(
+            advantages=advantages.detach(),
+            returns=returns.detach(),
+            mask=value_inputs["mask"].detach(),
+            position_fraction=position_fraction.detach(),
+            values=values.detach(),
+            start_value=start_value.detach(),
+            episodic_return=episodic_return.detach(),
+            turn_return=turn_return.detach() if turn_return is not None else None,
+            turn_tether=turn_tether.detach() if turn_tether is not None else None,
+            turn_start_value=turn_start_value.detach(),
+            turn_position_fraction=turn_position_fraction.detach(),
+        )
+
+    def register_policy_hidden_hook(captured: dict) -> "torch.utils.hooks.RemovableHandle":
+        """Hook the POLICY backbone so its post-norm hidden states (the tensor lm_head consumes) are
+        captured during the policy's own forward — reused for the value head with zero extra trunk forward."""
+
+        def _capture(_module, _inputs, output):
+            captured["hidden"] = output.last_hidden_state if hasattr(output, "last_hidden_state") else output[0]
+
+        return model.model.register_forward_hook(_capture)
+
+    def build_shared_warmup_targets(micro_batches):
+        """Warmup has no policy forward, so run ONE no-grad policy-trunk forward per micro-batch to
+        capture hidden, build targets, and cache detached features for the (head-only) warmup updates.
+        Reshard the policy afterwards: a no-grad-only forward can leave the [lm_head, norm] FSDP group
+        unsharded, which crashes the pre-backward warmup checkpoint save with a Tensor/DTensor mix."""
+        captured: dict[str, torch.Tensor] = {}
+        hook = register_policy_hidden_hook(captured)
+        targets: dict[int, ValueTargets] = {}
+        features: dict[int, torch.Tensor] = {}
+        try:
+            for micro_step, micro_batch in enumerate(micro_batches):
+                value_inputs = prepare_value_inputs(micro_batch)
+                # Run the full policy forward via the root `forward()` (not model.model directly): the
+                # FSDP root's pre-hook unshards the trunk params, so the hook captures a real hidden
+                # tensor. Calling the backbone submodule directly leaves embed_tokens a sharded
+                # DTensor ("aten.embedding got mixed Tensor and DTensor"). no_grad: warmup, no policy loss.
+                input_ids = micro_batch["input_ids"].to("cuda")
+                position_ids = micro_batch["position_ids"].to("cuda")
+                temperatures = micro_batch["temperatures"].to("cuda")
+                with torch.no_grad():
+                    forward(
+                        model, input_ids, position_ids, labels=shift_tensor_left(input_ids), temperature=temperatures
+                    )
+                hidden_det = captured["hidden"].detach()
+                features[micro_step] = hidden_det
+                targets[micro_step] = build_shared_target(micro_batch, value_inputs, hidden_det)
+        finally:
+            hook.remove()
+        reshard_module(model)
+        return targets, features
 
     while True:
         # Reset peak memory stats
@@ -668,12 +975,23 @@ def train(config: TrainerConfig):
             value_update_count = (
                 value_config.warmup_updates_per_batch if is_value_warmup else value_config.updates_per_step
             )
-        value_targets, first_value_update_done = build_value_targets(
-            micro_batches,
-            first_value_update=value_update_count > 0,
-            value_scale=value_scale,
-            tensors=tensors,
-        )
+        # shared_trunk builds targets from the policy trunk's hidden states: during warmup via a
+        # one-off no-grad trunk forward, during a train step inline in the policy micro loop (below).
+        policy_hidden_capture: dict[str, torch.Tensor] = {}
+        if shared_trunk:
+            first_value_update_done = False
+            value_features = {}
+            if is_value_warmup:
+                value_targets, value_features = build_shared_warmup_targets(micro_batches)
+            else:
+                value_targets = {}
+        else:
+            value_targets, first_value_update_done, value_features = build_value_targets(
+                micro_batches,
+                first_value_update=value_update_count > 0,
+                value_scale=value_scale,
+                tensors=tensors,
+            )
         value_update_stats = ValueUpdateStats(grad_norm=None, zero_grad_ratio=None)
         if first_value_update_done:
             value_update_stats = finish_value_update()
@@ -688,6 +1006,7 @@ def train(config: TrainerConfig):
                     value_update_count,
                     value_scale,
                     tensors,
+                    value_features=value_features,
                 )
             forward_backward_time = time.perf_counter() - forward_backward_start_time
             if memory_profiler is not None:
@@ -710,6 +1029,11 @@ def train(config: TrainerConfig):
                 )
                 save_ckpt_time += time.perf_counter() - save_ckpt_start_time
                 ckpt_manager.maybe_clean()
+
+                if value_config.export_warmup_checkpoint and value_optimizer is not None:
+                    value_only_path = ckpt_manager.ckpt_dir / "value_warmup_checkpoint"
+                    logger.info(f"Exporting value-only warmup checkpoint to {value_only_path}")
+                    save_value_checkpoint(value_only_path, value_model, [value_optimizer], value_scheduler)
 
             step_time = time.perf_counter() - step_start_time
             peak_memory = torch.cuda.max_memory_reserved() / 1024**3
@@ -749,8 +1073,11 @@ def train(config: TrainerConfig):
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")
-            if value_config is not None and value_config.use_gae:
-                advantages = value_targets[micro_step].advantages
+            # shared_trunk defers the value advantage until after the policy forward (its V_t comes
+            # from the trunk hidden states captured during that forward). The standard path has the
+            # value targets ready here and applies the GAE/mixture advantage up front.
+            if not shared_trunk:
+                advantages = apply_value_advantage(micro_step, advantages, value_targets, tensors)
             loss_mask = micro_batch["loss_mask"].to("cuda")
             inference_logprobs = micro_batch["inference_logprobs"].to("cuda")
             ref_logprobs = micro_batch["ref_logprobs"].to("cuda") if micro_batch["ref_logprobs"] is not None else None
@@ -818,18 +1145,37 @@ def train(config: TrainerConfig):
             if cp_enabled:
                 temperatures = shard_for_cp(temperatures, cp_rank=cp_rank, cp_world_size=cp_size)
 
-            # Forward pass with per-token temperatures
-            with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
-                out = forward(
-                    model,
-                    input_ids,
-                    forward_position_ids,
-                    labels=labels,
-                    temperature=temperatures,
-                    mm_kwargs=mm_kwargs,
-                    mm_token_type_ids=mm_token_type_ids,
-                    routed_experts=routed_experts,
-                )
+            # Forward pass with per-token temperatures. For shared_trunk, hook the policy trunk only
+            # around THIS forward (removed in finally, so the hook never outlives the forward or
+            # accumulates across steps) to capture its post-norm hidden states for the value head.
+            shared_hook = register_policy_hidden_hook(policy_hidden_capture) if shared_trunk else None
+            try:
+                with maybe_record_function("forward"), maybe_activation_offloading(config.model.ac_offloading):
+                    out = forward(
+                        model,
+                        input_ids,
+                        forward_position_ids,
+                        labels=labels,
+                        temperature=temperatures,
+                        mm_kwargs=mm_kwargs,
+                        mm_token_type_ids=mm_token_type_ids,
+                        routed_experts=routed_experts,
+                    )
+            finally:
+                if shared_hook is not None:
+                    shared_hook.remove()
+
+            if shared_trunk:
+                # Reuse the trunk hidden states captured during THIS policy forward (via the hook) —
+                # no extra trunk pass. Detaching severs the policy graph so the value loss (run after
+                # the policy update, on these cached features) can never reach the trunk. Build the
+                # value targets now so the deferred value advantage uses V_t under the current trunk.
+                assert "hidden" in policy_hidden_capture, "shared_trunk hook did not capture policy hidden states"
+                hidden_det = policy_hidden_capture["hidden"].detach()
+                value_features[micro_step] = hidden_det
+                value_inputs = prepare_value_inputs(micro_batch)
+                value_targets[micro_step] = build_shared_target(micro_batch, value_inputs, hidden_det)
+                advantages = apply_value_advantage(micro_step, advantages, value_targets, tensors)
 
             if out.get("logprobs") is None:
                 # VanillaOutputLinear was used - need to compute logprobs externally with per-token temps
@@ -983,6 +1329,7 @@ def train(config: TrainerConfig):
                 value_update_count,
                 value_scale,
                 tensors,
+                value_features=value_features,
             )
 
         if config.max_concurrent_runs == 1:

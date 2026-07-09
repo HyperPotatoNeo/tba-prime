@@ -21,7 +21,7 @@ import uuid
 from collections import defaultdict
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
-from prime_rl.orchestrator.algo.routing import stamp_value_returns
+from prime_rl.orchestrator.algo.routing import stamp_turn_anchor_tethers, stamp_value_returns
 from prime_rl.orchestrator.envs import TrainEnvs
 from prime_rl.orchestrator.filters import RolloutFilter, apply_filters
 from prime_rl.orchestrator.metrics import TrainRollouts
@@ -195,6 +195,7 @@ class TrainSink:
         if self.config.value_function:
             for rollout in survivors:
                 stamp_value_returns(rollout)
+            stamp_turn_anchor_tethers(survivors)
 
         # The env has a single sampling temperature; fan it out per token
         # (context tokens are masked out, so their temperature is don't-care).

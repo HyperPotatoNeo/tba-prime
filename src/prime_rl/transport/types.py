@@ -74,6 +74,21 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # learning. These are raw env rewards, not KL-shaped policy advantages.
     value_rewards: list[float] | None = None
     value_dones: list[bool] | None = None
+    # Per-token GLOBAL episode position fraction (0->1 across the whole episode's
+    # concatenated response tokens over ALL turn segments; 0.0 on non-sampled
+    # tokens). Set by the orchestrator for multi-turn rollouts so the mixture's
+    # position schedule ramps over global response length, not within one turn.
+    value_position_fraction: list[float] | None = None
+    # Per-token GLOBAL episode return R (rollout.reward on sampled tokens, 0.0
+    # elsewhere). Set by the orchestrator for multi-turn rollouts so the TETHER
+    # baseline can reconstruct the group anchor B_group = R - group_advantage;
+    # each turn is its own trainer sequence, so R isn't recoverable per-sequence.
+    value_episodic_return: list[float] | None = None
+    # Turn-anchor TETHER streams, aligned to token_ids and set on sampled tokens:
+    # value_turn_return is G_m (return-to-go from this assistant turn), and
+    # value_turn_tether is the group mean of G_m for rollouts that reached turn m.
+    value_turn_return: list[float] | None = None
+    value_turn_tether: list[float] | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -118,9 +133,13 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # Per-token value targets (see TrainingSample).
     value_rewards: list[float] | None = None
     value_dones: list[bool] | None = None
+    value_position_fraction: list[float] | None = None
+    value_episodic_return: list[float] | None = None
 
     # Packer-derived metadata used for run-local token exports.
     run_id: str | None = None
     run_step: int | None = None
     phase: Literal["train", "value_warmup"] = "train"
     save_checkpoint: bool = False
+    value_turn_return: list[float] | None = None
+    value_turn_tether: list[float] | None = None

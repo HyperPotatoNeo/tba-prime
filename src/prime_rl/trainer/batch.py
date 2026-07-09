@@ -146,6 +146,18 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     ref_kl_weights = list(training_example.ref_kl_weights) if training_example.ref_kl_weights is not None else None
     value_rewards = list(training_example.value_rewards) if training_example.value_rewards is not None else None
     value_dones = list(training_example.value_dones) if training_example.value_dones is not None else None
+    value_position_fraction = (
+        list(training_example.value_position_fraction) if training_example.value_position_fraction is not None else None
+    )
+    value_episodic_return = (
+        list(training_example.value_episodic_return) if training_example.value_episodic_return is not None else None
+    )
+    value_turn_return = (
+        list(training_example.value_turn_return) if training_example.value_turn_return is not None else None
+    )
+    value_turn_tether = (
+        list(training_example.value_turn_tether) if training_example.value_turn_tether is not None else None
+    )
     position_ids = list(range(len(input_ids)))
     mm_token_type_ids = training_example.mm_token_type_ids
     mm_kwargs = training_example.mm_kwargs
@@ -188,6 +200,14 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
             value_rewards = value_rewards[:cut]
         if value_dones is not None:
             value_dones = value_dones[:cut]
+        if value_position_fraction is not None:
+            value_position_fraction = value_position_fraction[:cut]
+        if value_episodic_return is not None:
+            value_episodic_return = value_episodic_return[:cut]
+        if value_turn_return is not None:
+            value_turn_return = value_turn_return[:cut]
+        if value_turn_tether is not None:
+            value_turn_tether = value_turn_tether[:cut]
         if routed_experts is not None:
             routed_experts = _slice_routed_experts(routed_experts, cut)
         if mm_token_type_ids is not None:
@@ -212,6 +232,10 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         ("ref_kl_weights", ref_kl_weights),
         ("value_rewards", value_rewards),
         ("value_dones", value_dones),
+        ("value_position_fraction", value_position_fraction),
+        ("value_episodic_return", value_episodic_return),
+        ("value_turn_return", value_turn_return),
+        ("value_turn_tether", value_turn_tether),
     ):
         if stream is not None:
             assert len(stream) == len(input_ids), f"{stream_name}: {len(stream)}"
@@ -246,6 +270,10 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
         ref_kl_weights=ref_kl_weights,
         value_rewards=value_rewards,
         value_dones=value_dones,
+        value_position_fraction=value_position_fraction,
+        value_episodic_return=value_episodic_return,
+        value_turn_return=value_turn_return,
+        value_turn_tether=value_turn_tether,
     )
 
 
@@ -311,6 +339,10 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     has_mm_token_type_ids = any(sample.mm_token_type_ids is not None for _, sample in bin_content.samples)
     has_value_rewards = any(sample.value_rewards is not None for _, sample in bin_content.samples)
     has_value_dones = any(sample.value_dones is not None for _, sample in bin_content.samples)
+    has_value_position_fraction = any(sample.value_position_fraction is not None for _, sample in bin_content.samples)
+    has_value_episodic_return = any(sample.value_episodic_return is not None for _, sample in bin_content.samples)
+    has_value_turn_return = any(sample.value_turn_return is not None for _, sample in bin_content.samples)
+    has_value_turn_tether = any(sample.value_turn_tether is not None for _, sample in bin_content.samples)
     # A weight stream materializes as soon as one packed sample carries it; the
     # samples that lack it get the stream's identity fill (STREAM_FILL).
     has_stream = {name: any(getattr(s, name) is not None for _, s in bin_content.samples) for name in STREAM_FILL}
@@ -327,6 +359,10 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
     streams: dict[str, list[float] | None] = {name: ([] if has_stream[name] else None) for name in STREAM_FILL}
     value_rewards: list[float] | None = [] if has_value_rewards else None
     value_dones: list[bool] | None = [] if has_value_dones else None
+    value_position_fraction: list[float] | None = [] if has_value_position_fraction else None
+    value_episodic_return: list[float] | None = [] if has_value_episodic_return else None
+    value_turn_return: list[float] | None = [] if has_value_turn_return else None
+    value_turn_tether: list[float] | None = [] if has_value_turn_tether else None
     routed_experts: RoutedExperts | None = None
     lora_num_tokens = [0] * num_loras
 
@@ -350,6 +386,22 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
             value_rewards.extend(sample.value_rewards if sample.value_rewards is not None else [0.0] * sample_len)
         if value_dones is not None:
             value_dones.extend(sample.value_dones if sample.value_dones is not None else [False] * sample_len)
+        if value_position_fraction is not None:
+            value_position_fraction.extend(
+                sample.value_position_fraction if sample.value_position_fraction is not None else [0.0] * sample_len
+            )
+        if value_episodic_return is not None:
+            value_episodic_return.extend(
+                sample.value_episodic_return if sample.value_episodic_return is not None else [0.0] * sample_len
+            )
+        if value_turn_return is not None:
+            value_turn_return.extend(
+                sample.value_turn_return if sample.value_turn_return is not None else [0.0] * sample_len
+            )
+        if value_turn_tether is not None:
+            value_turn_tether.extend(
+                sample.value_turn_tether if sample.value_turn_tether is not None else [0.0] * sample_len
+            )
         if mm_token_type_ids is not None:
             mm_token_type_ids.extend(
                 sample.mm_token_type_ids if sample.mm_token_type_ids is not None else [0] * sample_len
@@ -387,6 +439,10 @@ def _materialize_bin(bin_content: _MicroBatchBin, num_loras: int) -> MicroBatch:
         ref_kl_weights=streams["ref_kl_weights"],
         value_rewards=value_rewards,
         value_dones=value_dones,
+        value_position_fraction=value_position_fraction,
+        value_episodic_return=value_episodic_return,
+        value_turn_return=value_turn_return,
+        value_turn_tether=value_turn_tether,
     )
 
 
@@ -504,6 +560,14 @@ def pad_micro_batch(micro_batch: MicroBatch, pad_to_multiple_of: int) -> MicroBa
         micro_batch.value_rewards.extend([0.0] * padding_size)
     if micro_batch.value_dones is not None:
         micro_batch.value_dones.extend([False] * padding_size)
+    if micro_batch.value_position_fraction is not None:
+        micro_batch.value_position_fraction.extend([0.0] * padding_size)
+    if micro_batch.value_episodic_return is not None:
+        micro_batch.value_episodic_return.extend([0.0] * padding_size)
+    if micro_batch.value_turn_return is not None:
+        micro_batch.value_turn_return.extend([0.0] * padding_size)
+    if micro_batch.value_turn_tether is not None:
+        micro_batch.value_turn_tether.extend([0.0] * padding_size)
     if micro_batch.lora_num_tokens is not None:
         micro_batch.lora_num_tokens[-1] += (
             padding_size  # We send padding to the last lora so that tokens have ascending lora idx
@@ -535,6 +599,10 @@ def _assert_token_arrays_aligned(micro_batch: MicroBatch) -> None:
         "ref_kl_weights",
         "value_rewards",
         "value_dones",
+        "value_position_fraction",
+        "value_episodic_return",
+        "value_turn_return",
+        "value_turn_tether",
         "mm_token_type_ids",
     )
     for name in per_token_fields:
@@ -563,6 +631,10 @@ def _make_dummy_batch(source: MicroBatch) -> MicroBatch:
     dummy.ref_kl_weights = None
     dummy.value_rewards = None
     dummy.value_dones = None
+    dummy.value_position_fraction = None
+    dummy.value_episodic_return = None
+    dummy.value_turn_return = None
+    dummy.value_turn_tether = None
     return dummy
 
 
