@@ -1,5 +1,5 @@
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import torch
@@ -14,6 +14,7 @@ from prime_rl.utils.utils import get_ckpt_dir, get_step_path
 class Progress:
     step: int = 0
     total_tokens: int = 0
+    total_flops: float = 0.0
     total_samples: int = 0
     total_problems: int = 0
 
@@ -59,9 +60,15 @@ class CheckpointManager:
             with open(ckpt_path / "progress.pt", "rb") as f:
                 state = torch.load(f, weights_only=False)
 
-            # Set progress in-place
-            for key, value in asdict(state["progress"]).items():
-                setattr(progress, key, value)
+            # Set progress in-place. Missing fields keep their default so
+            # checkpoints from older versions remain resumable.
+            loaded_progress = state["progress"]
+            for field in fields(progress):
+                setattr(
+                    progress,
+                    field.name,
+                    getattr(loaded_progress, field.name, getattr(progress, field.name)),
+                )
 
         # Load buffer
         if self.config.skip_buffer:

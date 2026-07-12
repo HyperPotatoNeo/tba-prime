@@ -4,6 +4,7 @@ import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 import tomli_w
 
@@ -32,7 +33,7 @@ monkey_patch_chat_completion_logprobs()
 
 import pandas as pd
 import verifiers as vf
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
@@ -74,6 +75,154 @@ from prime_rl.utils.utils import (
 # pod terminates instead of sitting wedged forever. The training checkpoint
 # and artifacts are persisted *before* this point, so a forced exit is safe.
 SHUTDOWN_TIMEOUT_S = 300
+
+
+@dataclass(frozen=True)
+class FlopProfile:
+    dense_per_token: float
+    lm_head_per_decode_token: float
+    attention_per_context_token: float
+    num_layers: int
+    hidden_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    intermediate_size: int
+    vocab_size: int
+
+
+@dataclass
+class FlopEstimate:
+    dense: float = 0.0
+    attention: float = 0.0
+    lm_head: float = 0.0
+
+    @property
+    def total(self) -> float:
+        return self.dense + self.attention + self.lm_head
+
+
+def _get_config_int(model_config, *names: str) -> int:
+    for name in names:
+        value = getattr(model_config, name, None)
+        if value is not None:
+            return int(value)
+    raise ValueError(f"model config is missing required field(s): {', '.join(names)}")
+
+
+def _build_flop_profile(model_config) -> FlopProfile:
+    num_layers = _get_config_int(model_config, "num_hidden_layers", "n_layer", "num_layers")
+    hidden_size = _get_config_int(model_config, "hidden_size", "n_embd", "d_model")
+    num_attention_heads = _get_config_int(model_config, "num_attention_heads", "n_head")
+    num_key_value_heads = int(getattr(model_config, "num_key_value_heads", num_attention_heads))
+    intermediate_size = _get_config_int(model_config, "intermediate_size", "ffn_hidden_size")
+    vocab_size = _get_config_int(model_config, "vocab_size")
+    head_dim = int(getattr(model_config, "head_dim", hidden_size // num_attention_heads))
+
+    q_dim = num_attention_heads * head_dim
+    kv_dim = num_key_value_heads * head_dim
+    dense_params_per_layer = (
+        hidden_size * q_dim
+        + 2 * hidden_size * kv_dim
+        + q_dim * hidden_size
+        + 3 * hidden_size * intermediate_size
+    )
+    dense_per_token = 2.0 * num_layers * dense_params_per_layer
+    lm_head_per_decode_token = 2.0 * hidden_size * vocab_size
+    attention_per_context_token = 4.0 * num_layers * num_attention_heads * head_dim
+
+    return FlopProfile(
+        dense_per_token=dense_per_token,
+        lm_head_per_decode_token=lm_head_per_decode_token,
+        attention_per_context_token=attention_per_context_token,
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=head_dim,
+        intermediate_size=intermediate_size,
+        vocab_size=vocab_size,
+    )
+
+
+def _sum_capped_context(seq_len: int, context_cap: int | None) -> int:
+    if seq_len <= 0:
+        return 0
+    if context_cap is None or context_cap <= 0 or seq_len <= context_cap:
+        return seq_len * (seq_len + 1) // 2
+    return context_cap * (context_cap + 1) // 2 + (seq_len - context_cap) * context_cap
+
+
+def _compaction_context_cap(events) -> int | None:
+    if not events:
+        return None
+
+    cap = 0
+    for event in events:
+        if event.event_kind != 0:
+            continue
+        if event.kept_indices:
+            physical_after = len(event.kept_indices)
+        elif event.position_offset_after > 0:
+            physical_after = (
+                event.num_prompt_tokens
+                + event.num_output_tokens_at_compaction
+                - event.position_offset_after
+            )
+        else:
+            physical_after = 0
+        cap = max(cap, physical_after)
+    return cap or None
+
+
+def _add_length_flops(
+    estimate: FlopEstimate,
+    profile: FlopProfile,
+    prefill_tokens: int,
+    decode_tokens: int,
+    attention_seq_len: int,
+    attention_context_cap: int | None,
+) -> None:
+    computed_tokens = prefill_tokens + decode_tokens
+    estimate.dense += profile.dense_per_token * computed_tokens
+    estimate.lm_head += profile.lm_head_per_decode_token * decode_tokens
+    estimate.attention += profile.attention_per_context_token * _sum_capped_context(
+        attention_seq_len,
+        attention_context_cap,
+    )
+
+
+def _estimate_batch_flops(
+    profile: FlopProfile,
+    samples: list[TrainingSample],
+) -> FlopEstimate:
+    estimate = FlopEstimate()
+    for sample in samples:
+        if sample.calls:
+            for call in sample.calls:
+                prefill_tokens = len(call.submitted_prompt_ids)
+                decode_tokens = len(call.completion_ids)
+                _add_length_flops(
+                    estimate,
+                    profile,
+                    prefill_tokens=prefill_tokens,
+                    decode_tokens=decode_tokens,
+                    attention_seq_len=prefill_tokens + decode_tokens,
+                    attention_context_cap=_compaction_context_cap(call.compaction_events),
+                )
+            continue
+
+        decode_tokens = sum(sample.completion_mask)
+        seq_len = len(sample.prompt_ids) + len(sample.completion_mask)
+        _add_length_flops(
+            estimate,
+            profile,
+            prefill_tokens=seq_len - decode_tokens,
+            decode_tokens=decode_tokens,
+            attention_seq_len=seq_len,
+            attention_context_cap=_compaction_context_cap(sample.compaction_events),
+        )
+    return estimate
 
 
 @clean_exit
@@ -139,6 +288,20 @@ async def orchestrate(config: OrchestratorConfig):
     # Load tokenizer and processor (processor only for VLM models)
     logger.info(f"Initializing tokenizer for {config.model.name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
+    model_config = AutoConfig.from_pretrained(config.model.name, trust_remote_code=config.model.trust_remote_code)
+    try:
+        flop_profile = _build_flop_profile(model_config)
+    except ValueError as exc:
+        logger.warning(f"Approximate FLOPs logging disabled: {exc}")
+        flop_profile = None
+    else:
+        logger.info(
+            "Approximate FLOPs logging enabled "
+            f"(layers={flop_profile.num_layers}, hidden={flop_profile.hidden_size}, "
+            f"heads={flop_profile.num_attention_heads}, kv_heads={flop_profile.num_key_value_heads}, "
+            f"head_dim={flop_profile.head_dim}, intermediate={flop_profile.intermediate_size}, "
+            f"vocab={flop_profile.vocab_size})"
+        )
 
     # Install block-aligned message padding interceptor (kv-eviction). No-op
     # passthrough when compaction_padding.enabled is False.
@@ -724,6 +887,9 @@ async def orchestrate(config: OrchestratorConfig):
         progress.total_tokens += num_tokens
         progress.total_samples += num_rollouts
         progress.total_problems += num_unique_examples
+        flop_estimate = _estimate_batch_flops(flop_profile, train_examples) if flop_profile is not None else None
+        if flop_estimate is not None:
+            progress.total_flops += flop_estimate.total
 
         def compute_solve_rates(df):
             """Compute solve_none, solve_all, effective_batch_size for a set of rollouts."""
@@ -804,6 +970,25 @@ async def orchestrate(config: OrchestratorConfig):
             # W&B axis
             "step": progress.step,
         }
+
+        if flop_estimate is not None:
+            to_log.update(
+                {
+                    "flops/approx_step": flop_estimate.total,
+                    "flops/approx_step_pflops": flop_estimate.total / 1e15,
+                    "flops/approx_total": progress.total_flops,
+                    "flops/approx_total_pflops": progress.total_flops / 1e15,
+                    "flops/approx_dense_step": flop_estimate.dense,
+                    "flops/approx_attention_step": flop_estimate.attention,
+                    "flops/approx_lm_head_step": flop_estimate.lm_head,
+                    "flops/approx_tflops_per_s": (
+                        flop_estimate.total / step_time / 1e12 if step_time > 0 else 0.0
+                    ),
+                    "flops/approx_attention_fraction": (
+                        flop_estimate.attention / flop_estimate.total if flop_estimate.total > 0 else 0.0
+                    ),
+                }
+            )
 
         # Per-env metrics
         per_env_columns = [
