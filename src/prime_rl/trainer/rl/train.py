@@ -110,6 +110,7 @@ from prime_rl.trainer.multi_ckpt import setup_multi_checkpoint_manager
 from prime_rl.trainer.optim import setup_optimizer, setup_multi_optimizer
 from prime_rl.trainer.scheduler import setup_scheduler, setup_multi_scheduler
 from prime_rl.configs.trainer import DefaultLossConfig, TrainerConfig
+from prime_rl.trainer.batch import requires_segmented_forward
 from prime_rl.trainer.rl.data import DataLoader, FakeDataLoader
 from prime_rl.trainer.rl.microbatch_stacking import (
     compaction_metric_events_by_row,
@@ -127,6 +128,7 @@ from prime_rl.utils.cp import (
     shard_for_cp,
 )
 from prime_rl.utils.logger import setup_logger
+from prime_rl.transport.types import COMPACTION_REPLAY_MODE_PREFILL_TRIM
 from prime_rl.trainer.rl.loss import (
     compute_entropy,
     compute_loss,
@@ -1183,10 +1185,32 @@ def train(config: TrainerConfig):
             # contiguous shapes the packed text forward needed. See
             # plans/phase3_training_integration.md D5 section.
             compaction_events = micro_batch.get("compaction_events") or []
-            use_segmented = config.compaction.window_size > 0
+            replay_mode = int(micro_batch.get("compaction_replay_mode", 0))
+            prefill_trim_replay = (
+                replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+            )
+            calls_obj = micro_batch.get("calls")
+            if prefill_trim_replay:
+                if compaction_events or calls_obj is not None:
+                    raise ValueError(
+                        "prefill_trim MicroBatch must clear compaction_events "
+                        "and calls before trainer dispatch"
+                    )
+                if (
+                    teacher_logprobs is not None
+                    or routed_experts is not None
+                    or pixel_values is not None
+                ):
+                    raise ValueError(
+                        "prefill_trim MicroBatch carries incompatible teacher, "
+                        "router, or multimodal metadata"
+                    )
+            use_segmented = requires_segmented_forward(
+                config.compaction.window_size,
+                replay_mode,
+            )
             use_per_call = False
             use_flex_mask = False
-            calls_obj = micro_batch.get("calls")
             horizontal_flex_compaction = (
                 micro_batch.get("flex_stack_mode") == "horizontal"
             )
@@ -1226,14 +1250,16 @@ def train(config: TrainerConfig):
 
             if use_segmented:
                 assert segmented_forward is not None, (
-                    "Micro batch carries compaction_events but the "
+                    "Micro batch requires segmented replay but the "
                     "kv_eviction package is not importable. Install kv_eviction "
                     "or disable compaction on the inference engine."
                 )
-                assert config.compaction.window_size > 0, (
-                    "Micro batch has compaction_events but trainer config "
-                    "compaction.window_size is 0. The trainer's compaction "
-                    "config must mirror the inference engine's config."
+                assert (
+                    config.compaction.window_size > 0 or prefill_trim_replay
+                ), (
+                    "Micro batch requires segmented replay but trainer config "
+                    "compaction.window_size is 0 and no prefill_trim replay "
+                    "discriminator is present."
                 )
                 assert config.model.attn in {"flash_attention_2", "flex_attention"}, (
                     f"Compaction requires attn='flash_attention_2' for cache replay "
@@ -1275,35 +1301,39 @@ def train(config: TrainerConfig):
                         f"input_ids.shape={tuple(input_ids.shape)}. Check "
                         f"prepare_batch / _is_compaction_sample partitioning."
                     )
-                    bs = config.compaction.block_size
-                    pp = config.compaction.protected_prefix_tokens
-                    if pp == -1:
-                        # Auto-detect: infer from first compaction event's
-                        # position_offset_after and tokens_evicted. The first
-                        # eviction starts at the block-aligned protected prefix,
-                        # so offset_after - evicted gives us the eviction start.
-                        # Under D5 unified dispatch, event-less samples also
-                        # pass through this branch; in that case pp is unused
-                        # downstream (no eviction math needed) — fall back to
-                        # mb_prompt_len so the effective-prompt calc is a no-op.
-                        if compaction_events:
-                            first_evt = compaction_events[0]
-                            pp = (
-                                first_evt.position_offset_after
-                                - first_evt.tokens_evicted
-                            )
-                        else:
-                            pp = mb_prompt_len
-                    effective_prompt_len = (
-                        min(pp, mb_prompt_len) if pp > 0 else mb_prompt_len
-                    )
-                    prompt_aligned_len = (
-                        (effective_prompt_len + bs - 1) // bs
-                    ) * bs
-                    segment_boundaries = [
-                        int(e.num_output_tokens_at_compaction)
-                        for e in compaction_events
-                    ]
+                    if prefill_trim_replay:
+                        prompt_aligned_len = mb_prompt_len
+                        segment_boundaries = []
+                    else:
+                        bs = config.compaction.block_size
+                        pp = config.compaction.protected_prefix_tokens
+                        if pp == -1:
+                            # Auto-detect: infer from first compaction event's
+                            # position_offset_after and tokens_evicted. The first
+                            # eviction starts at the block-aligned protected prefix,
+                            # so offset_after - evicted gives us the eviction start.
+                            # Under D5 unified dispatch, event-less samples also
+                            # pass through this branch; in that case pp is unused
+                            # downstream (no eviction math needed) — fall back to
+                            # mb_prompt_len so the effective-prompt calc is a no-op.
+                            if compaction_events:
+                                first_evt = compaction_events[0]
+                                pp = (
+                                    first_evt.position_offset_after
+                                    - first_evt.tokens_evicted
+                                )
+                            else:
+                                pp = mb_prompt_len
+                        effective_prompt_len = (
+                            min(pp, mb_prompt_len) if pp > 0 else mb_prompt_len
+                        )
+                        prompt_aligned_len = (
+                            (effective_prompt_len + bs - 1) // bs
+                        ) * bs
+                        segment_boundaries = [
+                            int(e.num_output_tokens_at_compaction)
+                            for e in compaction_events
+                        ]
                 else:
                     assert (
                         config.compaction.masked_forward_dispatch == "flex_attention"
@@ -1349,7 +1379,8 @@ def train(config: TrainerConfig):
                 # structural fix for ADMISSION (multi-turn KL gap) and
                 # doesn't duplicate mid-gen handling.
                 use_flex_mask_local = (
-                    config.compaction.masked_forward_dispatch == "flex_attention"
+                    not prefill_trim_replay
+                    and config.compaction.masked_forward_dispatch == "flex_attention"
                     and micro_batch.get("calls") is not None
                     and (
                         (
@@ -1375,7 +1406,8 @@ def train(config: TrainerConfig):
                     )
                 )
                 use_per_call_local = (
-                    config.compaction.per_call_dispatch
+                    not prefill_trim_replay
+                    and config.compaction.per_call_dispatch
                     and per_call_segmented_forward is not None
                     and micro_batch.get("calls") is not None
                     and not batched_flex_compaction
@@ -1437,6 +1469,7 @@ def train(config: TrainerConfig):
                 if (
                     config.compaction.masked_forward_dispatch == "flex_attention"
                     and not use_flex_mask
+                    and not prefill_trim_replay
                 ):
                     raise ValueError(
                         "trainer.compaction.masked_forward_dispatch='flex_attention' "
@@ -1448,6 +1481,7 @@ def train(config: TrainerConfig):
                 if (
                     not use_per_call
                     and not use_flex_mask
+                    and not prefill_trim_replay
                     and config.compaction.bptt_segments != 1
                     and dist.is_initialized()
                     and dist.get_world_size() > 1
@@ -2726,7 +2760,11 @@ def train(config: TrainerConfig):
                             segment_boundaries=segment_boundaries,
                             prompt_len=mb_prompt_len,
                             prompt_aligned_len=prompt_aligned_len,
-                            stride=config.compaction.stride,
+                            stride=(
+                                max(1, config.compaction.stride)
+                                if prefill_trim_replay
+                                else config.compaction.stride
+                            ),
                             temperature=temperatures,
                             max_forward_passes=max_forwards,
                             loss_fn=_segment_loss_fn,

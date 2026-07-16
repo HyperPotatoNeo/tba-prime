@@ -4,6 +4,7 @@ import torch
 
 from prime_rl.trainer.rl.data import TensorMicroBatch
 from prime_rl.trainer.utils import get_response_lengths
+from prime_rl.transport.types import COMPACTION_REPLAY_MODE_LEGACY
 
 
 def _flatten_one_level(items):
@@ -82,6 +83,11 @@ def is_standard_stackable_micro_batch(
         return False
     if micro_batch.get("calls") is not None:
         return False
+    if (
+        int(micro_batch.get("compaction_replay_mode", 0))
+        != COMPACTION_REPLAY_MODE_LEGACY
+    ):
+        return False
     return True
 
 
@@ -116,6 +122,11 @@ def is_flex_compaction_stackable_micro_batch(
     if micro_batch.get("image_grid_thw") is not None:
         return False
     if micro_batch.get("routed_experts") is not None:
+        return False
+    if (
+        int(micro_batch.get("compaction_replay_mode", 0))
+        != COMPACTION_REPLAY_MODE_LEGACY
+    ):
         return False
     calls = micro_batch.get("calls")
     if not calls:
@@ -363,6 +374,7 @@ def stack_standard_micro_batches(
         compaction_events=None,
         prompt_len=None,
         calls=None,
+        compaction_replay_mode=COMPACTION_REPLAY_MODE_LEGACY,
     )
 
 
@@ -449,6 +461,7 @@ def stack_flex_compaction_micro_batches(
         compaction_events=compaction_events_batch,
         prompt_len=prompt_lens,
         calls=calls_batch,
+        compaction_replay_mode=COMPACTION_REPLAY_MODE_LEGACY,
     )
     stacked["sequence_lengths"] = sequence_lengths
     return stacked
@@ -513,6 +526,7 @@ def pack_horizontal_flex_compaction_micro_batches(
         compaction_events=compaction_events_batch,
         prompt_len=prompt_lens,
         calls=calls_batch,
+        compaction_replay_mode=COMPACTION_REPLAY_MODE_LEGACY,
     )
     packed["sequence_lengths"] = sequence_lengths
     packed["sequence_offsets"] = sequence_offsets

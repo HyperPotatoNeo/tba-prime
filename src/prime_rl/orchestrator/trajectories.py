@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +31,17 @@ if not hasattr(vf, "RolloutOutput"):
     vf.RolloutOutput = vf.State  # type: ignore[attr-defined]
 
 from prime_rl.transport import TrainingSample
-from prime_rl.transport.types import CallWire, CompactionEventWire
+from prime_rl.transport.types import (
+    COMPACTION_REPLAY_MODE_LEGACY,
+    COMPACTION_REPLAY_MODE_PREFILL_TRIM,
+    CallWire,
+    CompactionEventWire,
+    TurnCompactionStateWire,
+    training_effective_temperature,
+    validate_prefill_trim_event_field_types,
+    validate_survivor_metadata,
+    validate_turn_compaction_state,
+)
 from prime_rl.utils.chat_template import (
     common_prefix_len,
     deserialize_tool_calls,
@@ -228,6 +239,18 @@ def pretokenize_rollout_trajectory(
     tools = _convert_tools_to_oai_format(output.get("tool_defs", []))
 
     for step_idx, step in enumerate(output["trajectory"]):
+        replay_mode = (step.get("extras") or {}).get("compaction_replay_mode")
+        if replay_mode is not None and replay_mode != "prefill_trim":
+            raise ValueError(
+                f"unsupported compaction_replay_mode at trajectory step: "
+                f"{replay_mode!r}"
+            )
+        if replay_mode == "prefill_trim" and step["tokens"] is None:
+            raise ValueError(
+                "prefill_trim replay requires native trajectory tokens; "
+                f"example {output.get('example_id', '?')} step {step_idx} "
+                "cannot fall back to retokenization"
+            )
         if step["tokens"] is not None:
             continue
 
@@ -246,6 +269,305 @@ def pretokenize_rollout_trajectory(
     return True
 
 
+def _compaction_event_from_raw(raw_event: Any) -> CompactionEventWire | None:
+    if isinstance(raw_event, CompactionEventWire):
+        return raw_event
+    if isinstance(raw_event, dict):
+        return CompactionEventWire(
+            num_output_tokens_at_compaction=int(
+                raw_event["num_output_tokens_at_compaction"]
+            ),
+            tokens_evicted=int(raw_event["tokens_evicted"]),
+            position_offset_after=int(raw_event["position_offset_after"]),
+            num_prompt_tokens=int(raw_event.get("num_prompt_tokens", 0)),
+            evict_start=int(raw_event.get("evict_start", 0)),
+            new_user_fragment_len=int(
+                raw_event.get("new_user_fragment_len", 0)
+            ),
+            kept_indices=[
+                int(x) for x in (raw_event.get("kept_indices") or [])
+            ],
+            kept_token_ids=[
+                int(x) for x in (raw_event.get("kept_token_ids") or [])
+            ],
+            last_turn_evicted=int(raw_event.get("last_turn_evicted", -1)),
+            num_turns_evicted_after=int(
+                raw_event.get("num_turns_evicted_after", 0)
+            ),
+            archived_span_ids=[
+                str(x) for x in (raw_event.get("archived_span_ids") or [])
+            ],
+            archived_span_bounds=[
+                int(x) for x in (raw_event.get("archived_span_bounds") or [])
+            ],
+            event_kind=int(raw_event.get("event_kind", 0)),
+            restored_span_ids=[
+                str(x) for x in (raw_event.get("restored_span_ids") or [])
+            ],
+            visibility_boundary_computed=int(
+                raw_event.get("visibility_boundary_computed", -1)
+            ),
+            restored_span_token_ids=[
+                int(x)
+                for x in (raw_event.get("restored_span_token_ids") or [])
+            ],
+            restored_span_pos_start=int(
+                raw_event.get("restored_span_pos_start", -1)
+            ),
+        )
+    if not isinstance(raw_event, (list, tuple)) or len(raw_event) < 3:
+        return None
+    return CompactionEventWire(
+        num_output_tokens_at_compaction=int(raw_event[0]),
+        tokens_evicted=int(raw_event[1]),
+        position_offset_after=int(raw_event[2]),
+        num_prompt_tokens=int(raw_event[3]) if len(raw_event) >= 4 else 0,
+        evict_start=int(raw_event[4]) if len(raw_event) >= 5 else 0,
+        new_user_fragment_len=int(raw_event[5]) if len(raw_event) >= 6 else 0,
+        kept_indices=[int(x) for x in raw_event[6]]
+        if len(raw_event) >= 7 and raw_event[6]
+        else [],
+        kept_token_ids=[int(x) for x in raw_event[7]]
+        if len(raw_event) >= 8 and raw_event[7]
+        else [],
+        last_turn_evicted=int(raw_event[8]) if len(raw_event) >= 9 else -1,
+        num_turns_evicted_after=int(raw_event[9])
+        if len(raw_event) >= 10
+        else 0,
+        archived_span_ids=[str(x) for x in raw_event[10]]
+        if len(raw_event) >= 11 and raw_event[10]
+        else [],
+        archived_span_bounds=[int(x) for x in raw_event[11]]
+        if len(raw_event) >= 12 and raw_event[11]
+        else [],
+        event_kind=int(raw_event[12]) if len(raw_event) >= 13 else 0,
+        restored_span_ids=[str(x) for x in raw_event[13]]
+        if len(raw_event) >= 14 and raw_event[13]
+        else [],
+        visibility_boundary_computed=int(raw_event[14])
+        if len(raw_event) >= 15
+        else -1,
+        restored_span_token_ids=[int(x) for x in raw_event[15]]
+        if len(raw_event) >= 16 and raw_event[15]
+        else [],
+        restored_span_pos_start=int(raw_event[16])
+        if len(raw_event) >= 17
+        else -1,
+    )
+
+
+def _strict_prefill_trim_events_from_raw(
+    raw_events: Any,
+    *,
+    context: str,
+    state_present: bool,
+) -> list[CompactionEventWire]:
+    if raw_events is None and state_present:
+        raw_events = []
+    if not isinstance(raw_events, (list, tuple)):
+        raise ValueError(
+            f"{context} requires compaction_events to be a concrete list or tuple"
+        )
+    allowed_event_counts = {0, 1} if state_present else {1}
+    if len(raw_events) not in allowed_event_counts:
+        expected = "zero or one" if state_present else "exactly one"
+        raise ValueError(
+            f"{context} requires {expected} raw compaction event, "
+            f"got {len(raw_events)}"
+        )
+    if not raw_events:
+        return []
+    raw_event = raw_events[0]
+    if isinstance(raw_event, CompactionEventWire):
+        raw_kept_indices = raw_event.kept_indices
+        raw_kept_token_ids = raw_event.kept_token_ids
+    elif isinstance(raw_event, dict):
+        raw_kept_indices = raw_event.get("kept_indices", [])
+        raw_kept_token_ids = raw_event.get("kept_token_ids", [])
+    elif isinstance(raw_event, (list, tuple)):
+        raw_kept_indices = raw_event[6] if len(raw_event) >= 7 else []
+        raw_kept_token_ids = raw_event[7] if len(raw_event) >= 8 else []
+    else:
+        raw_kept_indices = []
+        raw_kept_token_ids = []
+    validate_survivor_metadata(
+        raw_kept_indices,
+        raw_kept_token_ids,
+        context=context,
+    )
+    try:
+        validate_prefill_trim_event_field_types(raw_event, context=context)
+        event = _compaction_event_from_raw(raw_event)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{context} requires exactly one valid compaction event"
+        ) from exc
+    if event is None:
+        raise ValueError(
+            f"{context} requires exactly one valid compaction event"
+        )
+    return [event]
+
+
+def _strict_prefill_trim_event_from_raw(
+    raw_events: Any,
+    *,
+    context: str,
+) -> CompactionEventWire:
+    return _strict_prefill_trim_events_from_raw(
+        raw_events,
+        context=context,
+        state_present=False,
+    )[0]
+
+
+def _validate_prefill_trim_event(
+    event: CompactionEventWire,
+    submitted_prompt_ids: list[int],
+    *,
+    context: str,
+    turn_compaction_state: Any = None,
+) -> list[int]:
+    if int(event.event_kind) != 0:
+        raise ValueError(f"{context} only supports eviction events")
+    if int(event.num_output_tokens_at_compaction) != 0:
+        raise ValueError(f"{context} only supports admission events")
+    tokens_evicted = int(event.tokens_evicted)
+    if tokens_evicted <= 0:
+        raise ValueError(f"{context} requires tokens_evicted > 0")
+    if turn_compaction_state is None:
+        if int(event.position_offset_after) != tokens_evicted:
+            raise ValueError(
+                f"{context} requires position_offset_after to equal tokens_evicted"
+            )
+    else:
+        raw_position_offset = (
+            turn_compaction_state.get("position_offset")
+            if isinstance(turn_compaction_state, dict)
+            else getattr(turn_compaction_state, "position_offset", None)
+        )
+        raw_num_turns_evicted = (
+            turn_compaction_state.get("num_turns_evicted")
+            if isinstance(turn_compaction_state, dict)
+            else getattr(turn_compaction_state, "num_turns_evicted", None)
+        )
+        raw_protected_prefix_len = (
+            turn_compaction_state.get("protected_prefix_len")
+            if isinstance(turn_compaction_state, dict)
+            else getattr(turn_compaction_state, "protected_prefix_len", None)
+        )
+        if type(raw_position_offset) is not int or int(
+            event.position_offset_after
+        ) != raw_position_offset:
+            raise ValueError(
+                f"{context} event cumulative position offset does not match "
+                "turn_compaction_state"
+            )
+        if type(raw_num_turns_evicted) is not int or int(
+            event.num_turns_evicted_after
+        ) != raw_num_turns_evicted:
+            raise ValueError(
+                f"{context} event cumulative turn count does not match "
+                "turn_compaction_state"
+            )
+        if type(raw_protected_prefix_len) is not int or int(
+            event.evict_start
+        ) != raw_protected_prefix_len:
+            raise ValueError(
+                f"{context} event protected prefix does not match "
+                "turn_compaction_state"
+            )
+
+    kept_indices, kept_token_ids = validate_survivor_metadata(
+        event.kept_indices,
+        event.kept_token_ids,
+        context=context,
+    )
+    if not kept_token_ids:
+        raise ValueError(f"{context} requires non-empty kept_token_ids")
+    if len(kept_token_ids) != int(event.num_prompt_tokens):
+        raise ValueError(
+            f"{context} kept_token_ids length does not match num_prompt_tokens"
+        )
+
+    start = int(event.evict_start)
+    end = start + tokens_evicted
+    if start < 0 or end > len(submitted_prompt_ids):
+        raise ValueError(
+            f"{context} eviction range [{start}, {end}) is outside the "
+            f"submitted prompt of length {len(submitted_prompt_ids)}"
+        )
+    replayed = submitted_prompt_ids[:start] + submitted_prompt_ids[end:]
+    if replayed != kept_token_ids:
+        raise ValueError(
+            f"{context} survivor tokens do not match submitted prompt deletion"
+        )
+
+    if not kept_indices:
+        raise ValueError(f"{context} requires non-empty kept_indices")
+    if len(kept_indices) != len(kept_token_ids):
+        raise ValueError(f"{context} kept_indices length does not match kept_token_ids")
+    if any(index < 0 or index >= len(submitted_prompt_ids) for index in kept_indices):
+        raise ValueError(f"{context} kept_indices are outside the submitted prompt")
+    if any(left >= right for left, right in zip(kept_indices, kept_indices[1:])):
+        raise ValueError(f"{context} kept_indices must be strictly increasing")
+    expected_indices = list(range(start)) + list(range(end, len(submitted_prompt_ids)))
+    if kept_indices != expected_indices:
+        raise ValueError(f"{context} kept_indices do not match the eviction range")
+    selected = [submitted_prompt_ids[index] for index in kept_indices]
+    if selected != kept_token_ids:
+        raise ValueError(f"{context} kept_indices select different tokens")
+    return kept_token_ids
+
+
+def _validate_prefill_trim_completion(
+    completion_ids: list[int],
+    completion_logprobs: list[float],
+    *,
+    context: str,
+) -> None:
+    if len(completion_ids) != len(completion_logprobs):
+        raise ValueError(
+            f"{context} completion token/logprob length mismatch: "
+            f"{len(completion_ids)} != {len(completion_logprobs)}"
+        )
+    if any(not math.isfinite(logprob) for logprob in completion_logprobs):
+        raise ValueError(f"{context} contains non-finite completion logprobs")
+
+
+def _strict_prefill_trim_logprobs(
+    raw_logprobs: Any,
+    *,
+    context: str,
+) -> list[float]:
+    if not isinstance(raw_logprobs, (list, tuple)):
+        raise ValueError(f"{context} must be a concrete logprob list")
+    logprobs: list[float] = []
+    for raw_logprob in raw_logprobs:
+        if type(raw_logprob) not in (int, float):
+            raise ValueError(f"{context} contains an invalid logprob")
+        logprob = float(raw_logprob)
+        if not math.isfinite(logprob):
+            raise ValueError(f"{context} contains a non-finite logprob")
+        logprobs.append(logprob)
+    return logprobs
+
+
+def _strict_prefill_trim_token_ids(
+    raw_token_ids: Any,
+    *,
+    context: str,
+) -> list[int]:
+    if not isinstance(raw_token_ids, (list, tuple)):
+        raise ValueError(f"{context} must be a concrete token ID list")
+    if any(
+        type(token_id) is not int or token_id < 0
+        for token_id in raw_token_ids
+    ):
+        raise ValueError(f"{context} contains an invalid token ID")
+    return list(raw_token_ids)
+
+
 def _build_summary_sample(
     step: vf.TrajectoryStep,
     *,
@@ -255,18 +577,19 @@ def _build_summary_sample(
     """Construct a standalone TrainingSample from a summary payload
     stashed on a trajectory step's extras.
 
-    Returns None when the step has no summary payload, or when the
-    payload is malformed (missing prompt/completion tokens, or logprobs
-    length mismatch with completion tokens). The regular per-step
-    sample emission is unaffected.
+    Legacy payloads return None when malformed. ``prefill_trim`` payloads
+    fail closed instead: they require exact submitted IDs and either the
+    legacy admission event or validated client-carried state with zero or one
+    admission event, and produce exactly one mode-1 ``CallWire``.
 
     Full-credit: ``completion_mask`` is all-True when the rollout did
     not error; for errored rollouts we zero the mask (same policy as
     make_sample above). ``compaction_events`` is populated from the
     payload in ``mode="eviction"`` (vLLM-side eviction can fire during
     the summary call's own prefill/decode); ``None`` in
-    ``mode="markovian"`` where the summary call runs with vLLM
-    compaction off.
+    ``mode="markovian"`` where the summary call runs with vLLM compaction
+    off. Mode-1 events live only on the call so batch preparation can validate
+    and clear them before eventless segmented dispatch.
     """
     extras = step.get("extras") if isinstance(step, dict) else None
     if not extras:
@@ -274,6 +597,22 @@ def _build_summary_sample(
     payload = extras.get("summary_trainsample")
     if not isinstance(payload, dict):
         return None
+    raw_replay_mode = payload.get("compaction_replay_mode")
+    if raw_replay_mode is None:
+        replay_mode = COMPACTION_REPLAY_MODE_LEGACY
+    elif raw_replay_mode == "prefill_trim":
+        replay_mode = COMPACTION_REPLAY_MODE_PREFILL_TRIM
+    else:
+        raise ValueError(
+            "unsupported compaction_replay_mode in summary payload: "
+            f"{raw_replay_mode!r}"
+        )
+    prefill_trim_replay = replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+    raw_turn_compaction_state = payload.get("turn_compaction_state")
+    if raw_turn_compaction_state is not None and not prefill_trim_replay:
+        raise ValueError(
+            "turn_compaction_state in summary payload requires prefill_trim replay"
+        )
     try:
         prompt_ids = [int(x) for x in (payload.get("prompt_token_ids") or [])]
         completion_ids = [
@@ -282,12 +621,79 @@ def _build_summary_sample(
         completion_logprobs = [
             float(x) for x in (payload.get("completion_logprobs") or [])
         ]
-    except (TypeError, ValueError):
+        submitted_prompt_ids = [
+            int(x)
+            for x in (payload.get("submitted_prompt_token_ids") or [])
+        ]
+        native_prompt_ids = [
+            int(x) for x in (payload.get("native_prompt_token_ids") or [])
+        ]
+        raw_summary_temperature = payload.get("completion_temperature")
+        summary_temperature_input = (
+            raw_summary_temperature
+            if raw_summary_temperature is not None
+            else temperature
+        )
+    except (TypeError, ValueError) as exc:
+        if prefill_trim_replay:
+            raise ValueError(
+                "prefill_trim summary replay contains malformed token metadata"
+            ) from exc
         return None
+    try:
+        summary_temperature = training_effective_temperature(
+            summary_temperature_input
+        )
+    except ValueError as exc:
+        raise ValueError("summary replay has invalid training temperature") from exc
+    if prefill_trim_replay:
+        try:
+            prompt_ids = _strict_prefill_trim_token_ids(
+                payload.get("prompt_token_ids"),
+                context="prefill_trim summary replay prompt",
+            )
+            completion_ids = _strict_prefill_trim_token_ids(
+                payload.get("completion_token_ids"),
+                context="prefill_trim summary replay completion",
+            )
+            submitted_prompt_ids = _strict_prefill_trim_token_ids(
+                payload.get("submitted_prompt_token_ids"),
+                context="prefill_trim summary replay submitted prompt",
+            )
+            native_prompt_ids = _strict_prefill_trim_token_ids(
+                payload.get("native_prompt_token_ids"),
+                context="prefill_trim summary replay native prompt",
+            )
+            completion_logprobs = _strict_prefill_trim_logprobs(
+                payload.get("completion_logprobs"),
+                context="prefill_trim summary replay completion logprobs",
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "prefill_trim summary replay contains malformed token metadata"
+            ) from exc
     if not prompt_ids or not completion_ids:
+        if prefill_trim_replay:
+            raise ValueError(
+                "prefill_trim summary replay requires prompt and completion tokens"
+            )
         return None
     if len(completion_logprobs) != len(completion_ids):
+        if prefill_trim_replay:
+            raise ValueError(
+                "prefill_trim summary replay completion/logprob length mismatch"
+            )
         return None
+    if prefill_trim_replay:
+        if raw_summary_temperature is None:
+            raise ValueError(
+                "prefill_trim summary replay requires completion_temperature"
+            )
+        _validate_prefill_trim_completion(
+            completion_ids,
+            completion_logprobs,
+            context="prefill_trim summary replay",
+        )
 
     # Coerce payload's ``compaction_events`` list to
     # ``CompactionEventWire`` instances. Mirrors the same
@@ -296,110 +702,92 @@ def _build_summary_sample(
     # the same msgspec boundary and can arrive as any of those shapes.
     raw_events = payload.get("compaction_events")
     summary_events: list[CompactionEventWire] | None = None
-    if raw_events:
+    if prefill_trim_replay:
+        strict_events = _strict_prefill_trim_events_from_raw(
+            raw_events,
+            context="prefill_trim summary replay",
+            state_present=raw_turn_compaction_state is not None,
+        )
+        summary_events = strict_events
+    elif raw_events:
         coerced: list[CompactionEventWire] = []
-        for e in raw_events:
-            if isinstance(e, CompactionEventWire):
-                coerced.append(e)
-            elif isinstance(e, dict):
-                try:
-                    coerced.append(
-                        CompactionEventWire(
-                            num_output_tokens_at_compaction=int(
-                                e["num_output_tokens_at_compaction"]
-                            ),
-                            tokens_evicted=int(e["tokens_evicted"]),
-                            position_offset_after=int(e["position_offset_after"]),
-                            num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
-                            evict_start=int(e.get("evict_start", 0)),
-                            new_user_fragment_len=int(
-                                e.get("new_user_fragment_len", 0)
-                            ),
-                            kept_indices=[
-                                int(x) for x in (e.get("kept_indices") or [])
-                            ],
-                            kept_token_ids=[
-                                int(x) for x in (e.get("kept_token_ids") or [])
-                            ],
-                            last_turn_evicted=int(
-                                e.get("last_turn_evicted", -1)
-                            ),
-                            num_turns_evicted_after=int(
-                                e.get("num_turns_evicted_after", 0)
-                            ),
-                            archived_span_ids=[
-                                str(x) for x in (e.get("archived_span_ids") or [])
-                            ],
-                            archived_span_bounds=[
-                                int(x)
-                                for x in (e.get("archived_span_bounds") or [])
-                            ],
-                            event_kind=int(e.get("event_kind", 0)),
-                            restored_span_ids=[
-                                str(x)
-                                for x in (e.get("restored_span_ids") or [])
-                            ],
-                            visibility_boundary_computed=int(
-                                e.get("visibility_boundary_computed", -1)
-                            ),
-                        )
-                    )
-                except (KeyError, TypeError, ValueError):
-                    continue
-            elif isinstance(e, (list, tuple)) and len(e) >= 3:
-                try:
-                    coerced.append(
-                        CompactionEventWire(
-                            num_output_tokens_at_compaction=int(e[0]),
-                            tokens_evicted=int(e[1]),
-                            position_offset_after=int(e[2]),
-                            num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
-                            evict_start=int(e[4]) if len(e) >= 5 else 0,
-                            new_user_fragment_len=int(e[5]) if len(e) >= 6 else 0,
-                            kept_indices=[int(x) for x in e[6]]
-                            if len(e) >= 7 and e[6]
-                            else [],
-                            kept_token_ids=[int(x) for x in e[7]]
-                            if len(e) >= 8 and e[7]
-                            else [],
-                            last_turn_evicted=int(e[8]) if len(e) >= 9 else -1,
-                            num_turns_evicted_after=int(e[9]) if len(e) >= 10 else 0,
-                            archived_span_ids=[str(x) for x in e[10]]
-                            if len(e) >= 11 and e[10]
-                            else [],
-                            archived_span_bounds=[int(x) for x in e[11]]
-                            if len(e) >= 12 and e[11]
-                            else [],
-                            event_kind=int(e[12]) if len(e) >= 13 else 0,
-                            restored_span_ids=[str(x) for x in e[13]]
-                            if len(e) >= 14 and e[13]
-                            else [],
-                            visibility_boundary_computed=int(e[14])
-                            if len(e) >= 15
-                            else -1,
-                        )
-                    )
-                except (TypeError, ValueError):
-                    continue
+        for raw_event in raw_events:
+            try:
+                event = _compaction_event_from_raw(raw_event)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if event is not None:
+                coerced.append(event)
         summary_events = coerced or None
+
+    summary_call: CallWire | None = None
+    if prefill_trim_replay:
+        if not submitted_prompt_ids:
+            raise ValueError(
+                "prefill_trim summary replay requires exact submitted prompt IDs"
+            )
+        if not native_prompt_ids:
+            raise ValueError(
+                "prefill_trim summary replay requires native prompt token IDs"
+            )
+        if submitted_prompt_ids != native_prompt_ids:
+            raise ValueError(
+                "prefill_trim summary replay submitted/native prompt mismatch"
+            )
+
+        turn_compaction_state: TurnCompactionStateWire | None = None
+        if summary_events:
+            authoritative_prompt_ids = _validate_prefill_trim_event(
+                summary_events[0],
+                native_prompt_ids,
+                context="prefill_trim summary replay",
+                turn_compaction_state=raw_turn_compaction_state,
+            )
+        else:
+            authoritative_prompt_ids = native_prompt_ids
+        if raw_turn_compaction_state is not None:
+            turn_compaction_state = validate_turn_compaction_state(
+                raw_turn_compaction_state,
+                authoritative_prompt_ids,
+                context="prefill_trim summary replay",
+            )
+        if prompt_ids != authoritative_prompt_ids:
+            raise ValueError(
+                "prefill_trim summary replay prompt must equal authoritative "
+                "physical prompt"
+            )
+
+        completion_temperatures = [summary_temperature] * len(completion_ids)
+        summary_call = CallWire(
+            submitted_prompt_ids=submitted_prompt_ids,
+            completion_ids=completion_ids,
+            completion_logprobs=completion_logprobs,
+            completion_temperatures=completion_temperatures,
+            compaction_events=list(summary_events or []),
+            compaction_replay_mode=COMPACTION_REPLAY_MODE_PREFILL_TRIM,
+            turn_compaction_state=turn_compaction_state,
+        )
 
     completion_mask = (
         [False] * len(completion_ids)
         if has_error
         else [True] * len(completion_ids)
     )
-    return TrainingSample(
+    sample = TrainingSample(
         prompt_ids=prompt_ids,
         prompt_mask=[False] * len(prompt_ids),
         completion_ids=completion_ids,
         completion_mask=completion_mask,
         completion_logprobs=completion_logprobs,
-        completion_temperatures=[temperature] * len(completion_ids),
+        completion_temperatures=[summary_temperature] * len(completion_ids),
         teacher_logprobs=None,
         advantage=None,
         routed_experts=None,
-        compaction_events=summary_events,
+        compaction_events=None if prefill_trim_replay else summary_events,
+        calls=[summary_call] if summary_call is not None else None,
+        compaction_replay_mode=replay_mode,
     )
+    return sample
 
 
 def interleave_rollout(
@@ -447,11 +835,85 @@ def interleave_rollout(
     # this field should be guaranteed because we set temperature in get_sampling_args
     temperature = output["sampling_args"]["temperature"]
 
+    def _compaction_replay_mode_from_step(step: vf.TrajectoryStep) -> int:
+        extras = step.get("extras") or {}
+        raw = extras.get("compaction_replay_mode")
+        if raw is None:
+            if extras.get("turn_compaction_state") is not None:
+                raise ValueError(
+                    "turn_compaction_state at trajectory step requires "
+                    "compaction_replay_mode"
+                )
+            return COMPACTION_REPLAY_MODE_LEGACY
+        if raw == "prefill_trim":
+            return COMPACTION_REPLAY_MODE_PREFILL_TRIM
+        raise ValueError(
+            f"unsupported compaction_replay_mode at trajectory step: {raw!r}"
+        )
+
     def prepare_step_tokens(step: vf.TrajectoryStep, step_idx: int) -> dict[str, Any] | None:
         tokens = step["tokens"]
+        replay_mode = _compaction_replay_mode_from_step(step)
+        prefill_trim_context = (
+            "prefill_trim replay at "
+            f"example {output.get('example_id', '?')} step {step_idx}"
+        )
+        if tokens is None and replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+            raise ValueError(
+                f"{prefill_trim_context} requires native trajectory tokens"
+            )
         if tokens is not None:
-            prompt_ids = list(tokens["prompt_ids"])
-            prompt_mask = [bool(i) for i in tokens["prompt_mask"]]
+            try:
+                native_prompt_ids = list(tokens["prompt_ids"])
+                prompt_mask = [bool(i) for i in tokens["prompt_mask"]]
+            except (KeyError, TypeError, ValueError) as exc:
+                if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+                    raise ValueError(
+                        f"{prefill_trim_context} contains malformed native "
+                        "prompt trajectory tokens"
+                    ) from exc
+                raise
+            prompt_ids = list(native_prompt_ids)
+            extras = step.get("extras") or {}
+            raw_turn_compaction_state = extras.get("turn_compaction_state")
+            turn_compaction_state: TurnCompactionStateWire | None = None
+
+            if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+                raw_submitted_prompt_ids = extras.get(
+                    "submitted_prompt_token_ids"
+                )
+                try:
+                    native_prompt_ids = _strict_prefill_trim_token_ids(
+                        native_prompt_ids,
+                        context=f"{prefill_trim_context} native prompt",
+                    )
+                    submitted_prompt_ids = _strict_prefill_trim_token_ids(
+                        raw_submitted_prompt_ids,
+                        context=f"{prefill_trim_context} submitted prompt",
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{prefill_trim_context} contains malformed submitted "
+                        "or native prompt token IDs"
+                    ) from exc
+                if submitted_prompt_ids != native_prompt_ids:
+                    raise ValueError(
+                        f"{prefill_trim_context} submitted/native prompt mismatch"
+                    )
+                response_prompt_ids = extras.get("prompt_token_ids")
+                if response_prompt_ids is not None:
+                    response_prompt_ids = _strict_prefill_trim_token_ids(
+                        response_prompt_ids,
+                        context=f"{prefill_trim_context} response prompt",
+                    )
+                    if response_prompt_ids != native_prompt_ids:
+                        raise ValueError(
+                            f"{prefill_trim_context} response/native prompt mismatch"
+                        )
+                if len(prompt_mask) != len(native_prompt_ids):
+                    raise ValueError(
+                        f"{prefill_trim_context} prompt mask is misaligned"
+                    )
 
             # Block-aligned padding mode: the kv_eviction interceptor
             # stashed the EXACT padded token stream vLLM ran on in the
@@ -461,9 +923,11 @@ def interleave_rollout(
             # position is no-gradient by construction and (b) the existing
             # per-token verifiers mask applies to the unpadded sequence
             # and can't be re-aligned cheaply.
-            extras = step.get("extras")
             padded_ids = extras.get("prompt_token_ids") if extras else None
-            if padded_ids:
+            if (
+                replay_mode == COMPACTION_REPLAY_MODE_LEGACY
+                and padded_ids
+            ):
                 prompt_ids = [int(x) for x in padded_ids]
                 prompt_mask = [False] * len(prompt_ids)
 
@@ -472,16 +936,69 @@ def interleave_rollout(
             # them. The per-call trainer rebuild (Phase B+) needs the
             # pre-trim prompt for phase-1 of the two-phase forward.
             submitted_pre_trim: list[int] = list(prompt_ids)
-            step_events = _compaction_events_from_step(step)
+            step_events = _compaction_events_from_step(
+                step,
+                replay_mode=replay_mode,
+                context=prefill_trim_context,
+            )
             all_events_pre_trim: list[CompactionEventWire] = (
                 list(step_events) if step_events else []
             )
+
+            if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+                try:
+                    completion_ids = _strict_prefill_trim_token_ids(
+                        tokens["completion_ids"],
+                        context=f"{prefill_trim_context} native completion",
+                    )
+                    completion_logprobs = _strict_prefill_trim_logprobs(
+                        tokens["completion_logprobs"],
+                        context=f"{prefill_trim_context} native completion logprobs",
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{prefill_trim_context} contains malformed native "
+                        "completion metadata"
+                    ) from exc
+                _validate_prefill_trim_completion(
+                    completion_ids,
+                    completion_logprobs,
+                    context=prefill_trim_context,
+                )
+                if len(tokens["completion_mask"]) != len(completion_ids):
+                    raise ValueError(
+                        f"{prefill_trim_context} completion mask is misaligned"
+                    )
+                assert step_events is not None
+                if step_events:
+                    authoritative_prompt_ids = _validate_prefill_trim_event(
+                        step_events[0],
+                        submitted_pre_trim,
+                        context=prefill_trim_context,
+                        turn_compaction_state=raw_turn_compaction_state,
+                    )
+                else:
+                    authoritative_prompt_ids = native_prompt_ids
+                if raw_turn_compaction_state is not None:
+                    turn_compaction_state = validate_turn_compaction_state(
+                        raw_turn_compaction_state,
+                        authoritative_prompt_ids,
+                        context=prefill_trim_context,
+                    )
+                if tokens.get("routed_experts") is not None:
+                    raise ValueError(
+                        "prefill_trim replay is incompatible with routed_experts "
+                        f"at example {output.get('example_id', '?')} step {step_idx}"
+                    )
+                prompt_ids = authoritative_prompt_ids
+                prompt_mask = [False] * len(prompt_ids)
+                step_events = None
 
             # Admission-time compaction trim: the vLLM response carries
             # the ORIGINAL (pre-trim) prompt_token_ids, but inference ran
             # on the trimmed prompt. Replay the scheduler's token
             # deletions so the trainer sees identical tokens + positions.
-            if step_events and padded_ids:
+            elif step_events and padded_ids:
                 orig_len = len(prompt_ids)
                 prompt_ids, prompt_mask, step_events = _apply_admission_trim(
                     prompt_ids, prompt_mask, step_events,
@@ -518,6 +1035,10 @@ def interleave_rollout(
                     else:
                         extras["compaction_events"] = None
 
+            if replay_mode == COMPACTION_REPLAY_MODE_LEGACY:
+                completion_ids = list(tokens["completion_ids"])
+                completion_logprobs = list(tokens["completion_logprobs"])
+
             # vLLM auto-pad: filler token ids appended to this call's KV
             # cache after sampling stopped (so the trailing block lands in
             # the prefix cache). The trainer needs these per-call so its
@@ -531,13 +1052,18 @@ def interleave_rollout(
                         trailing_pad_ids = [int(x) for x in raw_pad]
                     except (TypeError, ValueError):
                         trailing_pad_ids = []
+            if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM and trailing_pad_ids:
+                raise ValueError(
+                    "prefill_trim replay cannot carry vLLM trailing_pad_ids "
+                    f"at example {output.get('example_id', '?')} step {step_idx}"
+                )
 
             return {
                 "prompt_ids": prompt_ids,
                 "prompt_mask": prompt_mask,
-                "completion_ids": list(tokens["completion_ids"]),
+                "completion_ids": completion_ids,
                 "completion_mask": [bool(i) for i in tokens["completion_mask"]],
-                "completion_logprobs": list(tokens["completion_logprobs"]),
+                "completion_logprobs": completion_logprobs,
                 "routed_experts": tokens.get("routed_experts"),
                 # Per-call rebuild: pre-trim submitted prompt + all events
                 # (admission + mid-gen). The trainer's two-phase forward
@@ -545,7 +1071,10 @@ def interleave_rollout(
                 # [0, evict_end).
                 "submitted_prompt_ids_pre_trim": submitted_pre_trim,
                 "all_compaction_events_pre_trim": all_events_pre_trim,
+                "remaining_compaction_events": step_events,
                 "trailing_pad_ids": trailing_pad_ids,
+                "compaction_replay_mode": replay_mode,
+                "turn_compaction_state": turn_compaction_state,
             }
 
         logger.warning(f"Missing rollout tokens for example {output['example_id']} step {step_idx}.")
@@ -606,108 +1135,29 @@ def interleave_rollout(
 
     def _compaction_events_from_step(
         step: vf.TrajectoryStep,
+        *,
+        replay_mode: int,
+        context: str,
     ) -> list[CompactionEventWire] | None:
         """Read compaction events from a step's extras dict, handling both
         already-typed CompactionEventWire instances and the dict/list forms
         that can arrive after msgspec roundtrip. None when no events present.
         """
-        extras = step.get("extras")
-        if not extras:
-            return None
+        extras = step.get("extras") or {}
         raw = extras.get("compaction_events")
+        if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+            return _strict_prefill_trim_events_from_raw(
+                raw,
+                context=context,
+                state_present=extras.get("turn_compaction_state") is not None,
+            )
         if not raw:
             return None
         out: list[CompactionEventWire] = []
-        for e in raw:
-            if isinstance(e, CompactionEventWire):
-                out.append(e)
-            elif isinstance(e, dict):
-                out.append(
-                    CompactionEventWire(
-                        num_output_tokens_at_compaction=int(
-                            e["num_output_tokens_at_compaction"]
-                        ),
-                        tokens_evicted=int(e["tokens_evicted"]),
-                        position_offset_after=int(e["position_offset_after"]),
-                        num_prompt_tokens=int(e.get("num_prompt_tokens", 0)),
-                        evict_start=int(e.get("evict_start", 0)),
-                        new_user_fragment_len=int(
-                            e.get("new_user_fragment_len", 0)
-                        ),
-                        kept_indices=[
-                            int(x) for x in (e.get("kept_indices") or [])
-                        ],
-                        kept_token_ids=[
-                            int(x) for x in (e.get("kept_token_ids") or [])
-                        ],
-                        last_turn_evicted=int(
-                            e.get("last_turn_evicted", -1)
-                        ),
-                        num_turns_evicted_after=int(
-                            e.get("num_turns_evicted_after", 0)
-                        ),
-                        archived_span_ids=[
-                            str(x) for x in (e.get("archived_span_ids") or [])
-                        ],
-                        archived_span_bounds=[
-                            int(x)
-                            for x in (e.get("archived_span_bounds") or [])
-                        ],
-                        event_kind=int(e.get("event_kind", 0)),
-                        restored_span_ids=[
-                            str(x) for x in (e.get("restored_span_ids") or [])
-                        ],
-                        visibility_boundary_computed=int(
-                            e.get("visibility_boundary_computed", -1)
-                        ),
-                        restored_span_token_ids=[
-                            int(x)
-                            for x in (e.get("restored_span_token_ids") or [])
-                        ],
-                        restored_span_pos_start=int(
-                            e.get("restored_span_pos_start", -1)
-                        ),
-                    )
-                )
-            elif isinstance(e, (list, tuple)) and len(e) >= 3:
-                # msgspec array_like form
-                out.append(
-                    CompactionEventWire(
-                        num_output_tokens_at_compaction=int(e[0]),
-                        tokens_evicted=int(e[1]),
-                        position_offset_after=int(e[2]),
-                        num_prompt_tokens=int(e[3]) if len(e) >= 4 else 0,
-                        evict_start=int(e[4]) if len(e) >= 5 else 0,
-                        new_user_fragment_len=int(e[5]) if len(e) >= 6 else 0,
-                        kept_indices=[int(x) for x in e[6]]
-                        if len(e) >= 7 and e[6]
-                        else [],
-                        kept_token_ids=[int(x) for x in e[7]]
-                        if len(e) >= 8 and e[7]
-                        else [],
-                        last_turn_evicted=int(e[8]) if len(e) >= 9 else -1,
-                        num_turns_evicted_after=int(e[9]) if len(e) >= 10 else 0,
-                        archived_span_ids=[str(x) for x in e[10]]
-                        if len(e) >= 11 and e[10]
-                        else [],
-                        archived_span_bounds=[int(x) for x in e[11]]
-                        if len(e) >= 12 and e[11]
-                        else [],
-                        event_kind=int(e[12]) if len(e) >= 13 else 0,
-                        restored_span_ids=[str(x) for x in e[13]]
-                        if len(e) >= 14 and e[13]
-                        else [],
-                        visibility_boundary_computed=int(e[14])
-                        if len(e) >= 15
-                        else -1,
-                        restored_span_token_ids=[int(x) for x in e[15]]
-                        if len(e) >= 16 and e[15]
-                        else [],
-                        restored_span_pos_start=int(e[16])
-                        if len(e) >= 17
-                        else -1,
-                    )
-                )
+        for raw_event in raw:
+            event = _compaction_event_from_raw(raw_event)
+            if event is not None:
+                out.append(event)
         return out or None
 
     prepared_steps: list[dict[str, Any]] = []
@@ -717,7 +1167,22 @@ def interleave_rollout(
         if prepared is None:
             return None
         prepared_steps.append(prepared)
-        step_compaction_events.append(_compaction_events_from_step(step))
+        if (
+            prepared["compaction_replay_mode"]
+            == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+        ):
+            step_compaction_events.append(prepared["remaining_compaction_events"])
+        else:
+            step_compaction_events.append(
+                _compaction_events_from_step(
+                    step,
+                    replay_mode=int(prepared["compaction_replay_mode"]),
+                    context=(
+                        "prefill_trim replay at "
+                        f"example {output.get('example_id', '?')} step {step_idx}"
+                    ),
+                )
+            )
 
     # --- Diagnostic: detect coordinate mismatch between compaction events
     # and completion_ids BEFORE the merge loop runs (and potentially asserts).
@@ -860,6 +1325,12 @@ def interleave_rollout(
         compaction_events: list[CompactionEventWire] | None = None,
     ) -> TrainingSample:
         """Create a new TrainingSample from a trajectory step."""
+        replay_mode = int(tokens["compaction_replay_mode"])
+        sample_temperature = (
+            training_effective_temperature(temperature)
+            if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+            else temperature
+        )
         if has_error:
             completion_mask = [False] * len(tokens["completion_mask"])
         else:
@@ -877,11 +1348,12 @@ def interleave_rollout(
             completion_ids=completion_ids,
             completion_mask=completion_mask,
             completion_logprobs=list(tokens["completion_logprobs"]),
-            completion_temperatures=[temperature] * len(completion_ids),
+            completion_temperatures=[sample_temperature] * len(completion_ids),
             teacher_logprobs=None,
             advantage=None,
             routed_experts=routed_experts,
             compaction_events=compaction_events,
+            compaction_replay_mode=replay_mode,
         )
 
     def extend_sample(sample: TrainingSample, prefix_len: int, step_idx: int) -> None:
@@ -961,6 +1433,7 @@ def interleave_rollout(
         # untouched PRE-TRIM list captured before the strip.
         step_events_all = tokens.get("all_compaction_events_pre_trim") or []
         step_events_midgen = step_compaction_events[step_idx]
+        step_replay_mode = int(tokens["compaction_replay_mode"])
 
         # Phase A.2: when a step has any mid-generation compaction event,
         # don't merge — start a new sample. Mid-gen samples are routed to
@@ -981,9 +1454,11 @@ def interleave_rollout(
         # whenever step N also has an admission event — that's the bug.
         # Strict-length (>) prevents over-merging on zero-delta extensions.
         matched_idx = None
-        if not has_midgen:
+        if not has_midgen and step_replay_mode == COMPACTION_REPLAY_MODE_LEGACY:
             for idx, entry in enumerate(active_samples):
                 prefix_tokens = entry[0]
+                if entry[1].compaction_replay_mode != COMPACTION_REPLAY_MODE_LEGACY:
+                    continue
                 if (
                     len(step_pre_trim) > len(prefix_tokens)
                     and step_pre_trim[: len(prefix_tokens)] == prefix_tokens
@@ -1134,6 +1609,12 @@ def interleave_rollout(
         calls: list[CallWire] = []
         for sidx in step_idx_list:
             prepared = prepared_steps[sidx]
+            call_temperature = (
+                training_effective_temperature(temperature)
+                if int(prepared["compaction_replay_mode"])
+                == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+                else temperature
+            )
             calls.append(
                 CallWire(
                     submitted_prompt_ids=list(
@@ -1142,7 +1623,7 @@ def interleave_rollout(
                     ),
                     completion_ids=list(prepared["completion_ids"]),
                     completion_logprobs=list(prepared["completion_logprobs"]),
-                    completion_temperatures=[temperature]
+                    completion_temperatures=[call_temperature]
                     * len(prepared["completion_ids"]),
                     compaction_events=list(
                         prepared.get("all_compaction_events_pre_trim") or []
@@ -1150,9 +1631,36 @@ def interleave_rollout(
                     trailing_pad_ids=list(
                         prepared.get("trailing_pad_ids") or []
                     ),
+                    compaction_replay_mode=int(
+                        prepared["compaction_replay_mode"]
+                    ),
+                    turn_compaction_state=prepared.get(
+                        "turn_compaction_state"
+                    ),
                 )
             )
         sample.calls = calls
+
+        if sample.compaction_replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+            if len(sample.calls) != 1:
+                raise ValueError(
+                    "prefill_trim replay samples must contain exactly one call, "
+                    f"got {len(sample.calls)}"
+                )
+            call = sample.calls[0]
+            if call.compaction_replay_mode != COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+                raise ValueError(
+                    "prefill_trim replay requires exactly one mode-1 call"
+                )
+            if call.turn_compaction_state is None:
+                if len(call.compaction_events) != 1:
+                    raise ValueError(
+                        "legacy prefill_trim replay requires exactly one event"
+                    )
+            elif len(call.compaction_events) > 1:
+                raise ValueError(
+                    "state-aware prefill_trim replay supports zero or one event"
+                )
 
         # Self-consistency check: sum of all call completion lengths +
         # cross-call prefix-extension prompt deltas should equal the

@@ -1,4 +1,63 @@
+import hashlib
+import json
+import math
+import re
+from collections.abc import Sequence
+
 import msgspec
+
+
+def training_effective_temperature(requested_temperature: float) -> float:
+    """Return the temperature used to replay inference logits in training."""
+    try:
+        temperature = float(requested_temperature)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"training temperature must be a finite non-negative number, got "
+            f"{requested_temperature!r}"
+        ) from exc
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError(
+            f"training temperature must be finite and non-negative, got "
+            f"{requested_temperature!r}"
+        )
+    return 1.0 if temperature == 0.0 else temperature
+
+
+COMPACTION_REPLAY_MODE_LEGACY = 0
+COMPACTION_REPLAY_MODE_PREFILL_TRIM = 1
+
+TURN_COMPACTION_STATE_VERSION = 1
+TURN_COMPACTION_STATE_HASH_DOMAIN = b"sglang.turn_compaction_state.v1\0"
+_TURN_COMPACTION_STATE_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_TURN_COMPACTION_STATE_FIELDS = (
+    "version",
+    "position_offset",
+    "protected_prefix_len",
+    "num_turns_evicted",
+    "carried_prefix_num_live_turns",
+    "carried_prefix_len",
+    "state_id",
+)
+
+
+def validate_survivor_metadata(
+    kept_indices: object,
+    kept_token_ids: object,
+    *,
+    context: str,
+) -> tuple[list[int], list[int]]:
+    def validate(values: object, field: str) -> list[int]:
+        if not isinstance(values, (list, tuple)):
+            raise ValueError(f"{context} {field} must be a concrete list or tuple")
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError(f"{context} {field} must contain only non-negative Python ints")
+        return list(values)
+
+    return (
+        validate(kept_indices, "kept_indices"),
+        validate(kept_token_ids, "kept_token_ids"),
+    )
 
 
 class CompactionEventWire(
@@ -25,10 +84,9 @@ class CompactionEventWire(
     # this equals stride_blocks * block_size.
     tokens_evicted: int
 
-    # Cumulative position_offset after this event (not currently used by the
-    # trainer; position_ids can be computed as a plain arange since gen[N]'s
-    # RoPE always equals prompt_len + N, but carried for debugging and for
-    # future non-FIFO strategies).
+    # Cumulative position_offset after this event. Legacy replay requires this
+    # to equal the event's deletion delta; client-carried SGLang replay checks
+    # it against TurnCompactionStateWire's cumulative offset.
     position_offset_after: int
 
     # Prompt length (in tokens) of the vLLM request that produced this event.
@@ -107,8 +165,199 @@ class CompactionEventWire(
     restored_span_pos_start: int = -1
 
 
+_PREFILL_TRIM_EVENT_INT_FIELDS = (
+    ("num_output_tokens_at_compaction", 0),
+    ("tokens_evicted", 1),
+    ("position_offset_after", 2),
+    ("num_prompt_tokens", 3),
+    ("evict_start", 4),
+    ("new_user_fragment_len", 5),
+    ("last_turn_evicted", 8),
+    ("num_turns_evicted_after", 9),
+)
+
+
+def validate_prefill_trim_event_field_types(
+    event: object,
+    *,
+    context: str,
+) -> None:
+    """Reject mode-1 event scalar coercions before constructing its wire type."""
+    missing = object()
+    for field, array_index in _PREFILL_TRIM_EVENT_INT_FIELDS:
+        if isinstance(event, CompactionEventWire):
+            value = getattr(event, field)
+        elif type(event) is dict:
+            value = event.get(field, missing)
+        elif isinstance(event, (list, tuple)):
+            value = event[array_index] if len(event) > array_index else missing
+        else:
+            value = getattr(event, field, missing)
+        if type(value) is not int:
+            raise ValueError(f"{context} event {field} must be an exact int")
+
+
+class TurnCompactionStateWire(
+    msgspec.Struct, array_like=True, gc=False, omit_defaults=True
+):
+    """Validated client-carried SGLang turn-compaction state."""
+
+    version: int
+    position_offset: int
+    protected_prefix_len: int
+    num_turns_evicted: int
+    carried_prefix_num_live_turns: int
+    carried_prefix_len: int
+    state_id: str
+
+
+def compute_turn_compaction_state_id(
+    *,
+    version: int,
+    position_offset: int,
+    protected_prefix_len: int,
+    num_turns_evicted: int,
+    carried_prefix_num_live_turns: int,
+    carried_prefix_len: int,
+    carried_prefix_token_ids: Sequence[int],
+) -> str:
+    """Hash the compact canonical state anchor shared with SGLang."""
+    token_ids = list(carried_prefix_token_ids)
+    if len(token_ids) != carried_prefix_len:
+        raise ValueError(
+            "carried-prefix token count does not match carried_prefix_len"
+        )
+    if any(type(token_id) is not int or token_id < 0 for token_id in token_ids):
+        raise ValueError("carried-prefix token IDs must be nonnegative integers")
+    payload = [
+        version,
+        position_offset,
+        protected_prefix_len,
+        num_turns_evicted,
+        carried_prefix_num_live_turns,
+        carried_prefix_len,
+        token_ids,
+    ]
+    canonical = TURN_COMPACTION_STATE_HASH_DOMAIN + json.dumps(
+        payload, ensure_ascii=True, separators=(",", ":")
+    ).encode("ascii")
+    digest = hashlib.sha256(canonical).hexdigest()
+    return f"sha256:{digest}"
+
+
+def turn_compaction_state_to_json(
+    state: TurnCompactionStateWire,
+) -> dict[str, int | str]:
+    return {field: getattr(state, field) for field in _TURN_COMPACTION_STATE_FIELDS}
+
+
+def validate_turn_compaction_state(
+    raw_state: object,
+    prompt_ids: object,
+    *,
+    context: str,
+) -> TurnCompactionStateWire:
+    """Strictly validate a state and bind its hash to its carried prompt prefix."""
+    if isinstance(raw_state, TurnCompactionStateWire):
+        values = {
+            field: getattr(raw_state, field)
+            for field in _TURN_COMPACTION_STATE_FIELDS
+        }
+    elif type(raw_state) is dict:
+        unknown = set(raw_state) - set(_TURN_COMPACTION_STATE_FIELDS)
+        missing = set(_TURN_COMPACTION_STATE_FIELDS) - set(raw_state)
+        if missing or unknown:
+            details = []
+            if missing:
+                details.append(f"missing {sorted(missing)}")
+            if unknown:
+                details.append(f"unknown {sorted(unknown)}")
+            raise ValueError(
+                f"{context} turn_compaction_state has invalid fields: "
+                + ", ".join(details)
+            )
+        values = {field: raw_state[field] for field in _TURN_COMPACTION_STATE_FIELDS}
+    else:
+        raise ValueError(f"{context} turn_compaction_state must be a JSON object")
+
+    positive_fields = (
+        "position_offset",
+        "protected_prefix_len",
+        "num_turns_evicted",
+        "carried_prefix_len",
+    )
+    if type(values["version"]) is not int or values["version"] != TURN_COMPACTION_STATE_VERSION:
+        raise ValueError(
+            f"{context} turn_compaction_state version must be "
+            f"{TURN_COMPACTION_STATE_VERSION}"
+        )
+    for field in positive_fields:
+        value = values[field]
+        if type(value) is not int or value <= 0:
+            raise ValueError(
+                f"{context} turn_compaction_state {field} must be a positive int"
+            )
+    live_turns = values["carried_prefix_num_live_turns"]
+    if type(live_turns) is not int or live_turns < 0:
+        raise ValueError(
+            f"{context} turn_compaction_state "
+            "carried_prefix_num_live_turns must be a nonnegative int"
+        )
+    state_id = values["state_id"]
+    if type(state_id) is not str or _TURN_COMPACTION_STATE_ID_RE.fullmatch(
+        state_id
+    ) is None:
+        raise ValueError(
+            f"{context} turn_compaction_state state_id must be "
+            "'sha256:' followed by 64 lowercase hex characters"
+        )
+
+    if not isinstance(prompt_ids, (list, tuple)):
+        raise ValueError(f"{context} state anchor prompt must be a token ID list")
+    if any(type(token_id) is not int or token_id < 0 for token_id in prompt_ids):
+        raise ValueError(f"{context} state anchor prompt contains an invalid token ID")
+    carried_prefix_len = values["carried_prefix_len"]
+    protected_prefix_len = values["protected_prefix_len"]
+    if carried_prefix_len > len(prompt_ids):
+        raise ValueError(
+            f"{context} turn_compaction_state carried_prefix_len exceeds "
+            "the physical prompt length"
+        )
+    if protected_prefix_len > carried_prefix_len:
+        raise ValueError(
+            f"{context} turn_compaction_state protected_prefix_len exceeds "
+            "carried_prefix_len"
+        )
+
+    carried_prefix_token_ids = list(prompt_ids[:carried_prefix_len])
+    expected_state_id = compute_turn_compaction_state_id(
+        version=values["version"],
+        position_offset=values["position_offset"],
+        protected_prefix_len=protected_prefix_len,
+        num_turns_evicted=values["num_turns_evicted"],
+        carried_prefix_num_live_turns=live_turns,
+        carried_prefix_len=carried_prefix_len,
+        carried_prefix_token_ids=carried_prefix_token_ids,
+    )
+    if state_id != expected_state_id:
+        raise ValueError(
+            f"{context} turn_compaction_state state_id does not match "
+            "the carried prompt prefix"
+        )
+
+    return TurnCompactionStateWire(
+        version=values["version"],
+        position_offset=values["position_offset"],
+        protected_prefix_len=protected_prefix_len,
+        num_turns_evicted=values["num_turns_evicted"],
+        carried_prefix_num_live_turns=live_turns,
+        carried_prefix_len=carried_prefix_len,
+        state_id=state_id,
+    )
+
+
 class CallWire(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
-    """A single vLLM chat() call within a rollout (Phase B of
+    """A single inference chat() call within a rollout (Phase B of
     plans/two_phase_per_call_trainer.md).
 
     With Phase4 prefix-caching mode (orchestrator.compaction_padding.
@@ -119,15 +368,14 @@ class CallWire(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     (phase 1 over [0, evict_end) + cache splice + phase 2 over
     [evict_end, len(submitted_prompt))) when admission fired.
 
-    ``submitted_prompt_ids`` is the PRE-eviction prompt (what vLLM
-    received). The trainer's two-phase forward needs this to run
-    phase 1 over [0, evict_end). The post-eviction view used as
-    ``TrainingSample.prompt_ids`` is the same sequence with
-    ``[evict_start, evict_end)`` deleted — derivable from this struct
-    by replaying ``compaction_events``.
+    ``submitted_prompt_ids`` is the physical prompt received by the inference
+    server: pre-event when admission compacts it, unchanged when a carried call
+    has no new event. Legacy vLLM replay uses it for phase 1. SGLang mode 1
+    retains it only for validation; the batch adapter clears ``calls`` before
+    trainer dispatch.
     """
 
-    # Tokens vLLM received as the prompt for this call (pre-eviction).
+    # Tokens the inference server received as the prompt (pre-eviction).
     submitted_prompt_ids: list[int]
 
     # Tokens sampled during this call.
@@ -157,6 +405,13 @@ class CallWire(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     #     contribution so its persistent cache layout matches V's.
     # Empty when auto-pad did not fire for this call.
     trailing_pad_ids: list[int] = msgspec.field(default_factory=list)
+
+    # 0 = legacy vLLM warmup/KV splice; 1 = SGLang post-trim prompt replay.
+    compaction_replay_mode: int = COMPACTION_REPLAY_MODE_LEGACY
+
+    # Client-carried cumulative turn-compaction state. Trailing and optional so
+    # CallWire arrays emitted before this field continue to decode unchanged.
+    turn_compaction_state: TurnCompactionStateWire | None = None
 
 
 # Orchestrator -> Packer
@@ -190,6 +445,9 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # One CallWire per vLLM chat() call merged into this sample. None when
     # compaction is disabled (the trainer uses the merged path instead).
     calls: list[CallWire] | None = None
+
+    # Aggregate replay contract. Mode 1 samples contain exactly one mode 1 call.
+    compaction_replay_mode: int = COMPACTION_REPLAY_MODE_LEGACY
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -237,3 +495,6 @@ class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     # per-call segmented forward iterates these. None when the sample
     # didn't come from a compaction run.
     calls: list[CallWire] | None = None
+
+    # Retained after mode 1 events/calls are cleared before trainer dispatch.
+    compaction_replay_mode: int = COMPACTION_REPLAY_MODE_LEGACY

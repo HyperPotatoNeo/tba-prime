@@ -10,12 +10,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
 import verifiers as vf
 
 from prime_rl.orchestrator.trajectories import (
     _build_summary_sample,
     interleave_rollout,
 )
+from prime_rl.transport.types import compute_turn_compaction_state_id
 
 
 def _step(
@@ -83,6 +85,39 @@ def _summary_payload(
     }
 
 
+def _prefill_trim_summary_payload():
+    submitted = [10, 11, 12, 13, 14, 15]
+    kept = [10, 11, 14, 15]
+    payload = _summary_payload(
+        prompt_ids=kept,
+        completion_ids=[20, 21],
+        logprobs=[-0.1, -0.2],
+    )
+    payload.update(
+        {
+            "compaction_replay_mode": "prefill_trim",
+            "submitted_prompt_token_ids": submitted,
+            "native_prompt_token_ids": submitted,
+            "completion_temperature": 0.25,
+            "compaction_events": [
+                {
+                    "num_output_tokens_at_compaction": 0,
+                    "tokens_evicted": 2,
+                    "position_offset_after": 2,
+                    "num_prompt_tokens": len(kept),
+                    "evict_start": 2,
+                    "new_user_fragment_len": 1,
+                    "kept_indices": [0, 1, 4, 5],
+                    "kept_token_ids": kept,
+                    "last_turn_evicted": 0,
+                    "num_turns_evicted_after": 1,
+                }
+            ],
+        }
+    )
+    return payload
+
+
 # ─── _build_summary_sample (pure helper) ───
 
 
@@ -109,6 +144,296 @@ def test_build_summary_sample_happy_path():
     assert sample.advantage is None
     assert sample.compaction_events is None
     assert sample.routed_experts is None
+    assert sample.calls is None
+    assert sample.compaction_replay_mode == 0
+
+
+def test_build_summary_sample_prefill_trim_uses_authoritative_survivors():
+    from prime_rl.trainer.batch import prepare_sample
+    from prime_rl.transport.types import COMPACTION_REPLAY_MODE_PREFILL_TRIM
+
+    payload = _prefill_trim_summary_payload()
+    step = _step(
+        prompt_ids=[1, 2],
+        completion_ids=[3, 4],
+        extras={"summary_trainsample": payload},
+    )
+
+    sample = _build_summary_sample(step, temperature=0.7, has_error=False)
+
+    assert sample is not None
+    assert sample.compaction_replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+    assert sample.prompt_ids == [10, 11, 14, 15]
+    assert sample.compaction_events is None
+    assert sample.calls is not None
+    assert len(sample.calls) == 1
+    call = sample.calls[0]
+    assert call.compaction_replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+    assert call.submitted_prompt_ids == [10, 11, 12, 13, 14, 15]
+    assert call.completion_ids == sample.completion_ids == [20, 21]
+    assert call.completion_logprobs == sample.completion_logprobs
+    assert call.completion_temperatures == sample.completion_temperatures == [
+        0.25,
+        0.25,
+    ]
+    assert len(call.compaction_events) == 1
+    assert call.compaction_events[0].kept_token_ids == sample.prompt_ids
+
+    micro_batch = prepare_sample(sample, seq_len=32)
+    assert micro_batch.position_ids == [0, 1, 4, 5, 6, 7]
+    assert micro_batch.compaction_events is None
+    assert micro_batch.calls is None
+    assert (
+        micro_batch.compaction_replay_mode
+        == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+    )
+
+
+def test_build_summary_sample_prefill_trim_supports_state_only_replay():
+    from prime_rl.trainer.batch import prepare_sample
+
+    prompt_ids = [10, 11, 12, 13, 14, 15]
+    carried_prefix_len = 4
+    state = {
+        "version": 1,
+        "position_offset": 8,
+        "protected_prefix_len": 2,
+        "num_turns_evicted": 2,
+        "carried_prefix_num_live_turns": 1,
+        "carried_prefix_len": carried_prefix_len,
+    }
+    state["state_id"] = compute_turn_compaction_state_id(
+        **state,
+        carried_prefix_token_ids=prompt_ids[:carried_prefix_len],
+    )
+    payload = _summary_payload(
+        prompt_ids=prompt_ids,
+        completion_ids=[20, 21],
+        logprobs=[-0.1, -0.2],
+    )
+    payload.update(
+        {
+            "compaction_replay_mode": "prefill_trim",
+            "submitted_prompt_token_ids": prompt_ids,
+            "native_prompt_token_ids": prompt_ids,
+            "completion_temperature": 0.25,
+            "compaction_events": [],
+            "turn_compaction_state": state,
+        }
+    )
+    step = _step(
+        prompt_ids=[1],
+        completion_ids=[2],
+        extras={"summary_trainsample": payload},
+    )
+
+    sample = _build_summary_sample(step, temperature=0.7, has_error=False)
+
+    assert sample is not None
+    assert sample.prompt_ids == prompt_ids
+    assert sample.calls is not None and len(sample.calls) == 1
+    call = sample.calls[0]
+    assert call.compaction_events == []
+    assert call.turn_compaction_state is not None
+    assert call.turn_compaction_state.position_offset == 8
+    assert prepare_sample(sample, seq_len=32).position_ids == [
+        0,
+        1,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+    ]
+
+
+def test_build_summary_sample_prefill_trim_supports_cumulative_event_state():
+    from prime_rl.trainer.batch import prepare_sample
+
+    payload = _prefill_trim_summary_payload()
+    event = payload["compaction_events"][0]
+    event["position_offset_after"] = 4
+    event["last_turn_evicted"] = 1
+    event["num_turns_evicted_after"] = 2
+    kept = payload["prompt_token_ids"]
+    state = {
+        "version": 1,
+        "position_offset": 4,
+        "protected_prefix_len": 2,
+        "num_turns_evicted": 2,
+        "carried_prefix_num_live_turns": 1,
+        "carried_prefix_len": len(kept),
+    }
+    state["state_id"] = compute_turn_compaction_state_id(
+        **state,
+        carried_prefix_token_ids=kept,
+    )
+    payload["turn_compaction_state"] = state
+    step = _step(
+        prompt_ids=[1],
+        completion_ids=[2],
+        extras={"summary_trainsample": payload},
+    )
+
+    sample = _build_summary_sample(step, temperature=0.7, has_error=False)
+
+    assert sample is not None
+    assert sample.calls is not None
+    call = sample.calls[0]
+    assert call.compaction_events[0].tokens_evicted == 2
+    assert call.compaction_events[0].position_offset_after == 4
+    assert call.turn_compaction_state is not None
+    assert prepare_sample(sample, seq_len=32).position_ids == [0, 1, 6, 7, 8, 9]
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "wrong_survivors",
+        "wrong_indices",
+        "missing_submitted_prompt",
+        "native_prompt_mismatch",
+        "missing_temperature",
+    ],
+)
+def test_build_summary_sample_prefill_trim_rejects_malformed_survivors(
+    malformation,
+):
+    payload = _prefill_trim_summary_payload()
+    if malformation == "wrong_survivors":
+        payload["prompt_token_ids"][-1] = 99
+    elif malformation == "wrong_indices":
+        payload["compaction_events"][0]["kept_indices"] = [0, 1, 3, 5]
+    elif malformation == "missing_submitted_prompt":
+        payload["submitted_prompt_token_ids"] = []
+    elif malformation == "native_prompt_mismatch":
+        payload["native_prompt_token_ids"][-1] = 99
+    else:
+        payload.pop("completion_temperature")
+    step = _step(
+        prompt_ids=[1],
+        completion_ids=[2],
+        extras={"summary_trainsample": payload},
+    )
+
+    with pytest.raises(ValueError, match="prefill_trim summary replay"):
+        _build_summary_sample(step, temperature=1.0, has_error=False)
+
+
+def test_build_summary_sample_uses_payload_temperature_with_legacy_fallback():
+    payload = _summary_payload(
+        prompt_ids=[10],
+        completion_ids=[20, 21],
+    )
+    payload["completion_temperature"] = 0.2
+    step = _step(
+        prompt_ids=[1],
+        completion_ids=[2],
+        extras={"summary_trainsample": payload},
+    )
+
+    sample = _build_summary_sample(step, temperature=0.9, has_error=False)
+    assert sample is not None
+    assert sample.completion_temperatures == [0.2, 0.2]
+
+    payload.pop("completion_temperature")
+    legacy = _build_summary_sample(step, temperature=0.9, has_error=False)
+    assert legacy is not None
+    assert legacy.completion_temperatures == [0.9, 0.9]
+
+
+def test_prefill_trim_summary_greedy_temperature_is_effective_everywhere():
+    from prime_rl.trainer.batch import prepare_sample
+
+    payload = _prefill_trim_summary_payload()
+    payload["completion_temperature"] = 0.0
+    step = _step(
+        prompt_ids=[1],
+        completion_ids=[2],
+        extras={"summary_trainsample": payload},
+    )
+
+    sample = _build_summary_sample(step, temperature=0.7, has_error=False)
+
+    assert sample is not None
+    assert sample.completion_temperatures == [1.0, 1.0]
+    assert sample.calls is not None
+    assert sample.calls[0].completion_temperatures == [1.0, 1.0]
+    assert prepare_sample(sample, seq_len=32).temperatures == [1.0] * 6
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [-0.1, float("nan"), float("inf"), float("-inf")],
+)
+def test_summary_sample_rejects_invalid_training_temperature(temperature):
+    payload = _prefill_trim_summary_payload()
+    payload["completion_temperature"] = temperature
+    step = _step(
+        prompt_ids=[1],
+        completion_ids=[2],
+        extras={"summary_trainsample": payload},
+    )
+
+    with pytest.raises(ValueError, match="training temperature"):
+        _build_summary_sample(step, temperature=0.7, has_error=False)
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        "valid-plus-none",
+        "valid-plus-malformed-dict",
+        "valid-plus-malformed-list",
+        "valid-plus-malformed-object",
+        "two-valid",
+        "sole-malformed",
+    ],
+)
+def test_build_summary_sample_prefill_trim_rejects_invalid_raw_event_history(
+    history,
+):
+    payload = _prefill_trim_summary_payload()
+    valid = payload["compaction_events"][0]
+    malformed = {
+        "valid-plus-none": None,
+        "valid-plus-malformed-dict": {"tokens_evicted": "bad"},
+        "valid-plus-malformed-list": [0, "bad", 0],
+        "valid-plus-malformed-object": object(),
+    }
+    if history == "two-valid":
+        payload["compaction_events"] = [valid, dict(valid)]
+    elif history == "sole-malformed":
+        payload["compaction_events"] = [{"tokens_evicted": "bad"}]
+    else:
+        payload["compaction_events"] = [valid, malformed[history]]
+    step = _step(
+        prompt_ids=[1],
+        completion_ids=[2],
+        extras={"summary_trainsample": payload},
+    )
+    error = (
+        "exactly one valid compaction event"
+        if history == "sole-malformed"
+        else "exactly one raw compaction event"
+    )
+
+    with pytest.raises(ValueError, match=error):
+        _build_summary_sample(step, temperature=1.0, has_error=False)
+
+
+def test_build_summary_sample_unknown_replay_mode_fails_closed():
+    payload = _summary_payload(prompt_ids=[10], completion_ids=[20])
+    payload["compaction_replay_mode"] = "future_mode"
+    step = _step(
+        prompt_ids=[1],
+        completion_ids=[2],
+        extras={"summary_trainsample": payload},
+    )
+
+    with pytest.raises(ValueError, match="unsupported compaction_replay_mode"):
+        _build_summary_sample(step, temperature=1.0, has_error=False)
 
 
 def test_build_summary_sample_no_payload_returns_none():

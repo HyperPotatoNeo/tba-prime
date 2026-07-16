@@ -19,7 +19,14 @@ from __future__ import annotations
 
 import msgspec
 
-from prime_rl.transport.types import CompactionEventWire
+from prime_rl.transport.types import (
+    CallWire,
+    CompactionEventWire,
+    MicroBatch,
+    TrainingSample,
+    TurnCompactionStateWire,
+    compute_turn_compaction_state_id,
+)
 
 
 def _full_event() -> CompactionEventWire:
@@ -76,3 +83,102 @@ def test_compaction_event_wire_array_like_round_trip_decodes_with_new_fields():
     encoded = msgspec.json.encode(e)
     decoded = msgspec.json.decode(encoded, type=CompactionEventWire)
     assert decoded == e
+
+
+def test_legacy_transport_arrays_decode_with_replay_mode_zero():
+    call_payload = [[1], [2], [-0.1], [1.0]]
+    sample_payload = [[1], [False], [2], [True], [-0.1], [1.0]]
+    micro_batch_payload = [[1], [False], [1.0], [0.0], [0], [1.0]]
+    call = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(call_payload),
+        type=CallWire,
+    )
+    sample = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(sample_payload),
+        type=TrainingSample,
+    )
+    micro_batch = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(micro_batch_payload),
+        type=MicroBatch,
+    )
+
+    assert call.compaction_replay_mode == 0
+    assert call.turn_compaction_state is None
+    assert sample.compaction_replay_mode == 0
+    assert micro_batch.compaction_replay_mode == 0
+
+
+def test_prefill_trim_discriminator_round_trips_across_transport_structs():
+    call = CallWire([1], [2], [-0.1], [1.0], compaction_replay_mode=1)
+    sample = TrainingSample(
+        [1],
+        [False],
+        [2],
+        [True],
+        [-0.1],
+        [1.0],
+        calls=[call],
+        compaction_replay_mode=1,
+    )
+    micro_batch = MicroBatch(
+        [1, 2],
+        [False, True],
+        [1.0, 1.0],
+        [0.0, -0.1],
+        [0, 1],
+        [1.0, 1.0],
+        compaction_replay_mode=1,
+    )
+
+    for value, value_type in (
+        (call, CallWire),
+        (sample, TrainingSample),
+        (micro_batch, MicroBatch),
+    ):
+        decoded = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(value),
+            type=value_type,
+        )
+        assert decoded.compaction_replay_mode == 1
+
+
+def test_turn_compaction_state_and_call_wire_round_trip():
+    prompt_ids = [10, 11, 12, 13]
+    state = TurnCompactionStateWire(
+        version=1,
+        position_offset=8,
+        protected_prefix_len=2,
+        num_turns_evicted=2,
+        carried_prefix_num_live_turns=1,
+        carried_prefix_len=len(prompt_ids),
+        state_id=compute_turn_compaction_state_id(
+            version=1,
+            position_offset=8,
+            protected_prefix_len=2,
+            num_turns_evicted=2,
+            carried_prefix_num_live_turns=1,
+            carried_prefix_len=len(prompt_ids),
+            carried_prefix_token_ids=prompt_ids,
+        ),
+    )
+    call = CallWire(
+        submitted_prompt_ids=prompt_ids,
+        completion_ids=[20],
+        completion_logprobs=[-0.1],
+        completion_temperatures=[1.0],
+        compaction_replay_mode=1,
+        turn_compaction_state=state,
+    )
+
+    decoded_state = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(state),
+        type=TurnCompactionStateWire,
+    )
+    decoded_call = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(call),
+        type=CallWire,
+    )
+
+    assert decoded_state == state
+    assert decoded_call == call
+    assert decoded_call.turn_compaction_state == state

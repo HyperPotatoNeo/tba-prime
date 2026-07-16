@@ -1,6 +1,274 @@
 import copy
+import math
 
-from prime_rl.transport.types import CompactionEventWire, MicroBatch, TrainingSample
+from prime_rl.transport.types import (
+    COMPACTION_REPLAY_MODE_LEGACY,
+    COMPACTION_REPLAY_MODE_PREFILL_TRIM,
+    CallWire,
+    CompactionEventWire,
+    MicroBatch,
+    TrainingSample,
+    TurnCompactionStateWire,
+    training_effective_temperature,
+    validate_prefill_trim_event_field_types,
+    validate_survivor_metadata,
+    validate_turn_compaction_state,
+)
+
+
+def _validate_compaction_replay_mode(mode: int) -> int:
+    mode = int(mode)
+    if mode not in {
+        COMPACTION_REPLAY_MODE_LEGACY,
+        COMPACTION_REPLAY_MODE_PREFILL_TRIM,
+    }:
+        raise ValueError(f"unsupported compaction_replay_mode: {mode}")
+    return mode
+
+
+def _validate_call_replay_modes(
+    training_example: TrainingSample,
+    sample_mode: int,
+) -> None:
+    if training_example.calls is None:
+        return
+    for call_index, call in enumerate(training_example.calls):
+        call_mode = _validate_compaction_replay_mode(call.compaction_replay_mode)
+        if call_mode != sample_mode:
+            raise ValueError(
+                "CallWire compaction_replay_mode must match its TrainingSample: "
+                f"call {call_index} has mode {call_mode}, sample has mode "
+                f"{sample_mode}"
+            )
+
+
+def requires_segmented_forward(
+    compaction_window_size: int,
+    compaction_replay_mode: int,
+) -> bool:
+    """Return whether trainer dispatch must use the unified segmented path."""
+    replay_mode = _validate_compaction_replay_mode(compaction_replay_mode)
+    return (
+        int(compaction_window_size) > 0
+        or replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+    )
+
+
+def _validate_prefill_trim_sample(
+    training_example: TrainingSample,
+) -> tuple[
+    CallWire,
+    CompactionEventWire | None,
+    TurnCompactionStateWire | None,
+]:
+    if training_example.teacher_logprobs is not None:
+        raise ValueError("prefill_trim replay is incompatible with teacher_logprobs")
+    if training_example.routed_experts is not None:
+        raise ValueError("prefill_trim replay is incompatible with routed_experts")
+    if (
+        training_example.pixel_values is not None
+        or training_example.pixel_values_shape is not None
+        or training_example.image_grid_thw is not None
+    ):
+        raise ValueError("prefill_trim replay is incompatible with multimodal metadata")
+    if training_example.compaction_events:
+        raise ValueError(
+            "prefill_trim admission events must be carried only by its CallWire"
+        )
+    if training_example.calls is None or len(training_example.calls) != 1:
+        count = 0 if training_example.calls is None else len(training_example.calls)
+        raise ValueError(
+            f"prefill_trim replay requires exactly one call, got {count}"
+        )
+
+    call = training_example.calls[0]
+    call_mode = _validate_compaction_replay_mode(call.compaction_replay_mode)
+    if call_mode != COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+        raise ValueError("prefill_trim TrainingSample requires a mode-1 CallWire")
+    if not isinstance(call.compaction_events, (list, tuple)):
+        raise ValueError("prefill_trim call compaction_events must be a list")
+    raw_state = call.turn_compaction_state
+    allowed_event_counts = {1} if raw_state is None else {0, 1}
+    if len(call.compaction_events) not in allowed_event_counts:
+        expected = "exactly one" if raw_state is None else "zero or one"
+        raise ValueError(
+            f"prefill_trim replay requires {expected} call compaction event, "
+            f"got {len(call.compaction_events)}"
+        )
+    if call.trailing_pad_ids:
+        raise ValueError("prefill_trim replay cannot carry vLLM trailing_pad_ids")
+
+    event = call.compaction_events[0] if call.compaction_events else None
+    if event is not None:
+        validate_prefill_trim_event_field_types(
+            event,
+            context="prefill_trim replay",
+        )
+        if int(event.event_kind) != 0:
+            raise ValueError("prefill_trim replay only supports eviction events")
+        if int(event.num_output_tokens_at_compaction) != 0:
+            raise ValueError("prefill_trim replay only supports admission events")
+        if int(event.tokens_evicted) <= 0:
+            raise ValueError("prefill_trim replay requires tokens_evicted > 0")
+        if raw_state is None:
+            if int(event.position_offset_after) != int(event.tokens_evicted):
+                raise ValueError(
+                    "prefill_trim one-event position offset must equal tokens evicted"
+                )
+        else:
+            state_position_offset = (
+                raw_state.get("position_offset")
+                if isinstance(raw_state, dict)
+                else getattr(raw_state, "position_offset", None)
+            )
+            state_num_turns_evicted = (
+                raw_state.get("num_turns_evicted")
+                if isinstance(raw_state, dict)
+                else getattr(raw_state, "num_turns_evicted", None)
+            )
+            state_protected_prefix_len = (
+                raw_state.get("protected_prefix_len")
+                if isinstance(raw_state, dict)
+                else getattr(raw_state, "protected_prefix_len", None)
+            )
+            if type(state_position_offset) is not int or int(
+                event.position_offset_after
+            ) != state_position_offset:
+                raise ValueError(
+                    "prefill_trim event cumulative position offset does not "
+                    "match turn_compaction_state"
+                )
+            if type(state_num_turns_evicted) is not int or int(
+                event.num_turns_evicted_after
+            ) != state_num_turns_evicted:
+                raise ValueError(
+                    "prefill_trim event cumulative turn count does not match "
+                    "turn_compaction_state"
+                )
+            if type(state_protected_prefix_len) is not int or int(
+                event.evict_start
+            ) != state_protected_prefix_len:
+                raise ValueError(
+                    "prefill_trim event protected prefix does not match "
+                    "turn_compaction_state"
+                )
+
+        kept_indices, kept_token_ids = validate_survivor_metadata(
+            event.kept_indices,
+            event.kept_token_ids,
+            context="prefill_trim replay",
+        )
+        if not kept_token_ids:
+            raise ValueError("prefill_trim replay requires non-empty kept_token_ids")
+        if len(kept_token_ids) != int(event.num_prompt_tokens):
+            raise ValueError(
+                "prefill_trim kept_token_ids length must equal num_prompt_tokens"
+            )
+        if training_example.prompt_ids != kept_token_ids:
+            raise ValueError(
+                "prefill_trim TrainingSample.prompt_ids must equal kept_token_ids"
+            )
+
+        start = int(event.evict_start)
+        end = start + int(event.tokens_evicted)
+        if start < 0 or end > len(call.submitted_prompt_ids):
+            raise ValueError(
+                "prefill_trim eviction range is outside submitted prompt"
+            )
+        replayed = (
+            call.submitted_prompt_ids[:start] + call.submitted_prompt_ids[end:]
+        )
+        if replayed != kept_token_ids:
+            raise ValueError(
+                "prefill_trim submitted prompt deletion does not produce "
+                "kept_token_ids"
+            )
+        if start > len(kept_token_ids):
+            raise ValueError(
+                "prefill_trim evict_start exceeds the post-trim prompt"
+            )
+
+        if not kept_indices:
+            raise ValueError("prefill_trim replay requires non-empty kept_indices")
+        if len(kept_indices) != len(kept_token_ids):
+            raise ValueError(
+                "prefill_trim kept_indices length must equal kept_token_ids length"
+            )
+        if any(
+            index < 0 or index >= len(call.submitted_prompt_ids)
+            for index in kept_indices
+        ):
+            raise ValueError(
+                "prefill_trim kept_indices are outside the submitted prompt"
+            )
+        if any(
+            left >= right for left, right in zip(kept_indices, kept_indices[1:])
+        ):
+            raise ValueError("prefill_trim kept_indices must be strictly increasing")
+        expected_indices = list(range(start)) + list(
+            range(end, len(call.submitted_prompt_ids))
+        )
+        if kept_indices != expected_indices:
+            raise ValueError(
+                "prefill_trim kept_indices do not match the eviction range"
+            )
+        selected = [call.submitted_prompt_ids[index] for index in kept_indices]
+        if selected != kept_token_ids:
+            raise ValueError("prefill_trim kept_indices select different tokens")
+    elif call.submitted_prompt_ids != training_example.prompt_ids:
+        raise ValueError(
+            "prefill_trim eventless submitted prompt must equal "
+            "TrainingSample.prompt_ids"
+        )
+
+    turn_compaction_state = None
+    if raw_state is not None:
+        turn_compaction_state = validate_turn_compaction_state(
+            raw_state,
+            training_example.prompt_ids,
+            context="prefill_trim replay",
+        )
+
+    if call.completion_ids != training_example.completion_ids:
+        raise ValueError("prefill_trim call completion_ids do not match sample")
+    if len(training_example.completion_ids) != len(
+        training_example.completion_logprobs
+    ):
+        raise ValueError(
+            "prefill_trim completion token/logprob lengths do not match"
+        )
+    if len(training_example.completion_ids) != len(
+        training_example.completion_temperatures
+    ):
+        raise ValueError(
+            "prefill_trim completion token/temperature lengths do not match"
+        )
+    if any(
+        not math.isfinite(logprob)
+        for logprob in training_example.completion_logprobs
+    ):
+        raise ValueError("prefill_trim completion logprobs must be finite")
+    try:
+        effective_temperatures = [
+            training_effective_temperature(temperature)
+            for temperature in training_example.completion_temperatures
+        ]
+    except ValueError as exc:
+        raise ValueError(
+            "prefill_trim completion temperatures must be finite and positive"
+        ) from exc
+    if effective_temperatures != training_example.completion_temperatures:
+        raise ValueError(
+            "prefill_trim completion temperatures must already be "
+            "training-effective"
+        )
+    if call.completion_logprobs != training_example.completion_logprobs:
+        raise ValueError("prefill_trim call completion_logprobs do not match sample")
+    if call.completion_temperatures != training_example.completion_temperatures:
+        raise ValueError(
+            "prefill_trim call completion_temperatures do not match sample"
+        )
+    return call, event, turn_compaction_state
 
 
 def _clamp_compaction_events(
@@ -44,11 +312,39 @@ def prepare_sample(
     compute prompt_aligned_len for its owned-range bookkeeping. See D5
     fix notes in plans/phase3_training_integration.md.
     """
+    replay_mode = _validate_compaction_replay_mode(
+        training_example.compaction_replay_mode
+    )
+    _validate_call_replay_modes(training_example, replay_mode)
+    prefill_trim_event: CompactionEventWire | None = None
+    prefill_trim_state: TurnCompactionStateWire | None = None
+    if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM:
+        _, prefill_trim_event, prefill_trim_state = (
+            _validate_prefill_trim_sample(training_example)
+        )
+
     input_ids = training_example.prompt_ids + training_example.completion_ids
     loss_mask = training_example.prompt_mask + training_example.completion_mask
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
     advantages = [training_example.advantage] * len(input_ids)
-    position_ids = list(range(len(input_ids)))
+    if prefill_trim_state is not None:
+        protected_prefix_len = prefill_trim_state.protected_prefix_len
+        position_offset = prefill_trim_state.position_offset
+        position_ids = [
+            physical
+            if physical < protected_prefix_len
+            else physical + position_offset
+            for physical in range(len(input_ids))
+        ]
+    elif prefill_trim_event is None:
+        position_ids = list(range(len(input_ids)))
+    else:
+        evict_start = int(prefill_trim_event.evict_start)
+        position_offset = int(prefill_trim_event.position_offset_after)
+        position_ids = [
+            physical if physical < evict_start else physical + position_offset
+            for physical in range(len(input_ids))
+        ]
 
     # Per-token temperatures: prompt tokens use first completion temp (masked out anyway)
     # Default to 1.0 if completion is empty (e.g., model generated only tool calls with no text)
@@ -61,7 +357,11 @@ def prepare_sample(
     routed_experts = training_example.routed_experts
     # Compaction events (kv-eviction). Passed through to the MicroBatch and
     # clamped below if the completion was truncated to fit seq_len.
-    compaction_events = training_example.compaction_events
+    compaction_events = (
+        None
+        if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+        else training_example.compaction_events
+    )
 
     # Truncate to seq_len for non-compaction runs only. In compaction runs,
     # segmented_forward processes one segment at a time with bptt_segments=1,
@@ -70,7 +370,11 @@ def prepare_sample(
     # tokens that inference sampled (and compaction events that reference
     # them), wasting inference compute and breaking the invariant that the
     # trainer trains on everything the rollout produced.
-    if len(input_ids) > seq_len and not compaction_enabled:
+    if (
+        len(input_ids) > seq_len
+        and not compaction_enabled
+        and replay_mode != COMPACTION_REPLAY_MODE_PREFILL_TRIM
+    ):
         input_ids = input_ids[:seq_len]
         loss_mask = loss_mask[:seq_len]
         inference_logprobs = inference_logprobs[:seq_len]
@@ -119,7 +423,11 @@ def prepare_sample(
     # carry events need prompt_len set (preserving the msgspec wire
     # format for existing non-compaction pipelines).
     prompt_len: int | None = None
-    if compaction_events or compaction_enabled:
+    if (
+        compaction_events
+        or compaction_enabled
+        or replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+    ):
         # Post-truncation prompt length. If truncation cut INTO the prompt
         # itself (extreme case), use the new length; otherwise it's the
         # original prompt length.
@@ -129,7 +437,15 @@ def prepare_sample(
     # Forwarded as-is from TrainingSample.calls. Only set on compaction
     # samples (the path the trainer dispatches through). None for
     # non-compaction samples to preserve the existing wire format.
-    calls = training_example.calls if compaction_events or compaction_enabled else None
+    calls = (
+        None
+        if replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+        else (
+            training_example.calls
+            if compaction_events or compaction_enabled
+            else None
+        )
+    )
 
     return MicroBatch(
         input_ids=input_ids,
@@ -148,6 +464,7 @@ def prepare_sample(
         compaction_events=compaction_events,
         prompt_len=prompt_len,
         calls=calls,
+        compaction_replay_mode=replay_mode,
     )
 
 
@@ -157,16 +474,11 @@ def _is_multimodal_sample(sample: MicroBatch) -> bool:
 
 
 def _is_compaction_sample(sample: MicroBatch) -> bool:
-    """Check if a sample carries KV cache compaction events.
+    """Check if a sample requires isolated compaction-style dispatch.
 
-    Note: this only tests whether the INFERENCE rollout triggered
-    compaction. In a compaction training run (compaction_enabled=True
-    at the call sites below), the trainer also routes event-less
-    samples through segmented_forward, so the dispatch-side treatment
-    of "compaction-like" is OR-ed with compaction_enabled at every
-    call site. This function is kept as the narrow test because it's
-    still the right test for "does this sample carry event metadata
-    the segmented path must consume".
+    Legacy samples qualify by carrying events. A prefill_trim sample qualifies
+    by its replay discriminator because its events and calls are deliberately
+    cleared before transport to prevent legacy warmup/KV-splice replay.
 
     Compaction samples CANNOT be bin-packed with any other sample because:
     1. The trainer dispatches to segmented_forward per-sample, and
@@ -177,7 +489,16 @@ def _is_compaction_sample(sample: MicroBatch) -> bool:
     Each compaction sample therefore becomes its own micro batch, same
     pattern as multimodal samples.
     """
-    return sample.compaction_events is not None and len(sample.compaction_events) > 0
+    replay_mode = _validate_compaction_replay_mode(
+        sample.compaction_replay_mode
+    )
+    return (
+        replay_mode == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+        or (
+            sample.compaction_events is not None
+            and len(sample.compaction_events) > 0
+        )
+    )
 
 
 def packed_samples_into_micro_bs(
@@ -344,15 +665,16 @@ def prepare_batch(
     a text-only batch, the all-gather will hang. We separate micro batches by modality
     and distribute them so that at each step index, all ranks see the same modality.
 
-    Three modality buckets:
+    Four modality buckets:
     1. Multimodal (pixel_values set) — triggers vision encoder.
-    2. Compaction (compaction_events set, OR compaction_enabled=True) —
+    2. SGLang prefill_trim — always one eventless segmented forward.
+    3. Legacy compaction (compaction_events set, OR compaction_enabled=True) —
        triggers segmented_forward with multiple forward passes per
        micro-batch instead of the standard single pass. If one rank
        takes the segmented branch and another the standard branch at
        the same step index, they diverge in FSDP all-gather counts
        and NCCL deadlocks.
-    3. Text (neither) — the default single-pass path.
+    4. Text (neither) — the default single-pass path.
 
     When compaction_enabled=True every non-multimodal sample is treated
     as compaction-style, so text_batches is always empty in compaction
@@ -382,9 +704,23 @@ def prepare_batch(
         return _is_compaction_sample(b) or compaction_enabled
 
     mm_batches = [b for b in micro_batches if _is_multimodal_sample(b)]
+    prefill_trim_batches = [
+        b
+        for b in micro_batches
+        if (
+            not _is_multimodal_sample(b)
+            and b.compaction_replay_mode
+            == COMPACTION_REPLAY_MODE_PREFILL_TRIM
+        )
+    ]
     compaction_batches = [
         b for b in micro_batches
-        if not _is_multimodal_sample(b) and _treat_as_compaction(b)
+        if (
+            not _is_multimodal_sample(b)
+            and b.compaction_replay_mode
+            != COMPACTION_REPLAY_MODE_PREFILL_TRIM
+            and _treat_as_compaction(b)
+        )
     ]
     text_batches = [
         b for b in micro_batches
@@ -393,14 +729,22 @@ def prepare_batch(
 
     # Pad each group independently so its count is divisible by num_train_workers
     mm_batches = _pad_group_for_distribution(mm_batches, num_train_workers)
+    prefill_trim_batches = _pad_group_for_distribution(
+        prefill_trim_batches, num_train_workers
+    )
     compaction_batches = _pad_group_for_distribution(compaction_batches, num_train_workers)
     text_batches = _pad_group_for_distribution(text_batches, num_train_workers)
 
-    # Combine: all multimodal first, then all compaction, then all text-only.
+    # Keep replay modes in separate rows so every rank makes the same dispatch.
     # Each group's length is divisible by num_train_workers, so modality
     # boundaries align with distribution rows — every column (rank) sees
     # exactly the same modality at step index i.
-    ordered = mm_batches + compaction_batches + text_batches
+    ordered = (
+        mm_batches
+        + prefill_trim_batches
+        + compaction_batches
+        + text_batches
+    )
 
     assert len(ordered) % num_train_workers == 0, "Number of micro batches is not divisible by number of data ranks"
 

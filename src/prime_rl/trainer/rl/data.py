@@ -48,6 +48,8 @@ class TensorMicroBatch(TypedDict):
     # plans/two_phase_per_call_trainer.md). None for non-compaction
     # micro batches.
     calls: list[CallWire] | None
+    # Replay discriminator retained after prefill_trim events/calls are cleared.
+    compaction_replay_mode: int
 
 
 class FakeDataLoader:
@@ -122,6 +124,8 @@ class FakeDataLoader:
             "image_grid_thw": None,
             "compaction_events": None,
             "prompt_len": None,
+            "calls": None,
+            "compaction_replay_mode": 0,
         }
 
     def _get_micro_batch(self, generator: torch.Generator) -> TensorMicroBatch:
@@ -149,6 +153,8 @@ class FakeDataLoader:
             "image_grid_thw": None,
             "compaction_events": None,
             "prompt_len": None,
+            "calls": None,
+            "compaction_replay_mode": 0,
         }
 
 
@@ -234,4 +240,5 @@ class DataLoader:
             compaction_events=micro_batch.compaction_events,
             prompt_len=micro_batch.prompt_len,
             calls=micro_batch.calls,
+            compaction_replay_mode=micro_batch.compaction_replay_mode,
         )
