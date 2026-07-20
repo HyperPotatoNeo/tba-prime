@@ -196,6 +196,10 @@ class Scheduler:
     def drains_inflight_rollouts_on_weight_sync(self) -> bool:
         return self.phase4_weight_sync_strategy == "drain"
 
+    @property
+    def preserves_kv_on_weight_sync(self) -> bool:
+        return self.phase4_weight_sync_strategy == "preserve_kv"
+
     def _begin_policy_update_drain(self, next_ckpt_step: int) -> None:
         inflight = self.inflight_rollout_count
         pending_step = self.policy_update_pending_step
@@ -249,20 +253,27 @@ class Scheduler:
         )
         return rollout_count
 
-    async def schedule_rollout(self, group_id: int):
+    def _rollout_launch_allowed(self) -> bool:
+        return self.checkpoint_ready.is_set() and not self.policy_update_draining
+
+    async def schedule_rollout(self, group_id: int) -> bool:
         """Asynchronously schedules a rollout request (or a group request for group-scoring envs)."""
+        if not self._rollout_launch_allowed():
+            return False
         if self.rate_limiter:
             await self.rate_limiter.acquire()
+        if not self._rollout_launch_allowed():
+            return False
         group = self.groups.get(group_id)
         if group is None or group.rollouts_to_schedule <= 0:
-            return
+            return False
 
         if group.pinned_client is not None:
             client_config = group.pinned_client
         else:
             client_config = await self._select_least_loaded_client()
-            if group_id not in self.groups:
-                return
+            if not self._rollout_launch_allowed() or group_id not in self.groups:
+                return False
             group.pinned_client = client_config
 
         env_name = group.example["env_name"]
@@ -296,6 +307,7 @@ class Scheduler:
             group_id=group_id,
             rollout_count=rollout_count,
         )
+        return True
 
     @property
     def inflight_rollout_count(self) -> int:
@@ -307,10 +319,7 @@ class Scheduler:
         return self.inflight_rollout_count + pending
 
     async def _schedule_next_request(self) -> bool:
-        if not self.checkpoint_ready.is_set():
-            return False
-
-        if self.policy_update_draining:
+        if not self._rollout_launch_allowed():
             return False
 
         remaining_capacity = self.max_inflight_rollouts - self.inflight_rollout_count
@@ -324,8 +333,7 @@ class Scheduler:
             env = self.train_envs.get(group.example["env_name"])
             cost = group.rollouts_to_schedule if env.requires_group_scoring else 1
             if cost <= remaining_capacity:
-                await self.schedule_rollout(group_id=group_id)
-                return True
+                return await self.schedule_rollout(group_id=group_id)
 
         if remaining_capacity < self.rollouts_per_example:
             return False
@@ -334,8 +342,7 @@ class Scheduler:
         group_id = self.next_group_id
         self.next_group_id += 1
         self.groups[group_id] = GroupState(example=example, rollouts_to_schedule=self.rollouts_per_example)
-        await self.schedule_rollout(group_id=group_id)
-        return True
+        return await self.schedule_rollout(group_id=group_id)
 
     async def _fill_inflight_requests(self) -> None:
         while await self._schedule_next_request():
@@ -409,7 +416,12 @@ class Scheduler:
 
             update_weights_start_time = time.perf_counter()
             weights_path = get_step_path(get_broadcast_dir(self.config.output_dir), next_ckpt_step)
-            await self.inference_pool.update_weights(weights_path, lora_name=self.lora_name, step=next_ckpt_step)
+            await self.inference_pool.update_weights(
+                weights_path,
+                lora_name=self.lora_name,
+                step=next_ckpt_step,
+                preserve_kv=self.preserves_kv_on_weight_sync,
+            )
             self.update_weights_time = time.perf_counter() - update_weights_start_time
             self.logger.debug(f"Updated weights to step {next_ckpt_step} in {self.update_weights_time:.2f}s")
 

@@ -72,6 +72,28 @@ CLI uses kebab-case (`--model.max-model-len`), TOML uses snake_case (`max_model_
 - **Fail early**: incompatible option combinations (e.g. CP requires flash attention, NCCL broadcast requires async level 1) should raise in `model_validator` at config resolution time, not at runtime. When adding new constraints, add a validator to the config class.
 - **Deprecation**: when renaming or removing config fields, emit a deprecation warning with a clear migration path (e.g. "field X is deprecated, use Y instead"). Do not silently drop fields — help users update their configs.
 
+### Phase4 weight synchronization
+
+Multi-turn KV-compaction runs enable incremental prompt assembly and choose how
+policy updates handle active rollouts:
+
+```toml
+[orchestrator.compaction_padding]
+enabled = true
+phase4_enabled = true
+phase4_weight_sync_strategy = "preserve_kv"
+```
+
+- `restart` is the safe default: cancel and requeue active Phase4 rollouts.
+- `drain` stops admissions and waits for active rollouts to finish.
+- `preserve_kv` pauses vLLM with `mode=keep`, updates weights without clearing
+  active KV, and resumes generation. The resumed request is intentionally
+  off-policy; new requests use the new policy-version cache salt and cannot
+  reuse old-policy prefix-cache entries.
+
+`preserve_kv` supports static full-weight inference pools only, not elastic
+LoRA pools.
+
 ## Important patterns
 
 ### Boolean fields

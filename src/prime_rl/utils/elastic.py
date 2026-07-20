@@ -467,7 +467,15 @@ class ElasticInferencePool:
 
         raise TimeoutError(f"Timed out waiting for {min_servers} ready servers (got {self.num_ready_servers})")
 
-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
+    async def update_weights(
+        self,
+        weight_dir: Path | None,
+        lora_name: str | None = None,
+        step: int = 0,
+        preserve_kv: bool = False,
+    ) -> None:
+        if preserve_kv:
+            raise ValueError("preserve_kv is not supported by elastic LoRA inference pools")
         if lora_name is None:
             raise ValueError("Elastic inference pool requires LoRA training (lora_name must be set)")
         await self.sync_weights(weight_dir, lora_name, step)

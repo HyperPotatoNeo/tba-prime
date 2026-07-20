@@ -42,7 +42,13 @@ class InferencePool(Protocol):
         """Wait for inference pool to be ready."""
         ...
 
-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
+    async def update_weights(
+        self,
+        weight_dir: Path | None,
+        lora_name: str | None = None,
+        step: int = 0,
+        preserve_kv: bool = False,
+    ) -> None:
         """Update weights on all inference servers."""
         ...
 
@@ -86,8 +92,20 @@ class StaticInferencePool:
         await check_health(self._admin_clients, timeout=timeout)
         await maybe_check_has_model(self._admin_clients, model_name, skip_model_check=self._skip_model_check)
 
-    async def update_weights(self, weight_dir: Path | None, lora_name: str | None = None, step: int = 0) -> None:
-        await update_weights(self._admin_clients, weight_dir, lora_name=lora_name, step=step)
+    async def update_weights(
+        self,
+        weight_dir: Path | None,
+        lora_name: str | None = None,
+        step: int = 0,
+        preserve_kv: bool = False,
+    ) -> None:
+        await update_weights(
+            self._admin_clients,
+            weight_dir,
+            lora_name=lora_name,
+            step=step,
+            preserve_kv=preserve_kv,
+        )
 
     def get_metrics(self) -> dict[str, float]:
         return {}
@@ -222,19 +240,26 @@ async def check_health(
 NCCL_READY_MARKER = "NCCL_READY"
 
 
-async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
-    """Abort in-flight requests and pause all inference engines for weight sync."""
+async def _pause_engines(admin_clients: list[AsyncClient], preserve_kv: bool = False) -> None:
+    """Pause all inference engines for a coordinated weight update."""
     logger = get_logger()
-    logger.info("Pausing inference engines for weight update")
+    mode = "keep" if preserve_kv else "wait"
+    logger.info(f"Pausing inference engines for weight update (mode={mode})")
 
     async def _pause(client: AsyncClient) -> None:
         response = await client.post(
             "/pause",
-            params={"mode": "abort", "clear_cache": "false"},
+            params={"mode": mode, "clear_cache": "false"},
         )
         response.raise_for_status()
 
-    await asyncio.gather(*[_pause(client) for client in admin_clients])
+    results = await asyncio.gather(
+        *[_pause(client) for client in admin_clients],
+        return_exceptions=True,
+    )
+    errors = [result for result in results if isinstance(result, Exception)]
+    if errors:
+        raise RuntimeError(f"Failed to pause all inference engines ({len(errors)} failure(s))") from errors[0]
     logger.info("All inference engines paused")
 
 
@@ -255,20 +280,21 @@ async def update_weights(
     weight_dir: Path | None,
     lora_name: str | None = None,
     step: int = 0,
+    preserve_kv: bool = False,
 ) -> None:
     """Update weights on static inference servers.
 
-    Aborts any in-flight server-side requests before performing the weight
-    update, then resumes. This ensures all DP workers are idle and can
-    participate in the collective weight transfer without retaining old KV
-    state.
-
-    Note: The server-side /update_weights endpoint automatically resets the prefix cache
-    to invalidate any cached KV states computed with the old weights.
+    The default path waits for active requests and resets prefix KV. With
+    preserve_kv=True, active generations are frozen, their stale KV remains in
+    place through the update, and generation resumes afterward. New requests
+    are isolated by the server's policy-version cache salt.
     """
     logger = get_logger()
 
     weight_dir_posix = weight_dir.as_posix() if weight_dir is not None else None
+
+    if preserve_kv and lora_name is not None:
+        raise ValueError("preserve_kv is not supported for LoRA weight updates")
 
     if lora_name is not None and weight_dir is not None:
         await load_lora_adapter(admin_clients, lora_name, weight_dir)
@@ -277,16 +303,17 @@ async def update_weights(
         async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
             response = await admin_client.post(
                 "/update_weights",
-                json={"weight_dir": weight_dir},
+                json={
+                    "weight_dir": weight_dir,
+                    "step": step,
+                    "reset_prefix_cache": not preserve_kv,
+                },
             )
             response.raise_for_status()
 
-        # Abort any server-side stragglers before the collective weight update.
-        # The scheduler requeues tracked rollout slots before this call when
-        # retained KV state would be invalidated by the prefix-cache reset.
-        await _pause_engines(admin_clients)
-
         try:
+            await _pause_engines(admin_clients, preserve_kv=preserve_kv)
+
             # Create ready marker before servers enter receive path (used by NCCL broadcast)
             if weight_dir is not None:
                 nccl_ready_file = weight_dir / NCCL_READY_MARKER

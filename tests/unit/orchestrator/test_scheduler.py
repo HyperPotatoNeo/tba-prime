@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from prime_rl.configs.orchestrator import CompactionPaddingConfig
 from prime_rl.orchestrator.scheduler import GroupState, InflightRequest, Scheduler
 from prime_rl.utils.async_utils import safe_cancel
 
@@ -17,7 +18,11 @@ def make_scheduler() -> Scheduler:
     scheduler.ckpt_step = 7
     scheduler.config = SimpleNamespace(
         output_dir=Path("/tmp/prime-rl-test"),
-        compaction_padding=SimpleNamespace(enabled=False, phase4_enabled=False),
+        compaction_padding=SimpleNamespace(
+            enabled=False,
+            phase4_enabled=False,
+            phase4_weight_sync_strategy="restart",
+        ),
     )
     scheduler.logger = MagicMock()
     scheduler.checkpoint_ready = asyncio.Event()
@@ -30,6 +35,9 @@ def make_scheduler() -> Scheduler:
     scheduler.groups = {}
     scheduler.max_off_policy_steps = 1
     scheduler.cancelled_rollouts_count = 0
+    scheduler.weight_sync_restarted_rollouts_count = 0
+    scheduler.policy_update_draining = False
+    scheduler.policy_update_pending_step = None
     scheduler.policy_update_lock = asyncio.Lock()
     scheduler.inflight_policy_update_task = None
     scheduler.update_policy_task = None
@@ -38,6 +46,15 @@ def make_scheduler() -> Scheduler:
     scheduler.policy_update_draining = False
     scheduler.policy_update_pending_step = None
     return scheduler
+
+
+def test_preserve_kv_is_valid_weight_sync_strategy():
+    config = CompactionPaddingConfig(
+        phase4_enabled=True,
+        phase4_weight_sync_strategy="preserve_kv",
+    )
+
+    assert config.phase4_weight_sync_strategy == "preserve_kv"
 
 
 def test_update_off_policy_does_not_increment_interleaved_on_policy_tasks():
@@ -53,8 +70,18 @@ def test_update_off_policy_does_not_increment_interleaved_on_policy_tasks():
         interleaved_task = None
 
         scheduler.inflight_requests = {
-            stale_task: InflightRequest(off_policy_steps=1, client_config=client, env_name="test", group_id=1),
-            survivor_task: InflightRequest(off_policy_steps=0, client_config=client, env_name="test", group_id=2),
+            stale_task: InflightRequest(
+                off_policy_steps=1,
+                client_config=client,
+                env_name="test",
+                group_id=1,
+            ),
+            survivor_task: InflightRequest(
+                off_policy_steps=0,
+                client_config=client,
+                env_name="test",
+                group_id=2,
+            ),
         }
 
         async def drop_group(group_id: int) -> int:
@@ -188,6 +215,72 @@ def test_drain_weight_sync_defers_policy_update_until_inflight_rollouts_finish()
     asyncio.run(run())
 
 
+def test_preserve_kv_updates_without_cancelling_inflight_rollouts():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.config.compaction_padding.enabled = True
+        scheduler.config.compaction_padding.phase4_enabled = True
+        scheduler.config.compaction_padding.phase4_weight_sync_strategy = "preserve_kv"
+
+        active_task = asyncio.create_task(asyncio.sleep(60))
+        client = SimpleNamespace(api_base_url="http://test", extra_headers={})
+        scheduler.inflight_requests = {
+            active_task: InflightRequest(
+                off_policy_steps=0,
+                client_config=client,
+                env_name="test",
+                group_id=1,
+                rollout_count=2,
+            )
+        }
+        scheduler.inference_pool = SimpleNamespace(
+            update_weights=AsyncMock(),
+            update_model_name=MagicMock(),
+        )
+        scheduler._update_off_policy = AsyncMock()
+
+        with (
+            patch("prime_rl.orchestrator.scheduler.get_latest_ckpt_step", return_value=8),
+            patch("prime_rl.orchestrator.scheduler.wait_for_path", new=AsyncMock()),
+        ):
+            await scheduler.maybe_update_policy()
+
+        assert active_task in scheduler.inflight_requests
+        assert not active_task.cancelled()
+        scheduler.inference_pool.update_weights.assert_awaited_once()
+        assert scheduler.inference_pool.update_weights.await_args.kwargs["preserve_kv"] is True
+        assert scheduler.ckpt_step == 8
+        active_task.cancel()
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+
+
+def test_schedule_rollout_rechecks_weight_sync_gate_after_rate_limit_wait():
+    async def run() -> None:
+        scheduler = make_scheduler()
+        scheduler.rate_limiter = SimpleNamespace()
+
+        async def acquire() -> None:
+            scheduler.checkpoint_ready.clear()
+
+        scheduler.rate_limiter.acquire = acquire
+        scheduler.groups = {
+            1: GroupState(
+                example={"env_name": "test"},
+                rollouts_to_schedule=1,
+            )
+        }
+
+        launched = await scheduler.schedule_rollout(group_id=1)
+
+        assert launched is False
+        assert scheduler.groups[1].rollouts_to_schedule == 1
+        assert scheduler.inflight_requests == {}
+
+    asyncio.run(run())
+
+
 def test_drain_weight_sync_updates_once_inflight_rollouts_are_empty():
     async def run() -> None:
         scheduler = make_scheduler()
@@ -198,7 +291,7 @@ def test_drain_weight_sync_updates_once_inflight_rollouts_are_empty():
         scheduler.policy_update_pending_step = 8
         applied_steps: list[int] = []
 
-        async def update_weights(weight_dir, lora_name=None, step=0) -> None:
+        async def update_weights(weight_dir, lora_name=None, step=0, preserve_kv=False) -> None:
             applied_steps.append(step)
 
         scheduler.inference_pool = SimpleNamespace(
@@ -228,7 +321,7 @@ def test_maybe_update_policy_reuses_inflight_update_after_cancellation():
         release = asyncio.Event()
         applied_steps: list[int] = []
 
-        async def update_weights(weight_dir, lora_name=None, step=0) -> None:
+        async def update_weights(weight_dir, lora_name=None, step=0, preserve_kv=False) -> None:
             applied_steps.append(step)
             started.set()
             await release.wait()
@@ -320,7 +413,7 @@ def test_stop_cancels_inflight_policy_update_task():
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
-        async def update_weights(weight_dir, lora_name=None, step=0) -> None:
+        async def update_weights(weight_dir, lora_name=None, step=0, preserve_kv=False) -> None:
             started.set()
             try:
                 await asyncio.Future()

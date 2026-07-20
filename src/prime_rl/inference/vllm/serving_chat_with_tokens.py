@@ -16,6 +16,8 @@ from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 
+from prime_rl.inference.vllm.cache_salt import apply_prime_rl_policy_cache_salt
+
 logger = init_logger(__name__)
 
 
@@ -50,6 +52,29 @@ class ChatCompletionRequestWithTokens(ChatCompletionRequest):
 
 class OpenAIServingChatWithTokens(OpenAIServingChat):
     """OpenAI-compatible generate API that allows token-in and routed experts capture."""
+
+    def _apply_prime_rl_policy_cache_salt(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request],
+    ) -> None:
+        if raw_request is None:
+            return
+        policy_version = int(
+            getattr(raw_request.app.state, "prime_rl_prefix_cache_policy_version", 0)
+        )
+        apply_prime_rl_policy_cache_salt(
+            request,
+            policy_version=policy_version,
+        )
+
+    async def create_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Optional[Request] = None,
+    ) -> Union[AsyncGenerator[str, None], ChatCompletionResponse, ErrorResponse]:
+        self._apply_prime_rl_policy_cache_salt(request, raw_request)
+        return await super().create_chat_completion(request, raw_request)
 
     async def chat_completion_full_generator(
         self,
@@ -102,6 +127,8 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        self._apply_prime_rl_policy_cache_salt(request, raw_request)
+
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None

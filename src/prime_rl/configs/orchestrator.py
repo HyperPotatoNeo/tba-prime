@@ -905,14 +905,16 @@ class CompactionPaddingConfig(BaseConfig):
     ] = False
 
     phase4_weight_sync_strategy: Annotated[
-        Literal["restart", "drain"],
+        Literal["restart", "drain", "preserve_kv"],
         Field(
             description=(
                 "How Phase4 handles an RL weight sync while rollouts are "
                 "in flight. 'restart' cancels active Phase4 rollouts and "
                 "requeues them before updating weights. 'drain' stops "
                 "launching new rollouts, waits for active rollouts to finish, "
-                "then updates weights at an idle boundary."
+                "then updates weights at an idle boundary. 'preserve_kv' "
+                "briefly pauses generation, updates weights in place, and "
+                "resumes active rollouts with their existing stale KV cache."
             ),
         ),
     ] = "restart"

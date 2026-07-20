@@ -161,6 +161,36 @@ def engine_client(request: Request) -> EngineClient:
     return request.app.state.engine_client
 
 
+async def reset_prefix_cache_or_500(
+    request: Request,
+    *,
+    reason: str,
+    policy_version: int | None = None,
+) -> JSONResponse | None:
+    reset_ok = await engine_client(request).reset_prefix_cache()
+    if not reset_ok:
+        logger.error(
+            "Prefix-cache reset failed after %s; refusing to continue because stale KV would make RL logprobs invalid",
+            reason,
+        )
+        return JSONResponse(
+            content={
+                "status": "error",
+                "error": "prefix_cache_reset_failed",
+                "reason": reason,
+            },
+            status_code=500,
+        )
+    if policy_version is not None:
+        request.app.state.prime_rl_prefix_cache_policy_version = policy_version
+    logger.info(
+        "Prefix-cache reset succeeded after %s (policy_version=%s)",
+        reason,
+        getattr(request.app.state, "prime_rl_prefix_cache_policy_version", None),
+    )
+    return None
+
+
 def base(request: Request) -> OpenAIServing:
     return request.app.state.openai_serving_tokenization
 
@@ -186,7 +216,7 @@ async def pause(
     clear_cache: bool = False,
 ):
     await engine_client(request).pause_generation(mode=mode, clear_cache=clear_cache)
-    return {"status": "paused"}
+    return {"status": "paused", "mode": mode, "clear_cache": clear_cache}
 
 
 @router.post("/resume")
@@ -198,9 +228,28 @@ async def resume(request: Request):
 @router.post("/update_weights")
 async def update_weights(request: Request):
     data = await request.json()
+    policy_version = int(data.get("step") or 0)
+    reset_prefix_cache = bool(data.get("reset_prefix_cache", True))
     await engine_client(request).collective_rpc("update_weights_from_path", args=(data.get("weight_dir"),))
-    await engine_client(request).reset_prefix_cache()
-    return {"status": "ok"}
+    if reset_prefix_cache:
+        reset_error = await reset_prefix_cache_or_500(
+            request,
+            reason=f"weight update step {policy_version}",
+            policy_version=policy_version,
+        )
+        if reset_error is not None:
+            return reset_error
+    else:
+        request.app.state.prime_rl_prefix_cache_policy_version = policy_version
+        logger.info(
+            "Preserved in-flight KV after weight update step %s; new requests will use the updated policy cache salt",
+            policy_version,
+        )
+    return {
+        "status": "ok",
+        "prefix_cache_reset": reset_prefix_cache,
+        "policy_version": policy_version,
+    }
 
 
 @router.post("/load_lora_adapter")
@@ -214,9 +263,19 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
     response = await handler.load_lora_adapter(lora_request)
     if isinstance(response, ErrorResponse):
         return JSONResponse(content=response.model_dump(), status_code=response.error.code)
-    # Reset prefix cache to invalidate KV states computed with old weights
-    await engine_client(raw_request).reset_prefix_cache()
-    return {"status": "ok"}
+    policy_version = int(getattr(raw_request.app.state, "prime_rl_prefix_cache_policy_version", 0)) + 1
+    reset_error = await reset_prefix_cache_or_500(
+        raw_request,
+        reason=f"LoRA load {lora_request.lora_name}",
+        policy_version=policy_version,
+    )
+    if reset_error is not None:
+        return reset_error
+    return {
+        "status": "ok",
+        "prefix_cache_reset": True,
+        "policy_version": policy_version,
+    }
 
 
 @router.post("/init_broadcaster")
@@ -273,6 +332,7 @@ async def custom_init_app_state(
     2. Replace the serving_chat with our OpenAIServingChatWithTokens wrapper.
     """
     await init_app_state(engine_client, state, args, supported_tasks)
+    state.prime_rl_prefix_cache_policy_version = 0
 
     if "generate" in supported_tasks and state.openai_serving_chat is not None:
         original_chat = state.openai_serving_chat
