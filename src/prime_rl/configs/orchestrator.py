@@ -835,6 +835,26 @@ class CompactionPaddingConfig(BaseConfig):
         Field(description="Debug-only placeholder for logging text removed by turn eviction."),
     ] = False
 
+    phase4_enabled: Annotated[
+        bool,
+        Field(
+            description=("Enable incremental Phase4 prompt assembly for multi-turn KV compaction rollouts."),
+        ),
+    ] = False
+
+    phase4_weight_sync_strategy: Annotated[
+        Literal["restart", "drain", "preserve_kv"],
+        Field(
+            description=(
+                "How Phase4 handles policy updates while rollouts are in flight. "
+                "'restart' requeues active rollouts, 'drain' waits for them to "
+                "finish, and 'preserve_kv' pauses generation with mode='keep', "
+                "updates weights in place, and resumes active rollouts with their "
+                "existing stale KV."
+            ),
+        ),
+    ] = "restart"
+
 
 class MarkovianSummaryConfig(BaseConfig):
     """Optional summary exchange inserted when Markovian turn windows overflow."""

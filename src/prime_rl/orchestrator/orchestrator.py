@@ -143,9 +143,7 @@ async def orchestrate(config: OrchestratorConfig):
         from kv_eviction.env import configure_message_padding
         from kv_eviction.padding import resolve_filler_token_id, resolve_im_end_token_id
 
-        filler_token_id = resolve_filler_token_id(
-            tokenizer, override=config.compaction_padding.filler_token_id
-        )
+        filler_token_id = resolve_filler_token_id(tokenizer, override=config.compaction_padding.filler_token_id)
         im_end_token_id = (
             config.compaction_padding.im_end_token_id
             if config.compaction_padding.im_end_token_id is not None
@@ -158,12 +156,14 @@ async def orchestrate(config: OrchestratorConfig):
             filler_token_id=filler_token_id,
             im_end_token_id=im_end_token_id,
             max_prompt_len=config.seq_len,
+            phase4_enabled=config.compaction_padding.phase4_enabled,
         )
         os.environ["KV_EVICTION_PADDING_MODEL"] = config.model.name
         os.environ["KV_EVICTION_PADDING_BLOCK_SIZE"] = str(config.compaction_padding.block_size)
         os.environ["KV_EVICTION_PADDING_FILLER_ID"] = str(filler_token_id)
         os.environ["KV_EVICTION_PADDING_IM_END_ID"] = str(im_end_token_id)
         os.environ["KV_EVICTION_PADDING_MAX_PROMPT_LEN"] = str(config.seq_len)
+        os.environ["KV_EVICTION_PADDING_PHASE4"] = "1" if config.compaction_padding.phase4_enabled else "0"
 
     if config.markovian_thinker.enabled:
         from kv_eviction.env import configure_markovian_summary, configure_markovian_thinker

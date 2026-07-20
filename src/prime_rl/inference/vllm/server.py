@@ -170,8 +170,7 @@ async def reset_prefix_cache_or_500(
     reset_ok = await engine_client(request).reset_prefix_cache()
     if not reset_ok:
         logger.error(
-            "Prefix-cache reset failed after %s; refusing to continue because "
-            "stale KV would make RL logprobs invalid",
+            "Prefix-cache reset failed after %s; refusing to continue because stale KV would make RL logprobs invalid",
             reason,
         )
         return JSONResponse(
@@ -220,9 +219,7 @@ async def pause(request: Request):
             content={"status": "error", "error": f"invalid pause mode: {mode}"},
             status_code=HTTPStatus.BAD_REQUEST.value,
         )
-    await engine_client(request).pause_generation(
-        mode=mode, clear_cache=clear_cache
-    )
+    await engine_client(request).pause_generation(mode=mode, clear_cache=clear_cache)
     return {"status": "paused", "mode": mode, "clear_cache": clear_cache}
 
 
@@ -236,17 +233,25 @@ async def resume(request: Request):
 async def update_weights(request: Request):
     data = await request.json()
     policy_version = int(data.get("step") or 0)
+    reset_prefix_cache = bool(data.get("reset_prefix_cache", True))
     await engine_client(request).collective_rpc("update_weights_from_path", args=(data.get("weight_dir"),))
-    reset_error = await reset_prefix_cache_or_500(
-        request,
-        reason=f"weight update step {policy_version}",
-        policy_version=policy_version,
-    )
-    if reset_error is not None:
-        return reset_error
+    if reset_prefix_cache:
+        reset_error = await reset_prefix_cache_or_500(
+            request,
+            reason=f"weight update step {policy_version}",
+            policy_version=policy_version,
+        )
+        if reset_error is not None:
+            return reset_error
+    else:
+        request.app.state.prime_rl_prefix_cache_policy_version = policy_version
+        logger.info(
+            "Preserved in-flight KV after weight update step %s; new requests will use the updated policy cache salt",
+            policy_version,
+        )
     return {
         "status": "ok",
-        "prefix_cache_reset": True,
+        "prefix_cache_reset": reset_prefix_cache,
         "policy_version": policy_version,
     }
 
@@ -262,9 +267,7 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
     response = await handler.load_lora_adapter(lora_request)
     if isinstance(response, ErrorResponse):
         return JSONResponse(content=response.model_dump(), status_code=response.error.code)
-    policy_version = int(
-        getattr(raw_request.app.state, "prime_rl_prefix_cache_policy_version", 0)
-    ) + 1
+    policy_version = int(getattr(raw_request.app.state, "prime_rl_prefix_cache_policy_version", 0)) + 1
     reset_error = await reset_prefix_cache_or_500(
         raw_request,
         reason=f"LoRA load {lora_request.lora_name}",
