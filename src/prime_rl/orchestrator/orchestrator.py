@@ -345,7 +345,6 @@ async def orchestrate(config: OrchestratorConfig):
             block_size=config.compaction_padding.block_size,
             filler_token_id=filler_id,
             im_end_token_id=im_end_id,
-            max_prompt_len=config.seq_len,
             phase4_enabled=config.compaction_padding.phase4_enabled,
             **managed_kwargs,
         )
@@ -358,7 +357,6 @@ async def orchestrate(config: OrchestratorConfig):
         os.environ["KV_EVICTION_PADDING_BLOCK_SIZE"] = str(config.compaction_padding.block_size)
         os.environ["KV_EVICTION_PADDING_FILLER_ID"] = str(filler_id)
         os.environ["KV_EVICTION_PADDING_IM_END_ID"] = str(im_end_id)
-        os.environ["KV_EVICTION_PADDING_MAX_PROMPT_LEN"] = str(config.seq_len)
         os.environ["KV_EVICTION_PADDING_PHASE4"] = (
             "1" if config.compaction_padding.phase4_enabled else "0"
         )
