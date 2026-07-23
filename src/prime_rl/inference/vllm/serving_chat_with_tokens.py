@@ -16,7 +16,10 @@ from vllm.outputs import RequestOutput
 from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 
-from prime_rl.inference.vllm.cache_salt import apply_prime_rl_policy_cache_salt
+from prime_rl.inference.vllm.cache_salt import (
+    apply_prime_rl_policy_cache_salt,
+    get_policy_cache_version,
+)
 
 logger = init_logger(__name__)
 
@@ -60,9 +63,7 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
     ) -> None:
         if raw_request is None:
             return
-        policy_version = int(
-            getattr(raw_request.app.state, "prime_rl_prefix_cache_policy_version", 0)
-        )
+        policy_version = get_policy_cache_version(raw_request.app.state)
         apply_prime_rl_policy_cache_salt(
             request,
             policy_version=policy_version,

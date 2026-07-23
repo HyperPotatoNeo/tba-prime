@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from http import HTTPStatus
 from typing import Any, Literal
@@ -20,6 +21,13 @@ from vllm.logger import init_logger
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from prime_rl.configs.inference import InferenceConfig
+from prime_rl.inference.vllm.cache_salt import (
+    POLICY_VERSION_STATE_ATTR,
+    create_shared_policy_cache_version,
+    get_policy_cache_version,
+    increment_policy_cache_version,
+    set_policy_cache_version,
+)
 from prime_rl.utils.logger import get_logger
 
 MODEL_TOOL_CALL_PARSER: dict[str, str] = {
@@ -182,11 +190,11 @@ async def reset_prefix_cache_or_500(
             status_code=500,
         )
     if policy_version is not None:
-        request.app.state.prime_rl_prefix_cache_policy_version = policy_version
+        set_policy_cache_version(request.app.state, policy_version)
     logger.info(
         "Prefix-cache reset succeeded after %s (policy_version=%s)",
         reason,
-        getattr(request.app.state, "prime_rl_prefix_cache_policy_version", None),
+        get_policy_cache_version(request.app.state),
     )
     return None
 
@@ -240,7 +248,7 @@ async def update_weights(request: Request):
         if reset_error is not None:
             return reset_error
     else:
-        request.app.state.prime_rl_prefix_cache_policy_version = policy_version
+        set_policy_cache_version(request.app.state, policy_version)
         logger.info(
             "Preserved in-flight KV after weight update step %s; new requests will use the updated policy cache salt",
             policy_version,
@@ -249,6 +257,14 @@ async def update_weights(request: Request):
         "status": "ok",
         "prefix_cache_reset": reset_prefix_cache,
         "policy_version": policy_version,
+    }
+
+
+@router.get("/policy_cache_version")
+async def policy_cache_version(request: Request):
+    return {
+        "policy_version": get_policy_cache_version(request.app.state),
+        "process_id": os.getpid(),
     }
 
 
@@ -263,7 +279,7 @@ async def load_lora_adapter(lora_request: LoadLoRAAdapterRequest, raw_request: R
     response = await handler.load_lora_adapter(lora_request)
     if isinstance(response, ErrorResponse):
         return JSONResponse(content=response.model_dump(), status_code=response.error.code)
-    policy_version = int(getattr(raw_request.app.state, "prime_rl_prefix_cache_policy_version", 0)) + 1
+    policy_version = increment_policy_cache_version(raw_request.app.state)
     reset_error = await reset_prefix_cache_or_500(
         raw_request,
         reason=f"LoRA load {lora_request.lora_name}",
@@ -332,7 +348,11 @@ async def custom_init_app_state(
     2. Replace the serving_chat with our OpenAIServingChatWithTokens wrapper.
     """
     await init_app_state(engine_client, state, args, supported_tasks)
-    state.prime_rl_prefix_cache_policy_version = 0
+    setattr(
+        state,
+        POLICY_VERSION_STATE_ATTR,
+        getattr(args, POLICY_VERSION_STATE_ATTR, 0),
+    )
 
     if "generate" in supported_tasks and state.openai_serving_chat is not None:
         original_chat = state.openai_serving_chat
@@ -378,8 +398,6 @@ vllm.v1.utils.run_api_server_worker_proc = custom_run_api_server_worker_proc
 # Only difference we do some config translation (i.e. pass populated namespace
 # to `parse_args`) and additional arg validation
 def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
-    import os
-
     from vllm.entrypoints.cli.serve import run_headless, run_multi_api_server
     from vllm.entrypoints.openai.api_server import run_server
 
@@ -397,6 +415,7 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
     args = parser.parse_args(args=[], namespace=namespace)
     assert args is not None
     validate_parsed_serve_args(args)
+    setattr(args, POLICY_VERSION_STATE_ATTR, create_shared_policy_cache_version())
 
     args.tool_call_parser = resolve_tool_call_parser(args.model, args.tool_call_parser)
     args.enable_auto_tool_choice = args.tool_call_parser is not None
