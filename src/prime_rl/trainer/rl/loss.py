@@ -104,6 +104,47 @@ def _safe_mean(values: Tensor, mask: Tensor) -> Tensor:
     return values[mask].sum() / denom
 
 
+def compute_token_weighted_mismatch_metrics(
+    trainer_logprobs: Tensor,
+    inference_logprobs: Tensor,
+    advantages: Tensor,
+    loss_mask: Tensor,
+    loss_config: LossConfig,
+) -> dict[str, Tensor]:
+    """Return flattened per-token mismatch metrics for global aggregation."""
+    loss_mask = loss_mask.bool()
+    if not loss_mask.any():
+        return {}
+
+    log_ratio = trainer_logprobs - inference_logprobs
+    mismatch_kl = torch.exp(log_ratio) - log_ratio - 1.0
+    prob_delta = torch.exp(trainer_logprobs) - torch.exp(inference_logprobs)
+    metrics = {
+        "mismatch_kl_token_weighted": mismatch_kl[loss_mask],
+        "trainer_infer_logprob_delta_token_weighted": log_ratio[loss_mask],
+        "trainer_infer_prob_delta_token_weighted": prob_delta[loss_mask],
+    }
+
+    if isinstance(loss_config, DefaultLossConfig):
+        is_masked = torch.where(
+            advantages > 0,
+            prob_delta > loss_config.dppo_mask_high,
+            prob_delta < -loss_config.dppo_mask_low,
+        )
+        keep_mask = loss_mask & ~is_masked
+        masked_mask = loss_mask & is_masked
+        for prefix, mask in (
+            ("unmasked_", keep_mask),
+            ("masked_", masked_mask),
+        ):
+            if mask.any():
+                metrics[f"{prefix}mismatch_kl_token_weighted"] = mismatch_kl[mask]
+                metrics[f"{prefix}trainer_infer_logprob_delta_token_weighted"] = log_ratio[mask]
+                metrics[f"{prefix}trainer_infer_prob_delta_token_weighted"] = prob_delta[mask]
+
+    return metrics
+
+
 def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossOutputs:
     """
     DPPO+KL loss, combining:

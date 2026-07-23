@@ -2,7 +2,14 @@ import pytest
 import torch
 
 from prime_rl.configs.trainer import CustomLossConfig, DefaultLossConfig, SFTLossConfig
-from prime_rl.trainer.rl.loss import LossInputs, LossOutputs, compute_entropy, compute_loss, setup_loss_fn
+from prime_rl.trainer.rl.loss import (
+    LossInputs,
+    LossOutputs,
+    compute_entropy,
+    compute_loss,
+    compute_token_weighted_mismatch_metrics,
+    setup_loss_fn,
+)
 
 pytestmark = [pytest.mark.gpu]
 
@@ -95,6 +102,69 @@ def test_sft_loss_matches_masked_nll():
     # loss = -sum(masked logprobs) / loss_scale = -(-0.1 - 0.2) / 2 = 0.15
     assert torch.isclose(loss, torch.tensor(0.15, device=loss.device), atol=1e-6)
     assert "nll" in metrics
+
+
+def test_compute_token_weighted_mismatch_metrics():
+    trainer_logprobs = torch.tensor(
+        [[0.0, -3.0, -1.1, -0.9]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    inference_logprobs = torch.full(
+        (1, 4),
+        -1.0,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    advantages = torch.tensor(
+        [[1.0, -1.0, 1.0, -1.0]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    loss_mask = torch.tensor(
+        [[True, True, True, False]],
+        dtype=torch.bool,
+        device="cuda",
+    )
+
+    metrics = compute_token_weighted_mismatch_metrics(
+        trainer_logprobs=trainer_logprobs,
+        inference_logprobs=inference_logprobs,
+        advantages=advantages,
+        loss_mask=loss_mask,
+        loss_config=DefaultLossConfig(
+            dppo_mask_high=0.2,
+            dppo_mask_low=0.2,
+        ),
+    )
+
+    log_ratio = trainer_logprobs - inference_logprobs
+    expected_kl = torch.exp(log_ratio) - log_ratio - 1.0
+    assert torch.equal(
+        metrics["mismatch_kl_token_weighted"],
+        expected_kl[loss_mask],
+    )
+    assert torch.equal(
+        metrics["masked_mismatch_kl_token_weighted"],
+        expected_kl[0, :2],
+    )
+    assert torch.equal(
+        metrics["unmasked_mismatch_kl_token_weighted"],
+        expected_kl[0, 2:3],
+    )
+
+
+def test_compute_token_weighted_mismatch_metrics_empty_mask():
+    values = torch.zeros((1, 2), device="cuda")
+    metrics = compute_token_weighted_mismatch_metrics(
+        trainer_logprobs=values,
+        inference_logprobs=values,
+        advantages=values,
+        loss_mask=torch.zeros_like(values, dtype=torch.bool),
+        loss_config=DefaultLossConfig(),
+    )
+
+    assert metrics == {}
 
 
 def _dummy_custom_loss(inputs: LossInputs, multiplier: float = 1.0) -> LossOutputs:

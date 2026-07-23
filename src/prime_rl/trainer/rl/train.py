@@ -132,6 +132,7 @@ from prime_rl.transport.types import COMPACTION_REPLAY_MODE_PREFILL_TRIM
 from prime_rl.trainer.rl.loss import (
     compute_entropy,
     compute_loss,
+    compute_token_weighted_mismatch_metrics,
     selective_log_softmax,
     setup_loss_fn,
     shift_tensor_left,
@@ -2895,6 +2896,16 @@ def train(config: TrainerConfig):
                     loss_fn=loss_fn,
                     loss_scale=loss_scale,
                 )
+                with torch.no_grad():
+                    loss_tensors.update(
+                        compute_token_weighted_mismatch_metrics(
+                            trainer_logprobs=out["logprobs"],
+                            inference_logprobs=inference_logprobs,
+                            advantages=advantages,
+                            loss_mask=loss_mask,
+                            loss_config=config.loss,
+                        )
+                    )
 
                 # Backward pass
                 with maybe_record_function("backward"):
