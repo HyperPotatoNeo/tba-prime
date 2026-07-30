@@ -1356,7 +1356,14 @@ class OrchestratorConfig(BaseConfig):
     seq_len: Annotated[
         int,
         Field(
-            description="Sequence length to use for training. If a sample is shorter than this, it will be padded. If a sequence is longer than this, it will be truncated.",
+            description=(
+                "Sequence length to use for training. If a sample is shorter "
+                "than this, it will be padded. If a sequence is longer than "
+                "this, it will be truncated. Markovian Thinker also uses this "
+                "as its effective logical rollout cap: canonical prompt and "
+                "new environment/model tokens count once, while re-prefill "
+                "copies do not."
+            ),
         ),
     ] = 2048
 
