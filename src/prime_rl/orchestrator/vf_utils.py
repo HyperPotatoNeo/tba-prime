@@ -24,15 +24,22 @@ def get_prompt_len(output: vf.RolloutOutput) -> int:
 # TODO: remove once usage is tracked by verifiers
 def get_seq_len(output: vf.RolloutOutput) -> int:
     """
-    Computes the number of tokens from vf.RolloutOutput. Defined as the sum of prompt
-    and completion tokens from the last trajectory step. If raw tokens are not
-    available, falls back to checking the usage of the last response.
+    Computes the effective number of tokens from vf.RolloutOutput. Markovian
+    rollouts use the canonical pre-truncation prompt length so re-prefill resets
+    do not make this metric report only the final subtrace. Other rollouts use
+    the physical prompt length from the last trajectory step.
     """
     if not output["trajectory"]:
         return 0
     last_step = output["trajectory"][-1]
     if last_step["tokens"] is not None:
-        return len(last_step["tokens"]["prompt_ids"]) + len(last_step["tokens"]["completion_ids"])
+        prompt_len = len(last_step["tokens"]["prompt_ids"])
+        effective_prompt_tokens = (last_step.get("extras") or {}).get("effective_prompt_tokens")
+        if effective_prompt_tokens is not None:
+            if type(effective_prompt_tokens) is not int or effective_prompt_tokens < 0:
+                raise ValueError(f"effective_prompt_tokens must be a non-negative int, got {effective_prompt_tokens!r}")
+            prompt_len = effective_prompt_tokens
+        return prompt_len + len(last_step["tokens"]["completion_ids"])
     last_step_response = last_step["response"]
     return (last_step_response.get("usage") or {}).get("total_tokens", 0)
 
