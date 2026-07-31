@@ -83,8 +83,8 @@ def test_markovian_kv_eviction_expands_coupled_flags():
     assert config.inference is not None
     assert config.inference.enable_prefix_caching is True
     assert config.inference.vllm_extra["async_scheduling"] is False
-    assert config.inference.vllm_extra["compaction_window_size"] == 4096
-    assert config.inference.vllm_extra["compaction_stride"] == 512
+    assert config.inference.vllm_extra["compaction_window_size"] == 0
+    assert config.inference.vllm_extra["compaction_stride"] == 0
     assert config.inference.vllm_extra["block_size"] == 16
     assert config.inference.vllm_extra["compaction_protected_prefix_tokens"] == -1
     assert config.inference.vllm_extra["compaction_max_turns"] == 2
@@ -154,7 +154,7 @@ def test_markovian_kv_eviction_respects_explicit_flash_replay():
     assert config.trainer.compaction.bptt_segments == 1
 
 
-def test_markovian_kv_eviction_respects_window_override():
+def test_markovian_kv_eviction_rejects_window_override():
     inference = InferenceConfig()
     inference.vllm_extra = {"compaction_window_size": 8192}
     orch = OrchestratorConfig(
@@ -164,15 +164,12 @@ def test_markovian_kv_eviction_respects_window_override():
             max_turns=2,
         ),
     )
-    config = RLConfig(
-        trainer=TrainerConfig(),
-        orchestrator=orch,
-        inference=inference,
-    )
-
-    assert config.trainer.compaction.window_size == 8192
-    assert config.inference is not None
-    assert config.inference.vllm_extra["compaction_window_size"] == 8192
+    with pytest.raises(ValidationError, match="rejects both modes at once"):
+        RLConfig(
+            trainer=TrainerConfig(),
+            orchestrator=orch,
+            inference=inference,
+        )
 
 
 def test_markovian_kv_eviction_rejects_explicit_tito():

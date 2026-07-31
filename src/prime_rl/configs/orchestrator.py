@@ -1072,12 +1072,13 @@ class MarkovianThinkerConfig(BaseConfig):
     """Turn-count policy for multi-turn RL context management.
 
     In the default mode (``kv_eviction=False``), enabling this config uses the
-    Markovian Thinker baseline: the orchestrator truncates the ``messages``
-    list to the most recent ``max_turns`` complete conversation turn groups
-    BEFORE sending each chat completion request to vLLM. vLLM sees normal
-    full-context completions with no compaction, no eviction, no
-    ``CompactionEvent``s. Training uses the standard full-context forward
-    (no ``segmented_forward``).
+    Markovian Thinker baseline: the orchestrator applies vLLM's turn-eviction
+    schedule to the ``messages`` list BEFORE sending each chat completion
+    request. It protects the first message, counts each pair of later message
+    boundaries as one completed turn, triggers at ``max_turns``, and evicts
+    ``stride`` turns. vLLM then sees a normal full-context completion with no
+    engine-side compaction or ``CompactionEvent``s. Training uses the standard
+    full-context forward (no ``segmented_forward``).
 
     In KV-eviction mode (``kv_eviction=True``), this section instead becomes
     the single high-level switch for turn-based vLLM KV eviction. ``max_turns``
@@ -1085,10 +1086,9 @@ class MarkovianThinkerConfig(BaseConfig):
     ``compaction_eviction_turn_stride``. RLConfig expands the remaining
     coupled trainer/orchestrator/vLLM knobs automatically.
 
-    A "turn group" is the atomic unit ending at each assistant message
-    without ``tool_calls``. The system prefix (leading non-user messages)
-    and in-flight tail (messages after the last terminal assistant) are
-    always preserved — see ``plans/markovian_thinker_baseline.md``.
+    This counter intentionally ignores message roles and ``tool_calls`` so
+    tool-heavy trajectories receive the same context budget in both modes.
+    An unmatched final message remains as the in-flight tail.
 
     In baseline mode (``kv_eviction=False``), incompatible with:
     - ``inference.vllm_extra.compaction_window_size > 0``
@@ -1130,11 +1130,10 @@ class MarkovianThinkerConfig(BaseConfig):
         Field(
             ge=1,
             description=(
-                "Trigger threshold: truncation fires when the number of "
-                "complete turn groups in the `messages` list EXCEEDS this "
-                "value. A turn group ends at each assistant message without "
-                "`tool_calls`. System prefix and in-flight tail are always "
-                "preserved regardless of this cap. Default 6: aggressive "
+                "Trigger threshold shared with vLLM turn eviction. Truncation "
+                "fires when the number of completed paired-message turns "
+                "REACHES this value. The first message and an unmatched final "
+                "message are preserved. Default 6: aggressive "
                 "enough to exercise the truncation path on typical "
                 "BabyAI/TextWorld episodes (~15-30 turns) while leaving "
                 "enough context for coherent action selection."
@@ -1147,18 +1146,14 @@ class MarkovianThinkerConfig(BaseConfig):
         Field(
             ge=1,
             description=(
-                "Optional: number of recent turn groups to PRESERVE after "
-                "a truncation trigger (the 'keep count', decoupled from "
-                "the `max_turns` trigger threshold). "
-                "When None (default), keeps `max_turns` groups — legacy "
-                "single-knob behavior. When set, must be in [1, max_turns]. "
-                "Also used by the markovian-mode summary splice: the "
-                "last `stride` real turn groups are preserved in front of "
-                "the tail, producing `sys + last_N_body + tail + [I, S] + "
-                "[U_resume]`. With stride=None (default), N=0 — i.e. a "
-                "strict full reset to `sys + tail + [I, S] + [U_resume]`. "
-                "In kv_eviction mode, this maps to vLLM's "
-                "compaction_eviction_turn_stride; None means 1."
+                "Number of oldest completed turns evicted per trigger. This "
+                "maps directly to vLLM's compaction_eviction_turn_stride for "
+                "plain Markovian and KV-eviction modes. None means 1; "
+                "otherwise the value must be in "
+                "[1, max_turns]. Repeated triggers produce the same sawtooth "
+                "live window for Markovian re-prefill and KV eviction. "
+                "Optional summary mode retains its separate semantic-group "
+                "splice behavior."
             ),
         ),
     ] = None
@@ -1168,8 +1163,8 @@ class MarkovianThinkerConfig(BaseConfig):
         Field(
             description=(
                 "Debug-only: log one line per truncation with the number "
-                "of groups dropped and the role of the first/last dropped "
-                "message. Off in production."
+                "of paired-message turns dropped and the roles of the "
+                "first/last dropped messages. Off in production."
             ),
         ),
     ] = False

@@ -430,8 +430,8 @@ class RLConfig(BaseConfig):
                 "Single-flag KV-context mode. Expands into the coupled "
                 "trainer/orchestrator/inference settings (explicit per-field "
                 "overrides win). kv-eviction: engine turn-eviction, spans "
-                "drop, window = last max_turns/stride turns. markovian: "
-                "client-side truncation + re-prefill (reference). kv-recall: "
+                "drop with a max_turns/stride sawtooth window. markovian: "
+                "the same turn schedule via client-side re-prefill. kv-recall: "
                 "eviction + hidden-KV recall with the validated stack. "
                 "kv-selection: model/client-selected complete turns from "
                 "the would-be evicted band, without recall/offload. "
@@ -547,6 +547,22 @@ class RLConfig(BaseConfig):
         trainer_model = _cfg_child(trainer, "model")
         vllm_extra = _cfg_child(inference, "vllm_extra")
         eval_cfg = _cfg_get(orchestrator, "eval")
+
+        # Turn-mode eviction and token-window FIFO are mutually exclusive in
+        # vLLM. Keep nominal trainer geometry for replay dispatch, but disable
+        # engine-side token-window compaction unless explicitly contradicted.
+        _cfg_set_missing(vllm_extra, "compaction_window_size", 0)
+        _cfg_set_missing(vllm_extra, "compaction_stride", 0)
+        _cfg_set_missing(
+            trainer_compaction,
+            "window_size",
+            _KV_EVICTION_DEFAULT_WINDOW_SIZE,
+        )
+        _cfg_set_missing(
+            trainer_compaction,
+            "stride",
+            _KV_EVICTION_DEFAULT_STRIDE,
+        )
 
         block_size = _first_explicit_int(
             _KV_EVICTION_DEFAULT_BLOCK_SIZE,
@@ -910,9 +926,8 @@ class RLConfig(BaseConfig):
         if mt.stride is not None and mt.stride > mt.max_turns:
             raise ValueError(
                 f"orchestrator.markovian_thinker.stride={mt.stride} must be "
-                f"<= max_turns={mt.max_turns}. Stride is the post-trigger "
-                "keep count; keeping more groups than the trigger threshold "
-                "is impossible — the truncation would never drop anything."
+                f"<= max_turns={mt.max_turns}. Stride is the number of "
+                "completed turns evicted per trigger."
             )
 
         return self
